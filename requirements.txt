@@ -1,0 +1,4 @@
+requests>=2.31
+rich>=13.0
+# playwright is only needed from build step 3 (Meta Ad Library fallback scrape)
+# playwright>=1.44
