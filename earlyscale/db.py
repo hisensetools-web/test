@@ -166,6 +166,81 @@ CREATE TABLE IF NOT EXISTS landing_pages (
 );
 
 -- Inventory-delta sales tracking: which variants we probe and what they read each day.
+-- Meta part 2 (A): per-ad readings from the single-ad Ad Library page (or the list payload).
+CREATE TABLE IF NOT EXISTS meta_ad_detail_daily (
+    snapshot_date   TEXT NOT NULL,
+    ad_id           TEXT NOT NULL,
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    source          TEXT NOT NULL,      -- detail (single-ad page) | list (search results payload)
+    start_date      TEXT,
+    end_date        TEXT,               -- advances daily while the ad delivers
+    is_active       INTEGER,
+    page_like_count INTEGER,
+    status          TEXT,               -- ok | login-wall | no-record | error:<type>
+    fetched_at      TEXT NOT NULL,
+    PRIMARY KEY (snapshot_date, ad_id)
+);
+CREATE TABLE IF NOT EXISTS meta_page_likes_daily (
+    snapshot_date       TEXT NOT NULL,
+    page_id             TEXT NOT NULL,
+    store_id            INTEGER NOT NULL REFERENCES stores(id),
+    page_name           TEXT,
+    page_like_count     INTEGER,
+    likes_delta_1d      INTEGER,
+    likes_slope_7d      REAL,
+    likes_slope_prev_7d REAL,
+    page_categories     TEXT,
+    page_profile_id     TEXT,
+    fetched_at          TEXT NOT NULL,
+    PRIMARY KEY (snapshot_date, page_id)
+);
+CREATE TABLE IF NOT EXISTS meta_creatives (
+    ad_id       TEXT NOT NULL,
+    kind        TEXT NOT NULL,           -- image | video
+    position    INTEGER NOT NULL,
+    url         TEXT,
+    sha256      TEXT,
+    bytes       INTEGER,
+    hash_scope  TEXT,                    -- full | first_<n>
+    fetched_at  TEXT NOT NULL,
+    status      TEXT,
+    PRIMARY KEY (ad_id, kind, position)
+);
+CREATE INDEX IF NOT EXISTS idx_meta_creatives_hash ON meta_creatives(sha256);
+
+-- Meta part 2 (B): Sponsored posts captured by hand from a feed, and their public counts over time.
+CREATE TABLE IF NOT EXISTS fb_posts (
+    post_id         TEXT PRIMARY KEY,
+    page_id         TEXT,
+    page_name       TEXT,
+    permalink       TEXT NOT NULL,
+    primary_text    TEXT,
+    headline        TEXT,
+    landing_url     TEXT,
+    image_url       TEXT,
+    image_hash      TEXT,
+    source          TEXT,               -- manual | paste | file
+    captured_at     TEXT NOT NULL,
+    store_id        INTEGER REFERENCES stores(id),
+    ad_id           TEXT,               -- matched Ad Library ad
+    match_via       TEXT,               -- text | creative
+    match_score     REAL,
+    status          TEXT,               -- ok | gated | removed | error:<type>
+    note            TEXT
+);
+CREATE TABLE IF NOT EXISTS fb_posts_daily (
+    snapshot_date           TEXT NOT NULL,
+    post_id                 TEXT NOT NULL REFERENCES fb_posts(post_id),
+    reactions               INTEGER,
+    comments                INTEGER,
+    shares                  INTEGER,
+    status                  TEXT,
+    fetched_at              TEXT NOT NULL,
+    comment_delta_1d        INTEGER,
+    engagement_per_day_7d   REAL,
+    PRIMARY KEY (snapshot_date, post_id)
+);
+
 CREATE TABLE IF NOT EXISTS hero_variants (
     store_id            INTEGER NOT NULL REFERENCES stores(id),
     variant_id          INTEGER NOT NULL,
@@ -256,7 +331,14 @@ def _migrate(conn: sqlite3.Connection) -> None:
     wanted = {
         "meta_ads": [("concept_id", "TEXT"), ("lineage_of", "TEXT"), ("lineage_similarity", "REAL"),
                      ("landing_resolved_via", "TEXT"), ("landing_handle", "TEXT"), ("page_ignored", "INTEGER"),
-                     ("post_url", "TEXT"), ("engagement_type", "TEXT"), ("reach_keys", "TEXT")],
+                     ("post_url", "TEXT"), ("engagement_type", "TEXT"), ("reach_keys", "TEXT"),
+                     # part 2 (A): delivery from the single-ad page, page facts, creative fingerprint
+                     ("last_delivered", "TEXT"), ("delivery_status", "TEXT"), ("switched_off_date", "TEXT"),
+                     ("detail_fetched_date", "TEXT"), ("page_profile_id", "TEXT"), ("page_categories", "TEXT"),
+                     ("creative_hash", "TEXT"), ("lineage_via", "TEXT"),
+                     # part 2 (B): matched feed post and its latest counts
+                     ("post_id", "TEXT"), ("post_permalink", "TEXT")],
+        "meta_concepts_daily": [("ads_delivering", "INTEGER"), ("survival_source", "TEXT")],
         "alerts": [("dedupe_key", "TEXT")],
         "products_daily": [("unlisted", "INTEGER DEFAULT 0")],   # 1 = live product page not in products.json (found via ads)
         "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),

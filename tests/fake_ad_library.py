@@ -44,8 +44,21 @@ load();
 BLOCKED = "<html><head><title>Log in to Facebook</title></head><body><h1>You must log in to continue.</h1></body></html>"
 
 
-def make_handler(batches: int, block: bool, landing: str | None = None, handles: list[str] | None = None, port: int = 8095):
+def make_handler(batches: int, block: bool, landing: str | None = None, handles: list[str] | None = None, port: int = 8095,
+                 day: int = 1, likes: int = 12000, stop_ads: tuple[str, ...] = (), base_date: str | None = None):
+    """day / likes / stop_ads drive the single-ad page: end_date = base_date + (day - 1) except for ads in
+    stop_ads (which freeze at day 1); page_like_count grows with day. base_date defaults to today (UTC)."""
     base = json.loads(FIX.read_text())
+    from datetime import date as _date, datetime as _dt, timezone as _tz
+    bd = _date.fromisoformat(base_date) if base_date else _dt.now(_tz.utc).date()
+    day0 = int((bd - _date(1970, 1, 1)).total_seconds())
+
+    def end_date_for(ad_id: str) -> int:
+        d = 1 if ad_id in stop_ads else day
+        return day0 + (d - 1) * 86400
+
+    def page_likes() -> int:
+        return likes + (day - 1) * 150
     if landing:
         # point every ad at the given store origin: products/<handle> for the first two ads, /pages/av1 for the third
         res = base["data"]["ad_library_main"]["search_results_connection"]["edges"][0]["node"]["collated_results"]
@@ -70,6 +83,42 @@ def make_handler(batches: int, block: bool, landing: str | None = None, handles:
 
         def do_GET(self):
             u = urlparse(self.path)
+            qs = parse_qs(u.query)
+            if u.path.startswith("/ads/library") and qs.get("id"):
+                # the single-ad page: the record sits in the HTML in a data-sjs block under
+                # deeplink_ad_archive_result.deeplink_ad_archive; no graphql call, no post id.
+                if block:
+                    return self._send(200, BLOCKED.encode(), "text/html")
+                ad_id = qs["id"][0]
+                res = base["data"]["ad_library_main"]["search_results_connection"]["edges"][0]["node"]["collated_results"]
+                node = None
+                for r in res:
+                    off = int(ad_id) - int(r["ad_archive_id"])
+                    if off >= 0 and off % 100 == 0:
+                        node = copy.deepcopy(r)
+                        node["ad_archive_id"] = ad_id
+                        break
+                if node is None:
+                    return self._send(200, b"<html><head><title>Ad Library</title></head><body>No ads</body></html>", "text/html")
+                node["ad_id"] = None
+                node["end_date"] = end_date_for(ad_id)
+                node["page_like_count"] = page_likes()
+                node["page_profile_uri"] = f"https://www.facebook.com/{node['page_id']}/"
+                node["page_categories"] = ["Health/beauty", "Vitamins/supplements"]
+                node["snapshot"]["images"] = [{"original_image_url": f"http://127.0.0.1:{port}/creative/{int(ad_id) % 3}.jpg",
+                                               "resized_image_url": f"http://127.0.0.1:{port}/creative/{int(ad_id) % 3}_r.jpg"}]
+                node["snapshot"]["page_like_count"] = node["page_like_count"]
+                doc = {"require": [["ScheduledServerJS", "handle", None, [{"__bbox": {"require": [["RelayPrefetchedStreamCache", "next", [],
+                       ["adp_AdLibraryMobileFocusedStateProviderQueryRelayPreloader", {"__bbox": {"result": {"data": {
+                           "deeplink_ad_archive_result": {"deeplink_ad_archive": node}}}}}]]]}}]]]}
+                html = ('<!DOCTYPE html><html><head><title>Ad Library</title></head><body><div id="root"></div>'
+                        '<script type="application/json" data-content-len="1" data-sjs>' + json.dumps(doc) + '</script>'
+                        '<script type="application/json" data-sjs>{"define":[]}</script></body></html>')
+                return self._send(200, html.encode(), "text/html; charset=utf-8")
+            if u.path.startswith("/creative/"):
+                n = u.path.rsplit("/", 1)[-1].split("_")[0].split(".")[0]
+                body = (b"FAKEJPEG-" + n.encode()) * 64
+                return self._send(200, body, "image/jpeg")
             if "/posts/" in u.path:   # a "public post" page with embedded counts
                 body = ('<html><head><title>Post</title></head><body><script>{"comment_count":{"total_count":57},'
                         '"reaction_count":{"count":1203},"share_count":{"count":9}}</script></body></html>')
@@ -111,8 +160,13 @@ def main(argv=None):
     ap.add_argument("--block", action="store_true", help="serve a login wall instead of results")
     ap.add_argument("--landing", help="store origin to point landing URLs at, e.g. http://127.0.0.1:8011")
     ap.add_argument("--handles", nargs="+", help="product handles to use in landing URLs")
+    ap.add_argument("--day", type=int, default=1, help="simulated day: single-ad end_date and page likes advance with it")
+    ap.add_argument("--likes", type=int, default=12000)
+    ap.add_argument("--stop-ads", nargs="*", default=(), help="ad ids whose end_date stops advancing (switched off)")
+    ap.add_argument("--base-date", help="ISO date that day 1's end_date maps to (default: today)")
     a = ap.parse_args(argv)
-    srv = HTTPServer(("127.0.0.1", a.port), make_handler(a.batches, a.block, a.landing, a.handles, a.port))
+    srv = HTTPServer(("127.0.0.1", a.port), make_handler(a.batches, a.block, a.landing, a.handles, a.port, a.day, a.likes,
+                                                         tuple(a.stop_ads), a.base_date))
     print(f"fake Ad Library on http://127.0.0.1:{a.port}/ads/library/ batches={a.batches} block={a.block}")
     srv.serve_forever()
 

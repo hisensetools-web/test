@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import re
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import ad_metrics, config, db, deltas, inventory, meta_ads, sheets, shopify
+from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, sheets, shopify
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist
 
 console = Console()
@@ -105,6 +106,19 @@ def cmd_run(args) -> int:
     ok, failed = run_products_pass(conn, stores, snapshot_date, only)
     console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
     rc = 1 if ok == 0 and failed else 0
+    if not args.no_ads and conn.execute("SELECT 1 FROM fb_posts LIMIT 1").fetchone():
+        console.print("feed-post engagement pass (captured permalinks, logged-out) ...")
+        try:
+            from playwright.sync_api import sync_playwright
+            with sync_playwright() as pw:
+                browser = pw.chromium.launch(headless=True, **meta_ads.launch_kwargs())
+                try:
+                    c = fb_posts.refresh_engagement(conn, browser, snapshot_date)
+                finally:
+                    browser.close()
+            console.print(f"posts: fetched {c['fetched']}, ok={c['ok']} gated={c['gated']} removed={c['removed']}")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"[red]post engagement pass failed:[/] {e}")
     inv_stores = inventory_targets(stores, only, args.inventory)
     if inv_stores and not args.no_inventory:
         console.print(f"inventory probe pass ({len(inv_stores)} store(s), waits={config.INVENTORY_WAIT_MIN:.0f}-{config.INVENTORY_WAIT_MAX:.0f}s) ...")
@@ -172,7 +186,8 @@ def cmd_remove_store(args) -> int:
 
 
 def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | None = None,
-                 headless: bool = True, max_scrolls: int | None = None) -> tuple[int, int]:
+                 headless: bool = True, max_scrolls: int | None = None, detail: bool = True,
+                 detail_cap: int | None = None) -> tuple[int, int]:
     """Scrape the Ad Library for every store (one browser, sequential). Returns (ok, failed).
     A blocked or failing page is logged in meta_page_runs and never aborts the pass."""
     from playwright.sync_api import sync_playwright
@@ -200,7 +215,13 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                              domain, counts["total"], counts["new"], counts["disappeared"], res.scrolls,
                              res.responses, time.monotonic() - t0, res.note)
                     ok += 1
+                    try:
+                        ad_detail.record_list_readings(conn, store_id, snapshot_date, [json.loads(a["raw_json"]) for a in res.ads if a.get("raw_json")])
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("%-28s list readings failed: %s", domain, e)
                     _post_process_store(conn, store_id, domain, snapshot_date, session)
+                    if detail:
+                        _detail_pass_store(conn, browser, store_id, domain, snapshot_date, detail_cap)
                     try:
                         pe = meta_ads.fetch_boosted_engagement(conn, browser, store_id, snapshot_date)
                         if pe["candidates"]:
@@ -471,6 +492,270 @@ def cmd_inventory_report(args) -> int:
     return 0
 
 
+def _detail_pass_store(conn, browser, store_id: int, domain: str, snapshot_date: str, cap: int | None = None) -> dict:
+    """Single-ad pages for the selected ads, then delivery / page likes / creative lineage / rule 12. Never raises."""
+    t0 = time.monotonic()
+    try:
+        c = ad_detail.fetch_store_details(conn, browser, store_id, snapshot_date, cap)
+        f = ad_detail.finalize_store(conn, store_id, snapshot_date)
+        log.info("%-28s detail: fetched %d/%d ok=%d no_record=%d errors=%d login_wall=%d creatives_hashed=%d | delivering=%d off=%d pages=%d "
+                 "creative_lineage=%d alerts=%d %.0fs", domain, c["ok"] + c["no_record"] + c["errors"], c["selected"], c["ok"],
+                 c["no_record"], c["errors"], c["login_wall"], c["hashed"], f["delivering"], f["off"], f["pages"],
+                 f["creative_lineage"], f["alerts"], time.monotonic() - t0)
+        return {**c, **f}
+    except Exception as e:  # noqa: BLE001
+        log.error("%-28s detail pass FAILED: %s", domain, e)
+        return {}
+
+
+def cmd_ads_detail(args) -> int:
+    """Fetch single-ad pages (end_date, page likes, creatives) for stores with scraped ads."""
+    from playwright.sync_api import sync_playwright
+    snapshot_date = _parse_date(args.date)
+    conn = db.connect(args.db)
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    only = set(args.only) if args.only else None
+    targets = [s for s in stores if not only or s["store_domain"] in only]
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=not args.headed, **meta_ads.launch_kwargs())
+        try:
+            if args.ads:
+                sid = db.upsert_store(conn, targets[0]["store_domain"]) if targets else None
+                for aid in args.ads:
+                    row = conn.execute("SELECT store_id FROM meta_ads WHERE ad_id = ?", (aid,)).fetchone()
+                    store_id = row["store_id"] if row else sid
+                    d, status = ad_detail.fetch_ad_detail(browser, aid)
+                    console.print(f"{aid}: {status} {json.dumps({k: v for k, v in (d or {}).items() if k not in ('images', 'videos')}, default=str)[:400]}")
+                    if d:
+                        console.print(f"  images={len(d['images'])} videos={len(d['videos'])}")
+                    if store_id:
+                        ad_detail.record_detail(conn, store_id, aid, snapshot_date, d, status)
+                        if d:
+                            ad_detail.fingerprint_creatives(conn, aid, d)
+                        ad_detail.finalize_store(conn, store_id, snapshot_date)
+                    conn.commit()
+                return 0
+            t = Table(title=f"single-ad page pass ({snapshot_date})")
+            for c in ("store", "selected", "ok", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts"):
+                t.add_column(c, justify="left" if c == "store" else "right")
+            for st in targets:
+                store_id = db.upsert_store(conn, st["store_domain"])
+                conn.commit()
+                if not conn.execute("SELECT 1 FROM meta_ads WHERE store_id = ? LIMIT 1", (store_id,)).fetchone():
+                    continue
+                r = _detail_pass_store(conn, browser, store_id, st["store_domain"], snapshot_date, args.max)
+                t.add_row(_short(st["store_domain"]), *[str(r.get(c, "")) for c in ("selected", "ok", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts")])
+            console.print(t)
+        finally:
+            browser.close()
+    md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
+    if md:
+        console.print(f"alerts written to {md}")
+    return 0
+
+
+def cmd_ads_detail_report(args) -> int:
+    """end_date / page_like_count per day for flagged ads (or --ads), plus page likes per page."""
+    conn = db.connect(args.db)
+    as_of = _parse_date(args.date) if args.date else conn.execute("SELECT MAX(snapshot_date) FROM meta_ad_detail_daily").fetchone()[0]
+    if not as_of:
+        console.print("no detail readings yet - run `python tracker.py ads-detail`")
+        return 1
+    dates = [r[0] for r in conn.execute("SELECT DISTINCT snapshot_date FROM meta_ad_detail_daily WHERE snapshot_date <= ? ORDER BY snapshot_date DESC LIMIT ?",
+                                        (as_of, args.days))][::-1]
+    where, params = "", []
+    if args.store:
+        sid = conn.execute("SELECT id FROM stores WHERE store_domain = ?", (args.store,)).fetchone()
+        if not sid:
+            console.print(f"[red]unknown store[/] {args.store}")
+            return 2
+        where, params = " AND a.store_id = ?", [sid["id"]]
+    if args.ads:
+        ids = set(args.ads)
+    else:
+        ids = set()
+        for r in conn.execute(f"SELECT DISTINCT a.store_id FROM meta_ads a WHERE 1=1 {where}", params):
+            ids |= ad_detail.flagged_ad_ids(conn, r[0])
+        if not ids:
+            console.print("no flagged ads (no rule 5-8 alerts) for this selection; showing the ads with detail readings")
+            ids = {r[0] for r in conn.execute(f"""SELECT d.ad_id FROM meta_ad_detail_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
+                                                 WHERE d.source = 'detail' {where} ORDER BY d.snapshot_date DESC LIMIT ?""", params + [args.limit])}
+    rows = [dict(r) for r in conn.execute(
+        f"""SELECT a.ad_id, s.store_domain, a.page_name, a.ad_start_date, a.delivery_status, a.last_delivered, a.switched_off_date,
+                   a.product_handle, a.lineage_of, a.lineage_via, a.creative_hash, a.page_categories
+            FROM meta_ads a JOIN stores s ON s.id = a.store_id WHERE a.ad_id IN ({','.join('?' * len(ids))}) {where}
+            ORDER BY s.store_domain, a.page_name, a.ad_start_date""", list(ids) + params)] if ids else []
+    t = Table(title=f"end_date per day for {len(rows)} ads (as of {as_of}; '-' = no reading, L = from list payload)")
+    for c in ("ad", "store", "page", "start", "product"):
+        t.add_column(c)
+    for d in dates:
+        t.add_column(d[5:], justify="right")
+    for c in ("status", "last delivered", "off since", "lineage"):
+        t.add_column(c)
+    for r in rows[: args.limit]:
+        readings = {x["snapshot_date"]: x for x in conn.execute(
+            "SELECT snapshot_date, end_date, source, status FROM meta_ad_detail_daily WHERE ad_id = ? AND snapshot_date <= ?", (r["ad_id"], as_of))}
+        cells = []
+        for d in dates:
+            x = readings.get(d)
+            if not x:
+                cells.append("-")
+            elif x["end_date"]:
+                cells.append(x["end_date"][5:] + ("" if x["source"] == "detail" else " L"))
+            else:
+                cells.append(x["status"] or "?")
+        lin = f"{r['lineage_of']} ({r['lineage_via'] or 'text'})" if r["lineage_of"] else ""
+        t.add_row(r["ad_id"], _short(r["store_domain"]), (r["page_name"] or "")[:24], (r["ad_start_date"] or "")[5:],
+                  (r["product_handle"] or "")[:24], *cells, r["delivery_status"] or "", (r["last_delivered"] or "")[5:],
+                  (r["switched_off_date"] or "")[5:], lin)
+    console.print(t)
+    t = Table(title="page_like_count per day (page-level spend proxy)")
+    for c in ("store", "page", "page_id", "categories"):
+        t.add_column(c)
+    for d in dates:
+        t.add_column(d[5:], justify="right")
+    for c in ("delta 1d", "likes/day 7d", "prev 7d"):
+        t.add_column(c, justify="right")
+    pages = conn.execute(f"""SELECT DISTINCT p.page_id, p.page_name, s.store_domain, p.store_id FROM meta_page_likes_daily p JOIN stores s ON s.id = p.store_id
+                             WHERE 1=1 {where.replace('a.store_id', 'p.store_id')} ORDER BY s.store_domain, p.page_name""", params).fetchall()
+    for pg in pages[: args.limit]:
+        hist = {x["snapshot_date"]: x for x in conn.execute("SELECT * FROM meta_page_likes_daily WHERE page_id = ? AND snapshot_date <= ?", (pg["page_id"], as_of))}
+        last = hist.get(dates[-1]) if dates else None
+        cats = ""
+        if last and last["page_categories"]:
+            try:
+                cats = ", ".join(json.loads(last["page_categories"]))[:30]
+            except ValueError:
+                cats = last["page_categories"][:30]
+        t.add_row(_short(pg["store_domain"]), (pg["page_name"] or "")[:24], pg["page_id"], cats,
+                  *[str(hist[d]["page_like_count"]) if d in hist and hist[d]["page_like_count"] is not None else "-" for d in dates],
+                  "" if not last or last["likes_delta_1d"] is None else str(last["likes_delta_1d"]),
+                  "" if not last or last["likes_slope_7d"] is None else f"{last['likes_slope_7d']:.1f}",
+                  "" if not last or last["likes_slope_prev_7d"] is None else f"{last['likes_slope_prev_7d']:.1f}")
+    console.print(t)
+    cov = conn.execute(f"""SELECT s.store_domain, COUNT(DISTINCT a.ad_id) AS ads, SUM(a.delivery_status = 'on') AS on_, SUM(a.delivery_status = 'off') AS off,
+                             SUM(a.detail_fetched_date IS NOT NULL) AS fetched, SUM(a.creative_hash IS NOT NULL) AS hashed,
+                             SUM(a.lineage_via = 'creative') AS lin_creative
+                           FROM meta_ads a JOIN stores s ON s.id = a.store_id WHERE 1=1 {where} GROUP BY s.store_domain""", params).fetchall()
+    t = Table(title="coverage")
+    for c in ("store", "ads", "delivering", "off", "single-ad pages read", "creatives hashed", "lineage by creative"):
+        t.add_column(c, justify="left" if c == "store" else "right")
+    for r in cov:
+        t.add_row(_short(r["store_domain"]), *[str(r[k] or 0) for k in ("ads", "on_", "off", "fetched", "hashed", "lin_creative")])
+    console.print(t)
+    return 0
+
+
+def _read_clipboard() -> str:
+    try:
+        import tkinter
+        root = tkinter.Tk()
+        root.withdraw()
+        try:
+            return root.clipboard_get()
+        finally:
+            root.destroy()
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(f"could not read the clipboard ({e}); use --file or pass the URL") from e
+
+
+def cmd_fb_capture(args) -> int:
+    """Record Sponsored posts you saw yourself: a permalink, the bookmarklet JSON (--paste), or a file."""
+    conn = db.connect(args.db)
+    today = _parse_date(args.date)
+    if args.paste:
+        text = _read_clipboard()
+    elif args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    elif args.url:
+        text = json.dumps({"permalink": args.url, "page_name": args.page, "primary_text": args.text, "landing_url": args.landing,
+                           "reactions": args.reactions, "comments": args.comments, "shares": args.shares})
+    else:
+        console.print("[red]give a URL, --paste (bookmarklet JSON on the clipboard) or --file[/]")
+        return 2
+    try:
+        caps = fb_posts.parse_captures_text(text)
+    except ValueError as e:
+        console.print(f"[red]{e}[/]")
+        return 2
+    if not caps:
+        console.print("[yellow]nothing to capture[/]")
+        return 1
+    store_id = None
+    if args.store:
+        store_id = db.upsert_store(conn, args.store)
+    new = 0
+    for c in caps:
+        if c.get("image_url") and not c.get("image_hash"):
+            c["image_hash"] = fb_posts.hash_image(c["image_url"])
+        if fb_posts.record_capture(conn, c, today, source="paste" if args.paste else ("file" if args.file else "manual"), store_id=store_id):
+            new += 1
+        console.print(f"post {c['post_id']}  page={c.get('page_name') or c.get('page_id') or '?'}  counts={c.get('counts') or {}}")
+    matched = fb_posts.match_posts(conn)
+    fb_posts.propagate_to_ads(conn, today)
+    console.print(f"{len(caps)} capture(s), {new} new, {matched} newly matched to Ad Library ads. Daily counts: `python tracker.py fb-engagement`")
+    return 0
+
+
+def cmd_fb_engagement(args) -> int:
+    """Logged-out re-fetch of every captured permalink; deltas; propagate to matched ads."""
+    from playwright.sync_api import sync_playwright
+    conn = db.connect(args.db)
+    today = _parse_date(args.date)
+    n = conn.execute("SELECT COUNT(*) FROM fb_posts").fetchone()[0]
+    if not n:
+        console.print("no captured posts yet - see `python tracker.py fb-capture --help`")
+        return 1
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=not args.headed, **meta_ads.launch_kwargs())
+        try:
+            c = fb_posts.refresh_engagement(conn, browser, today, args.max)
+        finally:
+            browser.close()
+    console.print(f"permalinks: {c['candidates']} due, fetched {c['fetched']}: ok={c['ok']} gated={c['gated']} removed={c['removed']} "
+                  f"no_counts={c['no_counts']} errors={c['errors']}")
+    return _fb_report(conn, today, args.limit)
+
+
+def _fb_report(conn, as_of: str, limit: int = 60) -> int:
+    dates = [r[0] for r in conn.execute("SELECT DISTINCT snapshot_date FROM fb_posts_daily WHERE snapshot_date <= ? ORDER BY snapshot_date DESC LIMIT 7", (as_of,))][::-1]
+    t = Table(title=f"captured Sponsored posts and their public counts (reactions/comments/shares; as of {as_of})")
+    for c in ("post", "page", "store", "ad (match)", "status"):
+        t.add_column(c)
+    for d in dates:
+        t.add_column(d[5:], justify="right")
+    for c in ("comments 1d", "eng/day 7d"):
+        t.add_column(c, justify="right")
+    rows = conn.execute("""SELECT p.*, s.store_domain FROM fb_posts p LEFT JOIN stores s ON s.id = p.store_id ORDER BY p.captured_at DESC LIMIT ?""",
+                        (limit,)).fetchall()
+    for p in rows:
+        hist = {x["snapshot_date"]: x for x in conn.execute("SELECT * FROM fb_posts_daily WHERE post_id = ?", (p["post_id"],))}
+        last = hist.get(dates[-1]) if dates else None
+        cells = []
+        for d in dates:
+            x = hist.get(d)
+            if not x:
+                cells.append("-")
+            elif x["reactions"] is None and x["comments"] is None:
+                cells.append(x["status"] or "?")
+            else:
+                cells.append(f"{x['reactions'] or 0}/{x['comments'] or 0}/{x['shares'] or 0}")
+        match = f"{p['ad_id']} ({p['match_via']} {p['match_score']})" if p["ad_id"] else ""
+        t.add_row(p["post_id"][:20], (p["page_name"] or p["page_id"] or "")[:22], _short(p["store_domain"] or ""), match, p["status"] or "",
+                  *cells, "" if not last or last["comment_delta_1d"] is None else str(last["comment_delta_1d"]),
+                  "" if not last or last["engagement_per_day_7d"] is None else f"{last['engagement_per_day_7d']:.1f}")
+    console.print(t)
+    total = conn.execute("SELECT COUNT(*), SUM(ad_id IS NOT NULL), SUM(status = 'gated'), SUM(status = 'removed') FROM fb_posts").fetchone()
+    console.print(f"{total[0]} posts captured, {total[1] or 0} matched to Ad Library ads, {total[2] or 0} gated, {total[3] or 0} removed")
+    return 0
+
+
+def cmd_fb_report(args) -> int:
+    conn = db.connect(args.db)
+    as_of = _parse_date(args.date) if args.date else (conn.execute("SELECT MAX(snapshot_date) FROM fb_posts_daily").fetchone()[0] or date.today().isoformat())
+    return _fb_report(conn, as_of, args.limit)
+
+
 def cmd_ads(args) -> int:
     snapshot_date = _parse_date(args.date)
     stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
@@ -483,7 +768,8 @@ def cmd_ads(args) -> int:
     console.print(f"ads: snapshot_date={snapshot_date} pages={n} waits={config.META_WAIT_MIN}-{config.META_WAIT_MAX}s "
                   f"headless={not args.headed}")
     t0 = time.monotonic()
-    ok, failed = run_ads_pass(conn, stores, snapshot_date, only, headless=not args.headed, max_scrolls=args.max_scrolls)
+    ok, failed = run_ads_pass(conn, stores, snapshot_date, only, headless=not args.headed, max_scrolls=args.max_scrolls,
+                              detail=not args.no_detail, detail_cap=args.detail_max)
     md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
     console.print(f"done in {time.monotonic() - t0:.0f}s: [green]{ok} ok[/], [red]{failed} failed[/]"
                   + (f"; alerts written to {md}" if md else ""))
@@ -894,7 +1180,49 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
     s.add_argument("--headed", action="store_true", help="show the browser window (debugging)")
     s.add_argument("--max-scrolls", type=int, help=f"scroll cap per page (default {config.META_MAX_SCROLLS})")
+    s.add_argument("--no-detail", action="store_true", help="skip the single-ad page pass")
+    s.add_argument("--detail-max", type=int, help=f"single-ad pages per store (default {config.META_DETAIL_MAX})")
     s.set_defaults(fn=cmd_ads)
+
+    s = sub.add_parser("ads-detail", help="single-ad Ad Library pages: end_date (delivery), page likes, creative fingerprints")
+    s.add_argument("--date", help="snapshot date (default today)")
+    s.add_argument("--watchlist")
+    s.add_argument("--only", nargs="+", metavar="DOMAIN")
+    s.add_argument("--ads", nargs="+", metavar="AD_ID", help="fetch just these ad ids and print what was parsed")
+    s.add_argument("--max", type=int, help=f"pages per store (default {config.META_DETAIL_MAX})")
+    s.add_argument("--headed", action="store_true")
+    s.set_defaults(fn=cmd_ads_detail)
+
+    s = sub.add_parser("ads-detail-report", help="end_date and page_like_count per day for flagged ads; page likes; coverage")
+    s.add_argument("--date", help="as of this date (default latest)")
+    s.add_argument("--store", help="one store domain")
+    s.add_argument("--ads", nargs="+", metavar="AD_ID")
+    s.add_argument("--days", type=int, default=7)
+    s.add_argument("--limit", type=int, default=60)
+    s.set_defaults(fn=cmd_ads_detail_report)
+
+    s = sub.add_parser("fb-capture", help="record a Sponsored post you saw yourself (URL, bookmarklet JSON via --paste, or a file)")
+    s.add_argument("url", nargs="?", help="post permalink")
+    s.add_argument("--paste", action="store_true", help="read the bookmarklet's JSON from the clipboard")
+    s.add_argument("--file", help="file with JSON / JSON lines / one URL per line")
+    s.add_argument("--page", help="page name")
+    s.add_argument("--text", help="primary text (for matching to the Ad Library ad)")
+    s.add_argument("--landing", help="landing URL")
+    s.add_argument("--reactions"); s.add_argument("--comments"); s.add_argument("--shares")
+    s.add_argument("--store", help="store domain this post advertises")
+    s.add_argument("--date", help="snapshot date for the counts (default today)")
+    s.set_defaults(fn=cmd_fb_capture)
+
+    s = sub.add_parser("fb-engagement", help="logged-out re-fetch of every captured post's public counts; deltas; join to ads")
+    s.add_argument("--date", help="snapshot date (default today)")
+    s.add_argument("--max", type=int, help=f"posts per run (default {config.FB_POSTS_MAX})")
+    s.add_argument("--headed", action="store_true")
+    s.add_argument("--limit", type=int, default=60)
+    s.set_defaults(fn=cmd_fb_engagement)
+
+    s = sub.add_parser("fb-report", help="captured posts, matches and count history")
+    s.add_argument("--date"); s.add_argument("--limit", type=int, default=60)
+    s.set_defaults(fn=cmd_fb_report)
 
     s = sub.add_parser("ads-report", help="per-page status, products by ads, concepts, lineage, alerts (--raw for ad rows)")
     s.add_argument("--date", help="snapshot date (default: latest)")

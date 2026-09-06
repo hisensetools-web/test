@@ -67,6 +67,10 @@ META_CHROMIUM_PATH = os.environ.get("META_CHROMIUM_PATH", "").strip()  # optiona
 META_AD_LIBRARY_BASE = os.environ.get("META_AD_LIBRARY_BASE", "https://www.facebook.com/ads/library/")
 LANDING_REFRESH_DAYS = int(os.environ.get("LANDING_REFRESH_DAYS", "7"))  # re-fetch advertorial pages this often
 META_MAX_POSTS = int(os.environ.get("META_MAX_POSTS", "25"))     # boosted posts to fetch per store per run
+META_DETAIL_MAX = int(os.environ.get("META_DETAIL_MAX", "60"))       # single-ad pages per store per day
+META_CREATIVE_MAX_BYTES = int(os.environ.get("META_CREATIVE_MAX_BYTES", str(8 * 1024 * 1024)))   # hash at most this much of a video
+META_LIKES_MIN_SLOPE = float(os.environ.get("META_LIKES_MIN_SLOPE", "5"))   # likes/day before a doubling counts
+FB_POSTS_MAX = int(os.environ.get("FB_POSTS_MAX", "60"))             # permalinks to re-fetch per day
 META_REACH_MIN = int(os.environ.get("META_REACH_MIN", "1000"))    # ignore reach-slope alerts below this reach
 
 # Inventory-delta sales tracking. INVENTORY_STORES = comma list of domains to probe daily (rollout gate);

@@ -508,7 +508,33 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
     for a in all_ads:
         compute_reach_metrics(conn, a["ad_id"], today)
 
-    # per-concept daily rows
+    n_concepts = write_concept_rows(conn, store_id, today)
+    conn.commit()
+    return {"ads": len(all_ads), "ignored": len(all_ads) - len(ads), "resolved": resolved, "concepts": n_concepts,
+            "unlisted": unlisted,
+            "lineage": len(lineage), "pages_fetched": sum(1 for h in cache.values() if h.get("status") is not None)}
+
+
+def delivering(ad: dict) -> bool:
+    """Is this ad delivering today? The single-ad page's end_date (delivery_status) wins when we have it;
+    otherwise presence in the active search results."""
+    ds = ad.get("delivery_status")
+    if ds == "on":
+        return True
+    if ds == "off":
+        return False
+    return bool(ad.get("is_active"))
+
+
+def write_concept_rows(conn: sqlite3.Connection, store_id: int, today: str) -> int:
+    """One meta_concepts_daily row per concept for `today`; survival = delivering / ever, where delivering
+    uses end_date advancement when the single-ad page has been read (survival_source = delivery) and
+    search presence otherwise (survival_source = search)."""
+    ads = [dict(r) for r in conn.execute(
+        """SELECT a.ad_id, a.concept_id, a.page_name, a.landing_url, a.product_handle, a.page_handle, a.ad_start_date,
+                  a.first_seen_date, a.delivery_status, d.is_active
+           FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id AND d.snapshot_date = ?
+           WHERE a.store_id = ? AND COALESCE(a.page_ignored, 0) = 0 AND a.concept_id IS NOT NULL""", (today, store_id))]
     by_c: dict[str, list[dict]] = defaultdict(list)
     for a in ads:
         by_c[a["concept_id"]].append(a)
@@ -516,20 +542,19 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
     for cid, members in by_c.items():
         ever = conn.execute("SELECT COUNT(*) FROM meta_ads WHERE concept_id = ?", (cid,)).fetchone()[0] or len(members)
         active = sum(1 for m in members if m["is_active"])
+        deliv = sum(1 for m in members if delivering(m))
+        source = "delivery" if any(m.get("delivery_status") for m in members) else "search"
         launch = min((m["ad_start_date"] or m["first_seen_date"]) for m in members)
         m0 = members[0]
         conn.execute(
             """INSERT INTO meta_concepts_daily
                (snapshot_date, store_id, concept_id, page_name, landing_url, product_handle, page_handle, launch_date,
-                days_running, ads_ever, ads_active, survival)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                days_running, ads_ever, ads_active, ads_delivering, survival, survival_source)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             (today, store_id, cid, m0.get("page_name"), _strip(m0["landing_url"]) if m0["landing_url"] else None,
-             m0.get("product_handle"), m0.get("page_handle"), launch, _days(launch, today), ever, active,
-             round(active / ever, 3) if ever else None))
-    conn.commit()
-    return {"ads": len(all_ads), "ignored": len(all_ads) - len(ads), "resolved": resolved, "concepts": len(by_c),
-            "unlisted": unlisted,
-            "lineage": len(lineage), "pages_fetched": sum(1 for h in cache.values() if h.get("status") is not None)}
+             m0.get("product_handle"), m0.get("page_handle"), launch, _days(launch, today), ever, active, deliv,
+             round(deliv / ever, 3) if ever else None, source))
+    return len(by_c)
 
 
 def page_relevance(ads: list[dict], store_domain: str) -> dict[str, dict]:
@@ -675,21 +700,21 @@ def run_alerts(conn: sqlite3.Connection, store_id: int, store_domain: str, today
     # rule 6: concept with all ads active 14+ days while the page's active concepts fell
     active_concepts_by_page = defaultdict(int)
     prev_active_by_page = defaultdict(int)
-    for r in conn.execute("SELECT page_name, ads_active FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ?",
+    for r in conn.execute("SELECT page_name, COALESCE(ads_delivering, ads_active) AS ads_active FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ?",
                           (store_id, today)):
         if r["ads_active"]:
             active_concepts_by_page[r["page_name"]] += 1
     prev_date = conn.execute("SELECT MAX(snapshot_date) FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date <= ?",
                              (store_id, week_ago)).fetchone()[0]
     if prev_date:
-        for r in conn.execute("SELECT page_name, ads_active FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ?",
+        for r in conn.execute("SELECT page_name, COALESCE(ads_delivering, ads_active) AS ads_active FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ?",
                               (store_id, prev_date)):
             if r["ads_active"]:
                 prev_active_by_page[r["page_name"]] += 1
         for r in conn.execute(
-            """SELECT concept_id, page_name, product_handle, days_running, ads_ever, ads_active, landing_url
+            """SELECT concept_id, page_name, product_handle, days_running, ads_ever, COALESCE(ads_delivering, ads_active) AS ads_active, landing_url
                FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ?
-                 AND days_running >= 14 AND ads_ever >= 2 AND ads_active = ads_ever""", (store_id, today)):
+                 AND days_running >= 14 AND ads_ever >= 2 AND COALESCE(ads_delivering, ads_active) = ads_ever""", (store_id, today)):
             if active_concepts_by_page[r["page_name"]] < prev_active_by_page.get(r["page_name"], 0):
                 found.append({"rule": 6, "handle": r["product_handle"], "key": f"6|{r['concept_id']}",
                               "detail": f"concept {r['concept_id']} on {r['page_name']}: {r['ads_active']}/{r['ads_ever']} ads "
@@ -745,8 +770,8 @@ def write_alerts_markdown(conn: sqlite3.Connection, today: str, path: Path | Non
         return None
     path = path or (config.ALERTS_DIR / f"{today}.md")
     path.parent.mkdir(parents=True, exist_ok=True)
-    from . import inventory
-    names = {**RULES, **inventory.RULES}
+    from . import ad_detail, inventory
+    names = {**RULES, **inventory.RULES, **ad_detail.RULES}
     lines = [f"# Alerts {today}", ""]
     for r in rows:
         lines.append(f"- **rule {r['rule']}** ({names.get(r['rule'], '')}) {r['store_domain']} "
@@ -779,8 +804,8 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
                                     "eu_reach_slope_7d": None if not r["slope_n"] else round(r["slope"], 1),
                                     "comment_delta_1d": None if not r["cdelta_n"] else int(r["cdelta"])}
     for r in conn.execute(
-        """SELECT product_handle, COUNT(*) AS concepts, SUM(ads_active > 0) AS alive, MAX(days_running) AS oldest,
-                  MAX(CASE WHEN ads_active = ads_ever THEN days_running END) AS oldest_intact
+        """SELECT product_handle, COUNT(*) AS concepts, SUM(COALESCE(ads_delivering, ads_active) > 0) AS alive, MAX(days_running) AS oldest,
+                  MAX(CASE WHEN COALESCE(ads_delivering, ads_active) = ads_ever THEN days_running END) AS oldest_intact
            FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ? AND product_handle IS NOT NULL
            GROUP BY product_handle""", (store_id, snap)):
         h = r["product_handle"]

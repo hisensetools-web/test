@@ -252,6 +252,69 @@ If Meta serves a login wall the pass stops for the day rather than hammering it.
 - If Playwright cannot download its browser, point `META_CHROMIUM_PATH` in `.env` at an
   installed Chromium/Chrome binary.
 
+## Meta layer part 2: delivery, page likes, creatives, and feed-post engagement
+
+### A. Single-ad Ad Library pages (public, no login)
+
+`facebook.com/ads/library/?id={ad_archive_id}` embeds the ad record in the HTML (`data-sjs`
+script blocks, under `deeplink_ad_archive_result.deeplink_ad_archive`). There is no post id in
+it and the tracker does not look for one. The daily `ads` pass (and `python tracker.py ads-detail`)
+opens these pages headlessly for up to `META_DETAIL_MAX` (60) ads per store per day, most
+valuable first: ads named by an alert, ads started in the last 14 days, one ad per page (for the
+page-likes reading), then the rest; an ad already switched off is re-read weekly. The search
+results payload also carries `end_date` and `page_like_count`, so every scraped ad gets a free
+`list` reading each day and the single-ad page adds a `detail` reading (which wins).
+
+| field | stored as | derived |
+|---|---|---|
+| `end_date` | `meta_ad_detail_daily.end_date`, `meta_ads.last_delivered` | `delivery_status` = on while it advances; **off** when it has not moved for 2+ days (or lies 2+ days back), with `switched_off_date` = the last day it delivered. Concept survival (`ads_delivering / ads_ever`, rule 6, Signals `concept_status`) uses delivery whenever a concept has it, search presence otherwise |
+| `page_like_count` | `meta_page_likes_daily` (one row per page per day) | `likes_delta_1d`, `likes_slope_7d`, `likes_slope_prev_7d`; **rule 12** fires when the 7-day slope is at least twice the prior week's (and the prior week was at least `META_LIKES_MIN_SLOPE` likes/day) |
+| `snapshot.images[].original_image_url`, video URLs | `meta_creatives` (sha256 of the file, videos capped at `META_CREATIVE_MAX_BYTES`) and `meta_ads.creative_hash` | lineage by creative: a later ad on the same page with the same hash gets `lineage_of` the earliest one, `lineage_via = creative`, so image-only iterations are caught alongside the text-similarity lineage |
+| `page_profile_uri` id, `page_categories` | `meta_ads.page_profile_id`, `page_categories` (JSON) | shown in the reports |
+
+```bash
+python tracker.py ads-detail --only biorootlabs.com        # fetch now (default cap 60 per store)
+python tracker.py ads-detail --ads 1234567890123 ...       # one ad, prints what was parsed
+python tracker.py ads-detail-report --store biorootlabs.com --days 3
+```
+
+`ads-detail-report` lists, for the ads named by that store's alerts (or `--ads`), the
+`end_date` read on each day (`L` = list payload), delivery status, last delivered and off-since
+dates, and lineage; then `page_like_count` per page per day with the deltas and slopes; then
+coverage (ads read, delivering, off, creatives hashed, lineage by creative).
+
+### B. Engagement on Sponsored posts: captured by hand, counted logged-out
+
+Dark ads carry reactions / comments / shares only as feed posts. The tracker does **not** drive
+a logged-in Facebook account for this (automating an account, throwaway or not, inside a
+logged-in session is exactly what Meta's terms forbid and litigate). Instead:
+
+1. **You capture.** When you see a Sponsored post from a watchlist brand in your own feed, open
+   it by hand (click its timestamp so the permalink is in the address bar) and either run
+   `python tracker.py fb-capture <permalink> --page "Brand" --text "the ad copy" --store brand.com`
+   or click the bookmarklet in `tools/fb_capture_bookmarklet.js` (it copies a JSON capture with the
+   permalink, page, selected text and visible counts to the clipboard) and run
+   `python tracker.py fb-capture --paste`. `--file` takes JSON lines or one URL per line.
+   Posts are deduped on `post_id`.
+2. **The tracker counts.** `python tracker.py fb-engagement` (and the daily `run`, once any post
+   is captured) opens every known permalink in a fresh, logged-out browser context and records
+   the public reaction / comment / share counts in `fb_posts_daily`, deriving `comment_delta_1d`
+   and `engagement_per_day_7d`. A permalink behind a login wall is marked `gated`, a dead one
+   `removed`; both are skipped afterwards.
+3. **Join.** A post is matched to an Ad Library ad on the same page (id, else name) when the
+   normalised primary text is at least 0.8 similar (word trigrams) or the creative hash matches.
+   The ad row gets `post_id` / `post_permalink`, its `meta_ads_daily` row gets the counts, and
+   `engagement_per_day` reaches the Signals tab through the existing product join (rule 5 sees it too).
+
+```bash
+python tracker.py fb-report        # captured posts, matches, count history
+```
+
+**Daily run:** with `META_ADS=1` the scheduled `run` now does: Shopify pass -> stock probe -> Ad
+Library search scrape -> single-ad pages (A) -> boosted-post counts -> captured-post counts (B)
+-> Sheets sync. Nothing in `run_daily.bat` changes. Budget: the single-ad pages add roughly
+`META_DETAIL_MAX` x 4 s per store per day.
+
 ## Inventory-delta sales tracking (store-side demand signal)
 
 Traffic tools see a store weeks late and the Ad Library gives no reach for US/UK advertisers,
@@ -383,7 +446,9 @@ python tracker.py remove-store bad1.com bad2.com     # drops them from watchlist
 | `runs`, `store_runs` | run / (run, store) | status, error text, products seen, pages, duration |
 | `hero_variants` | (store, variant) | which variants are probed, role (new / rank / bundle_component), current rung, `inventory_tracked`, last probe date |
 | `inventory_daily` | (day, variant) | `stock_level`, `signal_source`, raw probe message, `units_sold_1d`, `restock_units`, `units_per_day_7d`, `units_per_day_prev_7d`, `units_per_day_wow` |
-| `alerts` | alert | rules 1-4 (deltas), 5-8 (Meta), 9-11 (inventory) |
+| `meta_ad_detail_daily`, `meta_page_likes_daily`, `meta_creatives` | (day, ad) / (day, page) / (ad, creative) | single-ad page readings, page likes with slopes, creative hashes |
+| `fb_posts`, `fb_posts_daily` | post / (day, post) | captured Sponsored posts, their match to an ad, daily public counts |
+| `alerts` | alert | rules 1-4 (deltas), 5-8 (Meta), 9-11 (inventory), 12 (page likes) |
 
 History is append-only across days. Re-running the same `--date` replaces only that day
 for that store, so a crashed or partial run can be repeated safely.
@@ -470,6 +535,8 @@ earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) 
 earlyscale/deltas.py    pure delta calculations (7d counts, sold-out/price/handle deltas) + DB loaders
 earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture), parser, SQLite recording
 earlyscale/ad_metrics.py landing-URL join, concepts, lineage, daily ad metrics, alert rules 5-8, Signals join
+earlyscale/ad_detail.py  single-ad Ad Library pages: delivery (end_date), page likes, creative fingerprints, rule 12
+earlyscale/fb_posts.py   captured Sponsored posts, logged-out counts, join to ads
 earlyscale/inventory.py  hero-variant selection, /cart/add.js stock probe + theme fallback, units-sold maths, alert rules 9-11
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O

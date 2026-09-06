@@ -607,7 +607,7 @@ def fetch_post_counts(browser, url: str) -> tuple[dict, str]:
             counts = parse_post_counts(body)
         return counts, ("ok" if counts else "no-counts")
     except Exception as e:  # noqa: BLE001
-        return {}, f"error:{type(e).__name__}"
+        return {}, f"error:{type(e).__name__}:{str(e).splitlines()[0][:60] if str(e) else ''}"
     finally:
         ctx.close()
 
