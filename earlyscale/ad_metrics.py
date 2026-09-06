@@ -262,9 +262,16 @@ def discover_unlisted_products(conn: sqlite3.Connection, store_id: int, store_do
                 if r.status_code == 200 and "json" in r.headers.get("Content-Type", ""):
                     data = r.json().get("product") or {}
                     if data.get("id") and data.get("handle"):
-                        product = shopify.normalise_product(data)
-                        hit["product_handle"] = product["handle"]
-                        hit["candidates"] = f"unlisted-product:{product['product_id']}"
+                        got = shopify.normalise_product(data)
+                        if got["handle"] != handle or got["handle"] in known:
+                            # the store redirected an old handle to a product we already know:
+                            # remember the redirect, do not create an unlisted twin
+                            hit["product_handle"] = match_handle(got["handle"], known) or got["handle"]
+                            hit["candidates"] = f"redirect:{got['handle']}"
+                        else:
+                            product = got
+                            hit["product_handle"] = product["handle"]
+                            hit["candidates"] = f"unlisted-product:{product['product_id']}"
             except (requests.RequestException, ValueError) as e:
                 hit["status"], hit["candidates"] = -1, f"error:{str(e)[:80]}"
             conn.execute("""INSERT OR REPLACE INTO landing_pages (url, fetched_at, status, final_url, product_handle, page_handle, candidates)

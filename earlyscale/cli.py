@@ -332,13 +332,17 @@ def cmd_ads_report(args) -> int:
     t = Table(title="landing pages fetched (advertorials / unmatched URLs), unresolved first")
     for c in ("landing url", "active ads", "http", "resolved to", "handles found on page"):
         t.add_column(c, overflow="fold")
+    known_products = {r[0] for r in conn.execute(
+        "SELECT DISTINCT handle FROM products_daily WHERE snapshot_date >= date(?, '-7 days')", (as_of,))}
     for r in conn.execute(f"""
         SELECT lp.url, lp.status, lp.product_handle, lp.candidates, COUNT(*) n
         FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id JOIN stores s ON s.id = a.store_id
         JOIN landing_pages lp ON lp.url = substr(a.landing_url, 1, CASE WHEN instr(a.landing_url, '?') > 0
                                                        THEN instr(a.landing_url, '?') - 1 ELSE length(a.landing_url) END)
         WHERE d.snapshot_date = ? AND d.is_active = 1 AND COALESCE(a.page_ignored, 0) = 0 {where}
-        GROUP BY lp.url ORDER BY (lp.product_handle IS NULL) DESC, n DESC LIMIT 12""", [as_of] + params):
+        GROUP BY lp.url ORDER BY (lp.product_handle IS NULL) DESC, n DESC LIMIT 20""", [as_of] + params):
+        if r["url"].endswith(".json") or ad_metrics.handle_from_url(r["url"])[0] in known_products:
+            continue   # product pages we already know are not diagnostics
         t.add_row(r["url"], str(r["n"]), "" if r["status"] is None else str(r["status"]),
                   r["product_handle"] or "[red]-[/]", (r["candidates"] or "")[:90])
     console.print(t)

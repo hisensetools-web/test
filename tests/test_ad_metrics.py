@@ -424,3 +424,31 @@ class UnlistedProductTests(unittest.TestCase):
         ad_metrics.process_store(conn, sid, "supp.com", "2026-09-06", self._session(log))
         self.assertEqual(conn.execute("SELECT product_handle FROM meta_ads WHERE ad_id='a'").fetchone()[0], "turmeric-1-000mg-o2")
         self.assertNotIn("https://supp.com/pages/li10", log)   # served from cache, re-matched
+
+
+class RedirectedHandleTests(unittest.TestCase):
+    def test_old_handle_redirecting_to_listed_product_is_not_recorded_as_unlisted(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "supp.com")
+        db.write_product_snapshot(conn, sid, "2026-09-06", [_prod(1, "turmeric-1000mg", "Turmeric", pos=0)])
+        session = mock.Mock(spec=requests.Session)
+
+        def get(url, **kw):
+            r = requests.Response(); r.encoding = "utf-8"
+            if url.endswith("/products/turmeric.json"):     # store redirects old handle -> current product json
+                r.status_code = 200; r.url = "https://supp.com/products/turmeric-1000mg.json"
+                r.headers["Content-Type"] = "application/json"
+                r._content = json.dumps({"product": {"id": 1, "handle": "turmeric-1000mg", "title": "Turmeric",
+                                                     "variants": [{"id": 10, "price": "39.00", "available": True}]}}).encode()
+            else:
+                r.status_code = 404; r.url = url; r._content = b""
+            return r
+        session.get.side_effect = get
+        ads = [_ad("1", "Brand", "2026-09-01", "https://supp.com/products/turmeric", "old handle copy")]
+        meta_ads.record_scrape(conn, sid, "2026-09-06", ads, "q")
+        m = ad_metrics.process_store(conn, sid, "supp.com", "2026-09-06", session)
+        self.assertEqual(m["unlisted"], 0)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM products_daily WHERE unlisted = 1").fetchone()[0], 0)
+        self.assertEqual(conn.execute("SELECT product_handle FROM meta_ads WHERE ad_id='1'").fetchone()[0], "turmeric-1000mg")
+        lp = conn.execute("SELECT candidates FROM landing_pages WHERE url LIKE '%turmeric.json'").fetchone()[0]
+        self.assertEqual(lp, "redirect:turmeric-1000mg")
