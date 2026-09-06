@@ -278,6 +278,12 @@ python tracker.py ads-detail --ads 1234567890123 ...       # one ad, prints what
 python tracker.py ads-detail-report --store biorootlabs.com --days 3
 ```
 
+Single-ad pages are opened in a *light* browser context (images, media, fonts, stylesheets and
+external scripts are aborted: the record is in the server-rendered HTML; `META_DETAIL_LIGHT=0`
+turns that off), the context is recycled every `META_DETAIL_CONTEXT_PAGES` (20) pages, and a
+Chromium that dies mid-pass is relaunched and the ad retried once, so one heavy page cannot
+take the remaining stores down with it.
+
 `ads-detail-report` lists, for the ads named by that store's alerts (or `--ads`), the
 `end_date` read on each day (`L` = list payload), delivery status, last delivered and off-since
 dates, and lineage; then `page_like_count` per page per day with the deltas and slopes; then

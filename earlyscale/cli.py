@@ -196,9 +196,10 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
     ok = failed = 0
     session = shopify.make_session()   # for landing-page fetches
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=headless, **meta_ads.launch_kwargs())
+        handle = meta_ads.BrowserHandle(p, headless=headless)
         try:
             for i, s in enumerate(stores):
+                browser = handle.get()   # relaunched if the previous store killed it
                 domain = s["store_domain"]
                 store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
                 conn.commit()
@@ -221,9 +222,9 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                         log.warning("%-28s list readings failed: %s", domain, e)
                     _post_process_store(conn, store_id, domain, snapshot_date, session)
                     if detail:
-                        _detail_pass_store(conn, browser, store_id, domain, snapshot_date, detail_cap)
+                        _detail_pass_store(conn, handle, store_id, domain, snapshot_date, detail_cap)
                     try:
-                        pe = meta_ads.fetch_boosted_engagement(conn, browser, store_id, snapshot_date)
+                        pe = meta_ads.fetch_boosted_engagement(conn, handle.get(), store_id, snapshot_date)
                         if pe["candidates"]:
                             log.info("%-28s boosted posts: %d candidates, fetched %d, counts found %d",
                                      domain, pe["candidates"], pe["fetched"], pe["with_counts"])
@@ -247,7 +248,7 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                 if i < len(stores) - 1:
                     meta_ads._wait()
         finally:
-            browser.close()
+            handle.close()
     return ok, failed
 
 
@@ -498,9 +499,9 @@ def _detail_pass_store(conn, browser, store_id: int, domain: str, snapshot_date:
     try:
         c = ad_detail.fetch_store_details(conn, browser, store_id, snapshot_date, cap)
         f = ad_detail.finalize_store(conn, store_id, snapshot_date)
-        log.info("%-28s detail: fetched %d/%d ok=%d no_record=%d errors=%d login_wall=%d creatives_hashed=%d | delivering=%d off=%d pages=%d "
+        log.info("%-28s detail: fetched %d/%d ok=%d no_record=%d errors=%d login_wall=%d creatives_hashed=%d relaunches=%d | delivering=%d off=%d pages=%d "
                  "creative_lineage=%d alerts=%d %.0fs", domain, c["ok"] + c["no_record"] + c["errors"], c["selected"], c["ok"],
-                 c["no_record"], c["errors"], c["login_wall"], c["hashed"], f["delivering"], f["off"], f["pages"],
+                 c["no_record"], c["errors"], c["login_wall"], c["hashed"], c.get("relaunches", 0), f["delivering"], f["off"], f["pages"],
                  f["creative_lineage"], f["alerts"], time.monotonic() - t0)
         return {**c, **f}
     except Exception as e:  # noqa: BLE001
@@ -517,7 +518,8 @@ def cmd_ads_detail(args) -> int:
     only = set(args.only) if args.only else None
     targets = [s for s in stores if not only or s["store_domain"] in only]
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=not args.headed, **meta_ads.launch_kwargs())
+        handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
+        browser = handle
         try:
             if args.ads:
                 sid = db.upsert_store(conn, targets[0]["store_domain"]) if targets else None
@@ -543,11 +545,11 @@ def cmd_ads_detail(args) -> int:
                 conn.commit()
                 if not conn.execute("SELECT 1 FROM meta_ads WHERE store_id = ? LIMIT 1", (store_id,)).fetchone():
                     continue
-                r = _detail_pass_store(conn, browser, store_id, st["store_domain"], snapshot_date, args.max)
+                r = _detail_pass_store(conn, handle, store_id, st["store_domain"], snapshot_date, args.max)
                 t.add_row(_short(st["store_domain"]), *[str(r.get(c, "")) for c in ("selected", "ok", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts")])
             console.print(t)
         finally:
-            browser.close()
+            handle.close()
     md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
     if md:
         console.print(f"alerts written to {md}")

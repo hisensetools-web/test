@@ -325,6 +325,35 @@ def launch_kwargs() -> dict:
     (e.g. a pre-installed Chromium when Playwright's own download is unavailable)."""
     return {"executable_path": config.META_CHROMIUM_PATH} if config.META_CHROMIUM_PATH else {}
 
+class BrowserHandle:
+    """Lazily launched Chromium that is relaunched when it dies (a heavy page can take the whole
+    browser process down; the pass must carry on with the next ad / store instead of failing)."""
+
+    def __init__(self, pw, headless: bool = True):
+        self.pw, self.headless, self.browser, self.relaunches = pw, headless, None, 0
+
+    def get(self):
+        if self.browser is None or not self.browser.is_connected():
+            if self.browser is not None:
+                self.relaunches += 1
+                log.warning("browser died; relaunching (%d)", self.relaunches)
+            self.browser = self.pw.chromium.launch(headless=self.headless, **launch_kwargs())
+        return self.browser
+
+    def close(self) -> None:
+        try:
+            if self.browser is not None and self.browser.is_connected():
+                self.browser.close()
+        except Exception:  # noqa: BLE001
+            pass
+        self.browser = None
+
+
+def browser_closed_error(e: BaseException) -> bool:
+    m = str(e).lower()
+    return "has been closed" in m or "target closed" in m or "browser closed" in m or "connection closed" in m
+
+
 @dataclass
 class ScrapeResult:
     url: str

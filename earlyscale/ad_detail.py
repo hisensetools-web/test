@@ -143,9 +143,29 @@ def detail_url(ad_id: str) -> str:
     return f"{config.META_AD_LIBRARY_BASE}?id={ad_id}"
 
 
-def new_context(browser):
-    return browser.new_context(user_agent=random.choice(meta_ads.USER_AGENTS), viewport={"width": 1366, "height": 850},
-                               locale="en-US")
+BLOCKED_RESOURCE_TYPES = ("image", "media", "font", "stylesheet")
+
+
+def new_context(browser, light: bool | None = None):
+    """A context for single-ad pages. `light` (default META_DETAIL_LIGHT) aborts images, media, fonts,
+    stylesheets and external scripts: the record is in the server-rendered HTML, and Facebook's
+    JS bundle is what makes 60 pages in a row exhaust a desktop Chromium."""
+    light = config.META_DETAIL_LIGHT if light is None else light
+    ctx = browser.new_context(user_agent=random.choice(meta_ads.USER_AGENTS), viewport={"width": 1366, "height": 850},
+                              locale="en-US")
+    if light:
+        def _route(route):
+            rt = route.request.resource_type
+            if rt in BLOCKED_RESOURCE_TYPES or (rt == "script" and route.request.url.startswith("http")):
+                return route.abort()
+            return route.continue_()
+        ctx.route("**/*", _route)
+    return ctx
+
+
+def _browser_of(browser):
+    """`browser` may be a Playwright Browser or a meta_ads.BrowserHandle."""
+    return browser.get() if hasattr(browser, "get") else browser
 
 
 def fetch_ad_detail(browser, ad_id: str, page=None, dismiss: bool = True) -> tuple[dict | None, str]:
@@ -153,7 +173,7 @@ def fetch_ad_detail(browser, ad_id: str, page=None, dismiss: bool = True) -> tup
     `page` lets one browser context serve a whole store's pass (a new context per ad costs seconds)."""
     ctx = None
     if page is None:
-        ctx = new_context(browser)
+        ctx = new_context(_browser_of(browser))
         page = ctx.new_page()
     try:
         page.goto(detail_url(ad_id), wait_until="domcontentloaded", timeout=config.META_NAV_TIMEOUT_MS)
@@ -442,23 +462,65 @@ def fetch_store_details(conn: sqlite3.Connection, browser, store_id: int, today:
     """Fetch the single-ad page for the selected ads, record readings, hash creatives. Stops on a login wall."""
     todo = select_for_detail(conn, store_id, today, cap)
     wait = wait or (lambda: meta_ads._wait(2, 5))
-    counts = {"selected": len(todo), "ok": 0, "no_record": 0, "errors": 0, "login_wall": 0, "hashed": 0, "hash_failed": 0}
+    counts = {"selected": len(todo), "ok": 0, "no_record": 0, "errors": 0, "login_wall": 0, "hashed": 0, "hash_failed": 0,
+              "relaunches": 0, "context_recycles": 0}
     session = requests.Session()
-    ctx = page = None
-    if todo and browser is not None and fetch is fetch_ad_detail:
-        ctx = new_context(browser)
-        page = ctx.new_page()
+    live = bool(todo) and browser is not None and fetch is fetch_ad_detail
+    holder = {"ctx": None, "page": None, "pages": 0}
+
+    def fresh_page():
+        if holder["ctx"] is not None:
+            try:
+                holder["ctx"].close()
+            except Exception:  # noqa: BLE001
+                pass
+        holder["ctx"] = new_context(_browser_of(browser))
+        holder["page"] = holder["ctx"].new_page()
+        holder["pages"] = 0
+        return holder["page"]
+
+    if live:
+        fresh_page()
     try:
-        _fetch_loop(conn, browser, page, store_id, today, todo, counts, fetch, hash_fetch, session, wait)
+        _fetch_loop(conn, browser, holder, fresh_page, store_id, today, todo, counts, fetch, hash_fetch, session, wait)
     finally:
-        if ctx is not None:
-            ctx.close()
+        if holder["ctx"] is not None:
+            try:
+                holder["ctx"].close()
+            except Exception:  # noqa: BLE001
+                pass
     return counts
 
 
-def _fetch_loop(conn, browser, page, store_id, today, todo, counts, fetch, hash_fetch, session, wait) -> None:
+def _fetch_one(browser, item, holder, fresh_page, fetch, counts):
+    """One fetch that survives a dead browser / context (relaunch + retry once) and recycles the
+    context every META_DETAIL_CONTEXT_PAGES pages."""
+    page = holder["page"]
+    if page is None:
+        return fetch(browser, item["ad_id"])
+    if holder["pages"] >= config.META_DETAIL_CONTEXT_PAGES:
+        page = fresh_page()
+        counts["context_recycles"] += 1
+    first = holder["pages"] == 0
+    holder["pages"] += 1
+    detail, status = fetch(browser, item["ad_id"], page, first)
+    dead = False
+    try:
+        dead = page.is_closed() or not _browser_of(browser).is_connected()
+    except Exception:  # noqa: BLE001
+        dead = True
+    if status.startswith("error") and dead:
+        counts["relaunches"] += 1
+        log.warning("browser/page died on ad %s; relaunching and retrying once", item["ad_id"])
+        page = fresh_page()
+        holder["pages"] += 1
+        detail, status = fetch(browser, item["ad_id"], page, True)
+    return detail, status
+
+
+def _fetch_loop(conn, browser, holder, fresh_page, store_id, today, todo, counts, fetch, hash_fetch, session, wait) -> None:
     for i, item in enumerate(todo):
-        detail, status = fetch(browser, item["ad_id"], page, i == 0) if page is not None else fetch(browser, item["ad_id"])
+        detail, status = _fetch_one(browser, item, holder, fresh_page, fetch, counts)
         if status == "login-wall":
             counts["login_wall"] += 1
             log.error("Ad Library single-ad page shows a login wall; stopping the detail pass for today")

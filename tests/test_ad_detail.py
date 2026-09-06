@@ -164,6 +164,52 @@ class DbTests(unittest.TestCase):
         self.assertEqual(ad_detail.flagged_ad_ids(self.conn, self.sid), {"1003", "1002"})
         self.assertEqual(len(ad_detail.select_for_detail(self.conn, self.sid, TODAY, cap=1)), 1)
 
+    def test_dead_browser_is_relaunched_and_context_recycled(self):
+        class FakePage:
+            def __init__(self, ctx): self.ctx, self.closed = ctx, False
+            def is_closed(self): return self.closed
+        class FakeCtx:
+            def __init__(self, br): self.br, self.pages = br, []
+            def new_page(self):
+                p = FakePage(self); self.pages.append(p); return p
+            def route(self, *a): pass
+            def close(self): pass
+        class FakeBrowser:
+            def __init__(self): self.connected, self.contexts = True, []
+            def is_connected(self): return self.connected
+            def new_context(self, **kw):
+                c = FakeCtx(self); self.contexts.append(c); return c
+        class Handle:
+            def __init__(self): self.browsers = [FakeBrowser()]
+            def get(self):
+                if not self.browsers[-1].connected:
+                    self.browsers.append(FakeBrowser())
+                return self.browsers[-1]
+        handle = Handle()
+        seen = []
+
+        def fetch(browser, ad_id, page=None, dismiss=True):
+            seen.append((ad_id, dismiss))
+            if ad_id == "1002" and len(seen) == 1:      # the browser dies on the first ad
+                page.closed = True
+                handle.browsers[-1].connected = False
+                return None, "error:TargetClosedError"
+            return ad_detail.normalise_detail(node(ad_id)), "ok"
+        old_pages, old_light = config.META_DETAIL_CONTEXT_PAGES, config.META_DETAIL_LIGHT
+        config.META_DETAIL_CONTEXT_PAGES, config.META_DETAIL_LIGHT = 2, False
+        try:
+            real = ad_detail.fetch_ad_detail
+            ad_detail.fetch_ad_detail = fetch      # so fetch_store_details treats the pass as live
+            c = ad_detail.fetch_store_details(self.conn, handle, self.sid, TODAY, cap=10, fetch=fetch,
+                                              hash_fetch=lambda u, s=None: {"sha256": "h", "bytes": 1, "scope": "full"}, wait=lambda: None)
+        finally:
+            ad_detail.fetch_ad_detail = real
+            config.META_DETAIL_CONTEXT_PAGES, config.META_DETAIL_LIGHT = old_pages, old_light
+        self.assertEqual((c["ok"], c["errors"], c["relaunches"]), (3, 0, 1))
+        self.assertEqual(len(handle.browsers), 2)                         # relaunched once
+        self.assertEqual([a for a, _ in seen], ["1002", "1002", "1001", "1003"])   # retried once after the relaunch
+        self.assertGreaterEqual(c["context_recycles"], 1)                 # 2 pages per context
+
     def test_fetch_store_details_stops_on_login_wall(self):
         seq = iter([(ad_detail.normalise_detail(node("1002")), "ok"), (None, "login-wall"), (ad_detail.normalise_detail(node("1001")), "ok")])
         c = ad_detail.fetch_store_details(self.conn, None, self.sid, TODAY, cap=10, fetch=lambda b, a: next(seq),
