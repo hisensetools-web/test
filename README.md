@@ -135,9 +135,14 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
 
 ## Behaviour on failure
 
-- Requests present as a normal desktop browser (Chrome User-Agent, HTML-first `Accept`,
-  `Accept-Language`). Some storefront WAFs answer 406 to anything else (seen on olavita.co).
-  Override with `USER_AGENT` in `.env` if a store needs something different.
+- Requests carry a Chrome User-Agent and `Accept-Language` (some storefront WAFs answer 406
+  to bot-looking agents, seen on olavita.co) and `Accept: application/json`. Do **not** send
+  an HTML-first Accept: Shopify then serves the storefront HTML for `/products.json` with a
+  200. If a store answers 406 to `application/json`, the request is repeated once with
+  `Accept: */*`. Override the agent with `USER_AGENT` in `.env` if needed.
+- An HTML or otherwise non-JSON body fails immediately with a descriptive
+  `got HTML, not JSON from <url> (HTTP <status>, content-type <type>)` error in
+  `store_runs.error`, never a JSON parse traceback.
 - Before paginating, the host is resolved once: `GET /products.json?limit=1` following
   redirects, and the final origin (e.g. `https://www.store.com`) is reused for every later
   request. If the apex host is unreachable (connection error / timeout, seen on
@@ -165,7 +170,8 @@ whole pipeline can be exercised without network access:
 python -m tests.mock_store --port 8001 --products 320 --seed 1 &
 python -m tests.mock_store --port 8002 --products 40  --seed 2 --fail-first 430 &   # tests retry
 python -m tests.mock_store --port 8003 --products 610 --seed 3 &
-python -m tests.mock_store --port 8004 --products 55  --seed 4 --require-browser &         # 406 unless browser headers
+python -m tests.mock_store --port 8004 --products 55  --seed 4 --require-browser &         # 406 to bot UA or explicit JSON Accept
+python -m tests.mock_store --port 8007 --products 90  --seed 7 --html-unless-json-accept &  # HTML for .json unless Accept asks JSON
 python -m tests.mock_store --port 8005 --products 1   --seed 5 --redirect-to http://127.0.0.1:8006 &   # apex -> "www"
 python -m tests.mock_store --port 8006 --products 130 --seed 5 &
 python tracker.py run --watchlist tests/watchlist.mock.csv --date 2026-09-05

@@ -69,7 +69,7 @@ def resolve_base_url(session: requests.Session, store_domain: str) -> str:
     for cand in candidates:
         try:
             r = session.get(f"{cand}/products.json", params={"limit": 1}, timeout=config.REQUEST_TIMEOUT,
-                            allow_redirects=True)
+                            allow_redirects=True, headers={"Accept": config.JSON_ACCEPT})
         except (requests.ConnectionError, requests.Timeout) as e:
             last_err = e
             log.warning("%s unreachable (%s)%s", cand, type(e).__name__,
@@ -82,14 +82,51 @@ def resolve_base_url(session: requests.Session, store_domain: str) -> str:
     raise StoreFetchError(f"unreachable: {last_err}")
 
 
+def _looks_like_html(text: str) -> bool:
+    head = text.lstrip("\ufeff \t\r\n")[:512].lower()
+    return head.startswith("<!doctype") or head.startswith("<html") or head.startswith("<?xml") \
+        or head.startswith("<head") or head.startswith("<body")
+
+
+def parse_json_response(r: requests.Response) -> dict:
+    """Decode a JSON body, raising a clear StoreFetchError (never a JSONDecodeError
+    traceback) when the store sent HTML or otherwise non-JSON content."""
+    ctype = r.headers.get("Content-Type", "")
+    text = r.text
+    if _looks_like_html(text) or ("html" in ctype and not text.lstrip().startswith(("{", "["))):
+        raise StoreFetchError(
+            f"got HTML, not JSON from {r.url} (HTTP {r.status_code}, content-type {ctype or 'none'}) "
+            "- password page, bot challenge, or not a Shopify storefront")
+    try:
+        data = r.json()
+    except ValueError:
+        snippet = text.strip()[:80].replace("\n", " ")
+        raise StoreFetchError(
+            f"response from {r.url} is not valid JSON (HTTP {r.status_code}, content-type {ctype or 'none'}): "
+            f"{snippet!r}") from None
+    if not isinstance(data, dict):
+        raise StoreFetchError(f"unexpected JSON shape from {r.url}: {type(data).__name__}")
+    return data
+
+
 def get_json(session: requests.Session, url: str, params: dict | None = None,
              retries: int = config.REQUEST_RETRIES) -> dict:
     """GET a JSON document with timeout and exponential backoff.
-    Retries on connection errors, timeouts, 429/430 (Shopify rate limit) and 5xx."""
+
+    Sends Accept: application/json. If the store answers 406 to that, the request is
+    repeated once with Accept: */* (some WAFs reject explicit JSON). Retries with backoff
+    on connection errors, timeouts, 429/430 (Shopify rate limit) and 5xx. HTML or
+    unparsable bodies fail immediately with a descriptive error."""
     last_err: Exception | None = None
     for attempt in range(retries + 1):
         try:
-            r = session.get(url, params=params, timeout=config.REQUEST_TIMEOUT, allow_redirects=True)
+            r = session.get(url, params=params, timeout=config.REQUEST_TIMEOUT, allow_redirects=True,
+                            headers={"Accept": config.JSON_ACCEPT})
+            if r.status_code == 406:
+                log.info("%s answered 406 to Accept: %s; retrying once with %s", url, config.JSON_ACCEPT,
+                         config.FALLBACK_ACCEPT)
+                r = session.get(url, params=params, timeout=config.REQUEST_TIMEOUT, allow_redirects=True,
+                                headers={"Accept": config.FALLBACK_ACCEPT})
             if r.status_code in (429, 430) or r.status_code >= 500:
                 raise StoreFetchError(f"HTTP {r.status_code}")
             if r.status_code in (401, 403, 406):
@@ -97,18 +134,14 @@ def get_json(session: requests.Session, url: str, params: dict | None = None,
             if r.status_code == 404:
                 raise StoreFetchError("HTTP 404 (not a Shopify storefront?)")  # no retry
             r.raise_for_status()
-            ctype = r.headers.get("Content-Type", "")
-            if "json" not in ctype:
-                # Password-protected stores 302 to /password and return HTML with 200.
-                raise StoreFetchError(f"non-JSON response ({ctype or 'no content-type'}) from {r.url}")  # no retry
-            return r.json()
+            return parse_json_response(r)  # raises non-retryable StoreFetchError on HTML/garbage
         except StoreFetchError as e:
             msg = str(e)
             retryable = msg.startswith("HTTP 429") or msg.startswith("HTTP 430") or msg.startswith("HTTP 5")
             if not retryable:
                 raise
             last_err = e
-        except (requests.ConnectionError, requests.Timeout, ValueError) as e:  # ValueError: bad JSON
+        except (requests.ConnectionError, requests.Timeout) as e:
             last_err = e
         if attempt < retries:
             wait = (2 ** attempt) * 1.5 + random.uniform(0, 1)
@@ -240,7 +273,7 @@ def discover_meta_page(store_domain: str, session: requests.Session | None = Non
     session = session or make_session()
     try:
         r = session.get(base_url(store_domain) + "/", timeout=config.REQUEST_TIMEOUT,
-                        headers={"Accept": "text/html"})
+                        headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
         r.raise_for_status()
     except requests.RequestException as e:
         log.warning("%s: could not fetch home page for meta discovery: %s", store_domain, e)

@@ -92,7 +92,8 @@ def mutate(products: list[dict], seed: int, now: datetime) -> list[dict]:
 
 
 def make_handler(products: list[dict], collection: list[dict], delay_first_page_status: int | None,
-                 require_browser: bool = False, redirect_to: str | None = None):
+                 require_browser: bool = False, redirect_to: str | None = None,
+                 html_unless_json_accept: bool = False):
     state = {"first_products_call": True, "hits": 0}
 
     class Handler(BaseHTTPRequestHandler):
@@ -117,10 +118,21 @@ def make_handler(products: list[dict], collection: list[dict], delay_first_page_
                 self.send_header("Content-Length", "0")
                 self.end_headers()
                 return
-            if require_browser:  # olavita.co-style WAF: 406 unless the request looks like a browser
-                ua = self.headers.get("User-Agent", "")
-                accept = self.headers.get("Accept", "")
-                if "Mozilla/" not in ua or "compatible;" in ua or "text/html" not in accept:
+            ua = self.headers.get("User-Agent", "")
+            accept = self.headers.get("Accept", "")
+            if html_unless_json_accept and u.path.endswith(".json"):
+                # Real Shopify behaviour that caused the 2026-09 regression: an HTML-first
+                # Accept header gets the storefront page back with a 200.
+                if "application/json" not in accept and not accept.startswith("*/*"):
+                    html = b"<!DOCTYPE html><html><head><title>Store</title></head><body>storefront</body></html>"
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/html; charset=utf-8")
+                    self.send_header("Content-Length", str(len(html)))
+                    self.end_headers()
+                    self.wfile.write(html)
+                    return
+            if require_browser:  # olavita.co-style WAF: 406 unless browser UA, and rejects explicit JSON Accept
+                if "Mozilla/" not in ua or "compatible;" in ua or accept.strip() == "application/json":
                     self._send_json(406, {"error": "Not Acceptable"})
                     return
             limit = min(int(qs.get("limit", ["30"])[0]), 250)
@@ -162,6 +174,8 @@ def main(argv=None):
                     help="answer the first /products.json request with this status (e.g. 430) to test retry")
     ap.add_argument("--require-browser", action="store_true",
                     help="answer 406 unless User-Agent/Accept look like a real browser")
+    ap.add_argument("--html-unless-json-accept", action="store_true",
+                    help="answer .json URLs with the storefront HTML (200) unless Accept asks for JSON")
     ap.add_argument("--redirect-to", metavar="ORIGIN",
                     help="301 every request to ORIGIN (simulates apex -> www redirect)")
     args = ap.parse_args(argv)
@@ -173,7 +187,8 @@ def main(argv=None):
     collection = list(products)
     random.Random(args.seed + 7).shuffle(collection)
     srv = HTTPServer(("127.0.0.1", args.port), make_handler(products, collection, args.fail_first,
-                                                             args.require_browser, args.redirect_to))
+                                                             args.require_browser, args.redirect_to,
+                                                             args.html_unless_json_accept))
     print(f"mock store on http://127.0.0.1:{args.port} products={len(products)} seed={args.seed} mutate={args.mutate}")
     srv.serve_forever()
 

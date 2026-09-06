@@ -34,18 +34,18 @@ REQUEST_RETRIES = 3
 REQUEST_DELAY_S = float(os.environ.get("REQUEST_DELAY_S", "1.0"))
 PAGE_LIMIT = 250
 MAX_PAGES = 60  # 60 * 250 = 15k products; safety cap against infinite pagination
-# Some storefront WAFs answer 406 to non-browser User-Agent/Accept combinations
-# (seen on olavita.co), so we present as a normal desktop browser.
+# Present as a desktop browser (some storefront WAFs answer 406 to bot-looking
+# User-Agents, seen on olavita.co) but ask for JSON explicitly: an HTML-first Accept
+# makes Shopify serve the storefront HTML for /products.json (regression, 2026-09).
 USER_AGENT = os.environ.get(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
     "Chrome/128.0.0.0 Safari/537.36",
 )
+JSON_ACCEPT = "application/json"
+FALLBACK_ACCEPT = "*/*"          # tried once if a store answers 406 to application/json
 BROWSER_HEADERS = {
     "User-Agent": USER_AGENT,
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8",
+    "Accept": JSON_ACCEPT,
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
 }
