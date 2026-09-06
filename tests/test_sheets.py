@@ -6,7 +6,9 @@ from unittest import mock
 
 import requests
 
-from earlyscale import db, sheets, shopify
+from earlyscale import config, db, sheets, shopify
+
+config.WATCHLIST_PATH = Path(__file__).parent / "fixtures" / "empty_watchlist.csv"
 
 FIX = Path(__file__).parent / "fixtures"
 D1, D2 = "2026-09-05", "2026-09-06"
@@ -157,10 +159,10 @@ class SyncTests(unittest.TestCase):
         session.post.return_value = _resp(200, '{"ok":true,"written":1,"skipped":0}')
         out = sheets.sync(conn, "https://x/exec", session=session)
         payloads = [json.loads(c.kwargs["data"]) for c in session.post.call_args_list]
-        self.assertEqual([p["tab"] for p in payloads], ["Stores", "Products", "Alerts"])
-        self.assertEqual([p["mode"] for p in payloads], ["replace", "append", "append"])
-        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 3)
-        self.assertEqual([x["tab"] for x in out], ["Stores", "Products", "Alerts"])
+        self.assertEqual([p["tab"] for p in payloads], ["Signals", "Families", "Categories", "Stores", "Products", "Alerts"])
+        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 4 + ["append", "append"])
+        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 6)
+        self.assertEqual([x["tab"] for x in out], ["Signals", "Families", "Categories", "Stores", "Products", "Alerts"])
 
     def test_dry_run_sends_nothing_and_missing_url_is_clear(self):
         conn = two_day_db()

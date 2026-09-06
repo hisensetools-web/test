@@ -105,6 +105,8 @@ def cmd_run(args) -> int:
     console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
     rc = 1 if ok == 0 and failed else 0
     if config.SHEETS_WEBHOOK_URL and not args.no_sync:
+        if args.watchlist:
+            sheets.set_watchlist_path(Path(args.watchlist))
         console.print("syncing to Google Sheets (SHEETS_WEBHOOK_URL is set) ...")
         if _do_sheets_sync(conn, as_of=snapshot_date) != 0:
             rc = rc or 3
@@ -133,6 +135,8 @@ def cmd_sync_sheets(args) -> int:
                       "(see README > Google Sheets sync), or use --dry-run to preview.")
         return 2
     conn = db.connect(args.db)
+    if args.watchlist:
+        sheets.set_watchlist_path(Path(args.watchlist))
     tabs = tuple(t.strip().lower() for t in args.tabs.split(",")) if args.tabs else sheets.TAB_ORDER
     bad = [t for t in tabs if t not in sheets.TAB_ORDER]
     if bad:
@@ -295,6 +299,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--date", help="sync the snapshot as of this date (default: latest)")
     s.add_argument("--tabs", help="comma list from stores,products,alerts (default all)")
     s.add_argument("--dry-run", action="store_true", help="build and size the chunks but send nothing")
+    s.add_argument("--watchlist", help="alternate watchlist.csv (only its stores are synced)")
     s.set_defaults(fn=cmd_sync_sheets)
 
     s = sub.add_parser("remove-store", help="remove one or more domains from watchlist.csv")

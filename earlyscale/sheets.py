@@ -16,7 +16,8 @@ from urllib.parse import urljoin
 
 import requests
 
-from . import config, deltas
+from . import config, deltas, signals
+from .watchlist import read_watchlist
 
 log = logging.getLogger("earlyscale.sheets")
 
@@ -26,9 +27,45 @@ PRODUCTS_HEADERS = ["date", "store", "handle", "title", "published_at", "updated
                     "available variants", "total variants", "collection position"]
 ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 
-TAB_ORDER = ("stores", "products", "alerts")
-TAB_NAMES = {"stores": "Stores", "products": "Products", "alerts": "Alerts"}
-TAB_MODES = {"stores": "replace", "products": "append", "alerts": "append"}
+SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
+                   "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
+                   "variants_of_family_published_7d", "ads_pointing_here", "engagement_per_day",
+                   "days_running_max", "concept_status"]
+FAMILIES_HEADERS = ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
+                    "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"]
+CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "families published 7d",
+                      "store list", "example families"]
+
+TAB_ORDER = ("signals", "families", "categories", "stores", "products", "alerts")
+TAB_NAMES = {"signals": "Signals", "families": "Families", "categories": "Categories",
+             "stores": "Stores", "products": "Products", "alerts": "Alerts"}
+TAB_MODES = {"signals": "replace", "families": "replace", "categories": "replace",
+             "stores": "replace", "products": "append", "alerts": "append"}
+
+
+_watchlist_path = None   # set by set_watchlist_path(); None = default watchlist.csv
+
+
+def set_watchlist_path(path) -> None:
+    """Use an alternate watchlist.csv for the store filter (the CLI passes --watchlist through)."""
+    global _watchlist_path
+    _watchlist_path = path
+
+
+def watched_store_ids(conn: sqlite3.Connection) -> set[int] | None:
+    """Stores currently in watchlist.csv (None = no watchlist, use every store in the DB).
+    Removed stores keep their history in SQLite but drop out of the sheet."""
+    domains = {r["store_domain"] for r in read_watchlist(_watchlist_path)}
+    if not domains:
+        return None
+    return {r["id"] for r in conn.execute("SELECT id, store_domain FROM stores") if r["store_domain"] in domains}
+
+
+def _stores(conn: sqlite3.Connection):
+    keep = watched_store_ids(conn)
+    for s in conn.execute("SELECT id, store_domain, meta_page_name FROM stores ORDER BY store_domain"):
+        if keep is None or s["id"] in keep:
+            yield s
 
 
 class SheetsSyncError(Exception):
@@ -44,7 +81,7 @@ class _Retryable(SheetsSyncError):
 def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     by_id = {d.store_id: d for d in deltas.all_store_deltas(conn, as_of)}
     rows = []
-    for s in conn.execute("SELECT id, store_domain, meta_page_name FROM stores ORDER BY store_domain"):
+    for s in _stores(conn):
         last = conn.execute(
             "SELECT status, error FROM store_runs WHERE store_id = ? ORDER BY run_id DESC LIMIT 1", (s["id"],)
         ).fetchone()
@@ -71,7 +108,7 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
 
 def products_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     rows = []
-    for s in conn.execute("SELECT id, store_domain FROM stores ORDER BY store_domain"):
+    for s in _stores(conn):
         dates = deltas.snapshot_dates(conn, s["id"], as_of)
         if not dates:
             continue
@@ -105,6 +142,29 @@ def alerts_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
                FROM alerts a JOIN stores s ON s.id = a.store_id WHERE a.snapshot_date = ? ORDER BY a.id""",
             (as_of,))
     ]
+
+
+def _contexts(conn: sqlite3.Connection, as_of: str | None):
+    for s in _stores(conn):
+        ctx = signals.store_signal_context(conn, s["id"], s["store_domain"], as_of)
+        if ctx:
+            yield ctx
+
+
+def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
+    rows = [r for ctx in _contexts(conn, as_of) for r in signals.signals_rows_for_store(ctx)]
+    rows.sort(key=lambda r: (r[4] == "", r[4] if r[4] != "" else 0, r[0], r[2]))   # days_since_published asc
+    return rows
+
+
+def families_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
+    rows = [r for ctx in _contexts(conn, as_of) for r in signals.families_rows_for_store(ctx)]
+    rows.sort(key=lambda r: (-r[6], -r[7], r[4] or "", r[0], r[1]))   # most 7d launches first
+    return rows
+
+
+def categories_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
+    return signals.categories_rows(families_rows(conn, as_of))
 
 
 # ---------------------------------------------------------------- chunking
@@ -181,7 +241,8 @@ def post_payload(session: requests.Session, url: str, payload: dict, retries: in
 # ---------------------------------------------------------------- orchestration
 
 def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = None) -> list[dict]:
-    builders = {"stores": stores_rows, "products": products_rows, "alerts": alerts_rows}
+    builders = {"signals": signals_rows, "families": families_rows, "categories": categories_rows,
+                "stores": stores_rows, "products": products_rows, "alerts": alerts_rows}
     plan = []
     for tab in TAB_ORDER:
         if tab not in tabs:

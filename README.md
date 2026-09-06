@@ -100,13 +100,23 @@ three tabs, each with a bold frozen header row:
 
 | tab | rows | behaviour |
 |---|---|---|
-| **Stores** | one per store | fully overwritten every sync, sorted by change score |
-| **Products** | one per product per snapshot date | appended; duplicates (same date + store + handle) are skipped, so syncing twice is safe |
+| **Signals** | one per product (latest snapshot) | overwritten every sync; sorted by `days_since_published`. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then four Meta columns filled by Part B |
+| **Families** | one per product family per store | overwritten; a family = handles sharing a base name or normalised title. Handle count, newest/oldest published_at, launches in 7/14/30 days, best rank, handle list. Sorted by 7-day launches |
+| **Categories** | one per keyword category | overwritten; categories are title unigrams/bigrams shared by 2+ stores (nothing hardcoded), with store/family counts and newest publish date. Families with no shared keyword fall into `(uncategorised)` |
+| **Stores** | one per store in watchlist.csv | fully overwritten every sync, sorted by change score |
+| **Products** | one per product per snapshot date | appended; duplicates (same date + store + handle) are skipped, so syncing twice is safe. Kept at the end of the tab bar with the two variant-count columns hidden |
 | **Alerts** | one per alert (build step 5) | appended; duplicates (date + store + handle + rule) skipped |
 
 From then on `python tracker.py run` syncs automatically at the end whenever
 `SHEETS_WEBHOOK_URL` is set (use `--no-sync` to skip). `run_daily.bat` needs no change: the
 tracker reads `.env` itself. Exit code 3 means the run succeeded but the sync failed.
+
+### After updating Code.gs
+
+Whenever this repo's `sheets/Code.gs` changes (new tabs, new columns), paste the new file
+over the old one in the Apps Script editor, save, then Deploy > **Manage deployments** >
+pencil icon > Version: **New version** > Deploy. The URL stays the same. Tabs that already
+exist keep their data; new tabs are created on the next sync.
 
 ### If something goes wrong
 

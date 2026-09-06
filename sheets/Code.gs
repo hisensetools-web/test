@@ -7,7 +7,7 @@
  * Put the resulting /exec URL in .env as SHEETS_WEBHOOK_URL.
  *
  * Protocol (one POST per chunk, JSON body):
- *   { "tab": "Stores" | "Products" | "Alerts",
+ *   { "tab": "Signals" | "Families" | "Categories" | "Stores" | "Products" | "Alerts",
  *     "mode": "replace" | "append",
  *     "chunk": 1, "chunks": 3,          // 1-based; replace clears the tab on chunk 1
  *     "rows": [[...], [...]] }           // values in header order
@@ -20,23 +20,44 @@
  */
 
 var TABS = {
+  Signals: {
+    headers: ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
+              "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
+              "variants_of_family_published_7d", "ads_pointing_here", "engagement_per_day",
+              "days_running_max", "concept_status"],
+    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 14], position: 1
+  },
+  Families: {
+    headers: ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
+              "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"],
+    keyCols: null, textCols: [0, 1, 2, 4, 5, 10], position: 2
+  },
+  Categories: {
+    headers: ["category", "stores", "families", "newest published_at", "families published 7d",
+              "store list", "example families"],
+    keyCols: null, textCols: [0, 3, 5, 6], position: 3
+  },
   Stores: {
     headers: ["store", "meta page", "last status", "products", "sold-out variants",
               "new products 7d", "updated products 7d", "sold-out delta", "price changes",
               "change score", "last snapshot date"],
     keyCols: null,                 // fully overwritten each sync
-    textCols: [0, 1, 2, 10]        // keep dates / domains as text, not auto-parsed
+    textCols: [0, 1, 2, 10],       // keep dates / domains as text, not auto-parsed
+    position: 4
   },
   Products: {
     headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price",
               "available variants", "total variants", "collection position"],
     keyCols: [0, 1, 2],            // date + store + handle
-    textCols: [0, 1, 2, 3, 4, 5]
+    textCols: [0, 1, 2, 3, 4, 5],
+    moveToEnd: true,               // raw data lives at the end of the tab bar
+    hideCols: [7, 8]               // available / total variants (still there, just hidden)
   },
   Alerts: {
     headers: ["date", "store", "handle", "rule", "detail", "created_at"],
     keyCols: [0, 1, 2, 3],         // date + store + handle + rule
-    textCols: [0, 1, 2, 4, 5]
+    textCols: [0, 1, 2, 4, 5],
+    position: 5
   }
 };
 
@@ -52,7 +73,7 @@ function doPost(e) {
     if (!e || !e.postData || !e.postData.contents) throw new Error("empty POST body");
     var body = JSON.parse(e.postData.contents);
     var spec = TABS[body.tab];
-    if (!spec) throw new Error("unknown tab: " + body.tab + " (expected Stores, Products or Alerts)");
+    if (!spec) throw new Error("unknown tab: " + body.tab + " (expected one of " + Object.keys(TABS).join(", ") + ")");
     var rows = Array.isArray(body.rows) ? body.rows : [];
     var sheet = getOrCreateSheet_(body.tab, spec);
     var result = (body.mode === "replace")
@@ -87,8 +108,21 @@ function getOrCreateSheet_(name, spec) {
       sheet.getRange(1, spec.textCols[i] + 1, sheet.getMaxRows(), 1).setNumberFormat("@");
     }
     sheet.autoResizeColumns(1, spec.headers.length);
+    if (spec.position) moveSheet_(ss, sheet, spec.position);
+  }
+  if (spec.moveToEnd) moveSheet_(ss, sheet, ss.getNumSheets());
+  if (spec.hideCols) {
+    for (var h = 0; h < spec.hideCols.length; h++) sheet.hideColumns(spec.hideCols[h] + 1);
   }
   return sheet;
+}
+
+function moveSheet_(ss, sheet, position) {
+  var n = ss.getNumSheets();
+  var target = Math.max(1, Math.min(position, n));
+  if (sheet.getIndex && sheet.getIndex() === target) return;
+  ss.setActiveSheet(sheet);
+  ss.moveActiveSheet(target);
 }
 
 /** Stores: chunk 1 wipes everything below the header, later chunks append. */

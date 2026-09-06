@@ -18,7 +18,9 @@ let failFirst = args.includes("--fail-first");
 // ------------------------------------------------ fake Sheets model
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 class Sheet {
-  constructor(name) { this.name = name; this.cells = []; this.formats = {}; this.frozenRows = 0; this.maxRows = 1000; this.autoResized = 0; }
+  constructor(name) { this.name = name; this.cells = []; this.formats = {}; this.frozenRows = 0; this.maxRows = 1000; this.autoResized = 0; this.hidden = new Set(); }
+  hideColumns(c, n = 1) { for (let i = 0; i < n; i++) this.hidden.add(c + i); }
+  getIndex() { return order.indexOf(this) + 1; }
   _fmt(r, c) { return this.formats[r + ":" + c] || this.formats["*:" + c] || ""; }
   getName() { return this.name; }
   getLastRow() { let last = 0; this.cells.forEach((row, i) => { if (row && row.some(v => v !== "" && v !== null && v !== undefined)) last = i + 1; }); return last; }
@@ -59,11 +61,15 @@ class Range {
   }
   clearContent() { for (let i = 0; i < this.nr; i++) { const row = this.s.cells[this.r - 1 + i]; if (row) for (let j = 0; j < this.nc; j++) row[this.c - 1 + j] = ""; } return this; }
 }
-const sheets = {};
+const sheets = {}; const order = []; let active = null;
 const spreadsheet = {
   getSheetByName: n => sheets[n] || null,
-  insertSheet: n => (sheets[n] = new Sheet(n)),
+  insertSheet: n => { const s = new Sheet(n); sheets[n] = s; order.push(s); return s; },
   getSpreadsheetTimeZone: () => "Etc/UTC",
+  getNumSheets: () => order.length,
+  getSheets: () => order.slice(),
+  setActiveSheet: s => { active = s; return s; },
+  moveActiveSheet: pos => { const i = order.indexOf(active); if (i < 0) throw new Error("no active sheet"); order.splice(i, 1); order.splice(pos - 1, 0, active); },
 };
 const sandbox = {
   SpreadsheetApp: { getActiveSpreadsheet: () => spreadsheet },
@@ -84,7 +90,7 @@ const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://x");
   if (req.method === "GET" && url.pathname === "/exec") { const o = sandbox.doGet({}); res.writeHead(200, { "Content-Type": o.mime }); return res.end(o.content); }
   if (req.method === "GET" && url.pathname === "/__dump") {
-    const out = {}; for (const [n, s] of Object.entries(sheets)) out[n] = { frozenRows: s.frozenRows, autoResized: s.autoResized, rows: s.cells.slice(0, s.getLastRow()).map(r => r.map(v => v instanceof Date ? "DATE:" + v.toISOString().slice(0, 10) : v)) };
+    const out = { __order: order.map(s => s.name) }; for (const [n, s] of Object.entries(sheets)) out[n] = { frozenRows: s.frozenRows, autoResized: s.autoResized, hidden: [...s.hidden].sort((a, b) => a - b), rows: s.cells.slice(0, s.getLastRow()).map(r => r.map(v => v instanceof Date ? "DATE:" + v.toISOString().slice(0, 10) : v)) };
     res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify(out));
   }
   if (url.pathname === "/__login") { res.writeHead(200, { "Content-Type": "text/html" }); return res.end("<!DOCTYPE html><html><body>Sign in - Google Accounts</body></html>"); }

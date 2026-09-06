@@ -67,6 +67,41 @@ def build_catalog(n: int, seed: int, now: datetime) -> list[dict]:
     return products
 
 
+SUPPLEMENTS = ["Ceylon Cinnamon", "Oregano Oil", "Beef Organ Complex", "Tart Cherry", "Pumpkin Seed Oil",
+               "Castor Oil", "Black Garlic", "Lymphatic Drainage", "Sea Moss", "Berberine", "Magnesium Glycinate",
+               "Shilajit Resin", "Lion's Mane", "Ashwagandha", "Apple Cider Vinegar", "Turmeric Curcumin"]
+CHANNEL_SUFFIXES = ["", "", "-google", "-tt", "-taboola", "-fb", "-otp", "-sub", "-coc", "-vip", "-old", "-copy", "-2"]
+
+
+def build_supplement_catalog(n: int, seed: int, now: datetime) -> list[dict]:
+    """Health-supplement store: a handful of hero products, each with channel-suffixed handle
+    variants (ceylon-cinnamon-google, ceylon-cinnamon-tt, ...), some launched this week."""
+    rng = random.Random(seed)
+    heroes = rng.sample(SUPPLEMENTS, k=min(len(SUPPLEMENTS), max(3, n // 6)))
+    products = []
+    i = 0
+    while len(products) < n:
+        hero = heroes[i % len(heroes)]
+        base = hero.lower().replace("'", "").replace(" ", "-")
+        suffix = CHANNEL_SUFFIXES[i % len(CHANNEL_SUFFIXES)] if i >= len(heroes) else ""
+        handle = f"{base}-capsules{suffix}"
+        age_days = rng.choice([rng.randint(0, 6)] * 3 + [rng.randint(7, 30)] * 3 + [rng.randint(31, 400)] * 4)
+        created = now - timedelta(days=age_days, hours=rng.randint(0, 23))
+        pid = 7_100_000_000_000 + seed * 1_000_000 + i
+        price = rng.choice([29.0, 39.0, 49.0, 59.0]) + 0.95
+        products.append({
+            "id": pid, "title": f"{hero} Capsules" + (" - Subscription" if suffix == "-sub" else ""),
+            "handle": handle, "body_html": "", "published_at": created.isoformat(),
+            "created_at": created.isoformat(), "updated_at": created.isoformat(),
+            "vendor": f"MockSupp{seed}", "product_type": "Supplement", "tags": [],
+            "variants": [{"id": pid * 10, "title": "Default Title", "sku": f"S{seed}-{i}", "price": f"{price:.2f}",
+                          "compare_at_price": None, "available": rng.random() > 0.1, "position": 1, "product_id": pid}],
+            "images": [], "options": [],
+        })
+        i += 1
+    return products
+
+
 def mutate(products: list[dict], seed: int, now: datetime) -> list[dict]:
     """Day-2 changes: 5% of variants flip to sold out, 3% of products change price, 2 new products."""
     rng = random.Random(seed + 999)
@@ -170,6 +205,8 @@ def main(argv=None):
     ap.add_argument("--products", type=int, default=320)
     ap.add_argument("--seed", type=int, default=1)
     ap.add_argument("--mutate", action="store_true", help="apply day-2 changes to the catalog")
+    ap.add_argument("--catalog", choices=["apparel", "supplements"], default="apparel",
+                    help="supplements = hero products with channel-suffixed handle variants")
     ap.add_argument("--fail-first", type=int, default=None, metavar="STATUS",
                     help="answer the first /products.json request with this status (e.g. 430) to test retry")
     ap.add_argument("--require-browser", action="store_true",
@@ -180,7 +217,7 @@ def main(argv=None):
                     help="301 every request to ORIGIN (simulates apex -> www redirect)")
     args = ap.parse_args(argv)
     now = datetime.now(timezone.utc).replace(microsecond=0)
-    products = build_catalog(args.products, args.seed, now)
+    products = (build_supplement_catalog if args.catalog == "supplements" else build_catalog)(args.products, args.seed, now)
     if args.mutate:
         products = mutate(products, args.seed, now)
     # "best-selling" collection order: deterministic shuffle so position differs from catalog order
