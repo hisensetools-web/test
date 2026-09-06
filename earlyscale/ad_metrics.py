@@ -290,15 +290,31 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
     for a in ads:
         r = resolve_landing(conn, store_id, store_domain, a, known, v2h, session if fetch_landings else None, cache, today)
         a["product_handle"], a["page_handle"] = r["product_handle"], r["page_handle"]
+        a["landing_handle"] = handle_from_url(a.get("landing_url"))[0]   # raw advertised handle, suffix and all
         resolved += 1 if r["product_handle"] else 0
-        conn.execute("UPDATE meta_ads SET product_handle = ?, page_handle = ?, landing_resolved_via = ? WHERE ad_id = ?",
-                     (r["product_handle"], r["page_handle"], r["resolved_via"], a["ad_id"]))
+        conn.execute("""UPDATE meta_ads SET product_handle = ?, page_handle = ?, landing_resolved_via = ?, landing_handle = ?
+                        WHERE ad_id = ?""",
+                     (r["product_handle"], r["page_handle"], r["resolved_via"], a["landing_handle"], a["ad_id"]))
 
     page_of = lambda a: a.get("page_id") or a.get("page_name") or ""
+
+    # Page relevance: a keyword search also returns unrelated advertisers. A page none of whose
+    # ads (with a URL) lands on the store or resolves to a product is ignored downstream.
+    pages = page_relevance(ads, store_domain)
+    conn.execute("DELETE FROM meta_pages_daily WHERE snapshot_date = ? AND store_id = ?", (today, store_id))
+    for name, rec in pages.items():
+        conn.execute("""INSERT INTO meta_pages_daily (snapshot_date, store_id, page_name, page_id, ads, ads_with_url, on_store, ignored)
+                        VALUES (?,?,?,?,?,?,?,?)""",
+                     (today, store_id, name, rec["page_id"], rec["ads"], rec["with_url"], rec["on_store"], rec["ignored"]))
+    for a in ads:
+        a["page_ignored"] = pages[a.get("page_name") or ""]["ignored"]
+        conn.execute("UPDATE meta_ads SET page_ignored = ? WHERE ad_id = ?", (a["page_ignored"], a["ad_id"]))
+    all_ads = ads
+    ads = [a for a in ads if not a["page_ignored"]]
     concepts = cluster_concepts([{"ad_id": a["ad_id"], "page": page_of(a), "landing": _strip(a["landing_url"]) if a["landing_url"] else None,
                                   "launch": a["ad_start_date"] or a["first_seen_date"]} for a in ads])
-    for a in ads:
-        a["concept_id"] = concepts[a["ad_id"]]
+    for a in all_ads:
+        a["concept_id"] = concepts.get(a["ad_id"])
         conn.execute("UPDATE meta_ads SET concept_id = ? WHERE ad_id = ?", (a["concept_id"], a["ad_id"]))
 
     def text_of(a):
@@ -322,7 +338,7 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
            WHERE d.store_id = ? AND d.snapshot_date = (SELECT MAX(snapshot_date) FROM meta_ads_daily
                                                        WHERE store_id = ? AND snapshot_date < ?)""",
         (store_id, store_id, today))}
-    for a in ads:
+    for a in all_ads:
         eng = _engagement(a)
         prev = prev_rows.get(a["ad_id"])
         delta = None
@@ -353,8 +369,25 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
              m0.get("product_handle"), m0.get("page_handle"), launch, _days(launch, today), ever, active,
              round(active / ever, 3) if ever else None))
     conn.commit()
-    return {"ads": len(ads), "resolved": resolved, "concepts": len(by_c), "lineage": len(lineage),
-            "pages_fetched": sum(1 for h in cache.values() if h.get("status") is not None)}
+    return {"ads": len(all_ads), "ignored": len(all_ads) - len(ads), "resolved": resolved, "concepts": len(by_c),
+            "lineage": len(lineage), "pages_fetched": sum(1 for h in cache.values() if h.get("status") is not None)}
+
+
+def page_relevance(ads: list[dict], store_domain: str) -> dict[str, dict]:
+    """{page_name: {ads, with_url, on_store, ignored, page_id}} over one store's ads.
+    on_store counts ads whose landing domain is the store's or that resolved to a product."""
+    out: dict[str, dict] = {}
+    for a in ads:
+        rec = out.setdefault(a.get("page_name") or "", {"ads": 0, "with_url": 0, "on_store": 0, "ignored": 0,
+                                                         "page_id": a.get("page_id")})
+        rec["ads"] += 1
+        if a.get("landing_url"):
+            rec["with_url"] += 1
+            if a.get("product_handle") or same_store(a.get("landing_domain"), store_domain):
+                rec["on_store"] += 1
+    for rec in out.values():
+        rec["ignored"] = 1 if (rec["with_url"] > 0 and rec["on_store"] == 0) else 0
+    return out
 
 
 def _engagement(row: dict) -> int | None:
@@ -393,7 +426,7 @@ def run_alerts(conn: sqlite3.Connection, store_id: int, store_domain: str, today
            WHERE d.store_id = ? AND d.snapshot_date = ? AND d.engagement_per_day IS NOT NULL""",
         (week_ago, store_id, today)):
         if r["then_"] and r["then_"] > 0 and r["now"] >= 2 * r["then_"]:
-            found.append({"rule": 5, "handle": r["product_handle"],
+            found.append({"rule": 5, "handle": r["product_handle"], "key": f"5|{r['ad_id']}",
                           "detail": f"ad {r['ad_id']} ({r['page_name']}): engagement/day {r['then_']} -> {r['now']}"})
 
     # rule 6: concept with all ads active 14+ days while the page's active concepts fell
@@ -415,32 +448,45 @@ def run_alerts(conn: sqlite3.Connection, store_id: int, store_domain: str, today
                FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ?
                  AND days_running >= 14 AND ads_ever >= 2 AND ads_active = ads_ever""", (store_id, today)):
             if active_concepts_by_page[r["page_name"]] < prev_active_by_page.get(r["page_name"], 0):
-                found.append({"rule": 6, "handle": r["product_handle"],
+                found.append({"rule": 6, "handle": r["product_handle"], "key": f"6|{r['concept_id']}",
                               "detail": f"concept {r['concept_id']} on {r['page_name']}: {r['ads_active']}/{r['ads_ever']} ads "
                                         f"alive {r['days_running']}d while page concepts {prev_active_by_page[r['page_name']]}"
                                         f" -> {active_concepts_by_page[r['page_name']]} ({r['landing_url']})"})
 
-    # rule 7: new ad with lineage to a 20+ day ad
+    # rule 7: new ads with lineage to a 20+ day ad, one alert per (page, parent ad) so a store
+    # that launches 40 copies of one proven ad yields one line, not forty.
+    groups: dict[tuple, dict] = {}
     for r in conn.execute(
         """SELECT a.ad_id, a.page_name, a.product_handle, a.lineage_of, a.lineage_similarity, o.ad_start_date, o.first_seen_date
            FROM meta_ads a JOIN meta_ads o ON o.ad_id = a.lineage_of
-           WHERE a.store_id = ? AND a.first_seen_date = ? AND a.lineage_of IS NOT NULL""", (store_id, today)):
+           WHERE a.store_id = ? AND a.first_seen_date = ? AND a.lineage_of IS NOT NULL AND COALESCE(a.page_ignored, 0) = 0""",
+        (store_id, today)):
         age = _days(r["ad_start_date"] or r["first_seen_date"], today) or 0
-        if age >= 20:
-            found.append({"rule": 7, "handle": r["product_handle"],
-                          "detail": f"ad {r['ad_id']} ({r['page_name']}) is {r['lineage_similarity']:.0%} similar to "
-                                    f"ad {r['lineage_of']} running {age}d"})
+        if age < 20:
+            continue
+        g = groups.setdefault((r["page_name"], r["lineage_of"]), {"ids": [], "sims": [], "handles": [], "age": age})
+        g["ids"].append(r["ad_id"])
+        g["sims"].append(r["lineage_similarity"] or 0)
+        if r["product_handle"]:
+            g["handles"].append(r["product_handle"])
+    for (page, parent), g in groups.items():
+        n = len(g["ids"])
+        handle = max(set(g["handles"]), key=g["handles"].count) if g["handles"] else None
+        found.append({"rule": 7, "handle": handle, "key": f"7|{page}|{parent}",
+                      "detail": f"{n} new ad{'s' if n > 1 else ''} on {page} re-use copy from ad {parent} running "
+                                f"{g['age']}d (avg {sum(g['sims']) / n:.0%} similar; e.g. {', '.join(g['ids'][:3])})"})
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     written = []
     for f in found:
+        key = f.get("key") or f"{f['rule']}|{f['detail']}"
         exists = conn.execute(
-            "SELECT 1 FROM alerts WHERE snapshot_date = ? AND store_id = ? AND rule = ? AND detail = ?",
-            (today, store_id, f["rule"], f["detail"])).fetchone()
+            "SELECT 1 FROM alerts WHERE snapshot_date = ? AND store_id = ? AND dedupe_key = ?",
+            (today, store_id, key)).fetchone()
         if exists:
             continue
-        conn.execute("INSERT INTO alerts (snapshot_date, store_id, product_handle, rule, detail, created_at) VALUES (?,?,?,?,?,?)",
-                     (today, store_id, f["handle"], f["rule"], f["detail"], now))
+        conn.execute("""INSERT INTO alerts (snapshot_date, store_id, product_handle, rule, detail, created_at, dedupe_key)
+                        VALUES (?,?,?,?,?,?,?)""", (today, store_id, f["handle"], f["rule"], f["detail"], now, key))
         written.append(f)
     conn.commit()
     return written
@@ -476,6 +522,7 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
         """SELECT a.product_handle, COUNT(*) AS n, MAX(d.days_running) AS dmax, AVG(d.engagement_per_day) AS epd
            FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
            WHERE d.store_id = ? AND d.snapshot_date = ? AND d.is_active = 1 AND a.product_handle IS NOT NULL
+             AND COALESCE(a.page_ignored, 0) = 0
            GROUP BY a.product_handle""", (store_id, snap)):
         out[r["product_handle"]] = {"ads_pointing_here": r["n"], "days_running_max": r["dmax"],
                                     "engagement_per_day": None if r["epd"] is None else round(r["epd"], 1),

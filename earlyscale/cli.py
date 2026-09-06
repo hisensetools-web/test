@@ -307,14 +307,40 @@ def cmd_ads_report(args) -> int:
         t.add_row(r["store_domain"], r["product_handle"], str(r["n"]), str(r["pages"]), str(r["oldest"] or ""),
                   str(r["newest"] or ""), str(r["concepts"]), f"direct {r['direct'] or 0}, via page {r['via_page'] or 0}")
     console.print(t)
-    unresolved = conn.execute(f"""
-        SELECT a.landing_domain, a.page_handle, COUNT(*) n FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
-        JOIN stores s ON s.id = d.store_id WHERE d.snapshot_date = ? AND d.is_active = 1 AND a.product_handle IS NULL {where}
-        GROUP BY a.landing_domain, a.page_handle ORDER BY n DESC LIMIT 10""", [as_of] + params).fetchall()
-    if unresolved:
-        console.print("[dim]active ads with no product match: " + "; ".join(
-            f"{r['landing_domain'] or 'no url'}{('/pages/' + r['page_handle']) if r['page_handle'] else ''} x{r['n']}"
-            for r in unresolved) + "[/]")
+    ignored = conn.execute(f"""
+        SELECT p.page_name, p.ads FROM meta_pages_daily p JOIN stores s ON s.id = p.store_id
+        WHERE p.snapshot_date = ? AND p.ignored = 1 {where} ORDER BY p.ads DESC""", [as_of] + params).fetchall()
+    if ignored:
+        console.print("[dim]ignored pages (none of their ads land on the store): " +
+                      ", ".join(f"{r['page_name']} x{r['ads']}" for r in ignored) + "[/]")
+
+    t = Table(title="advertised handles (raw /products/<handle> in ad URLs) -> resolved product")
+    for c in ("store", "advertised handle", "active ads", "in products.json", "resolved to"):
+        t.add_column(c)
+    for r in conn.execute(f"""
+        SELECT s.store_domain, a.landing_handle, COUNT(*) n, a.product_handle,
+               EXISTS (SELECT 1 FROM products_daily p WHERE p.store_id = s.id AND p.handle = a.landing_handle
+                       AND p.snapshot_date = (SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = s.id)) listed
+        FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id JOIN stores s ON s.id = d.store_id
+        WHERE d.snapshot_date = ? AND d.is_active = 1 AND a.landing_handle IS NOT NULL AND COALESCE(a.page_ignored, 0) = 0 {where}
+        GROUP BY s.store_domain, a.landing_handle ORDER BY n DESC LIMIT ?""", [as_of] + params + [args.limit]):
+        t.add_row(r["store_domain"], r["landing_handle"], str(r["n"]), "[green]yes[/]" if r["listed"] else "[yellow]no[/]",
+                  r["product_handle"] or "[red]-[/]")
+    console.print(t)
+
+    t = Table(title="landing pages fetched (advertorials / unmatched URLs), unresolved first")
+    for c in ("landing url", "active ads", "http", "resolved to", "handles found on page"):
+        t.add_column(c, overflow="fold")
+    for r in conn.execute(f"""
+        SELECT lp.url, lp.status, lp.product_handle, lp.candidates, COUNT(*) n
+        FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id JOIN stores s ON s.id = a.store_id
+        JOIN landing_pages lp ON lp.url = substr(a.landing_url, 1, CASE WHEN instr(a.landing_url, '?') > 0
+                                                       THEN instr(a.landing_url, '?') - 1 ELSE length(a.landing_url) END)
+        WHERE d.snapshot_date = ? AND d.is_active = 1 AND COALESCE(a.page_ignored, 0) = 0 {where}
+        GROUP BY lp.url ORDER BY (lp.product_handle IS NULL) DESC, n DESC LIMIT 12""", [as_of] + params):
+        t.add_row(r["url"], str(r["n"]), "" if r["status"] is None else str(r["status"]),
+                  r["product_handle"] or "[red]-[/]", (r["candidates"] or "")[:90])
+    console.print(t)
 
     t = Table(title=f"concepts (page + landing + launch window), by days running")
     for c in ("store", "page", "launched", "days", "ads", "active", "survival", "product / page handle", "landing"):
@@ -325,24 +351,26 @@ def cmd_ads_report(args) -> int:
         FROM meta_concepts_daily c JOIN stores s ON s.id = c.store_id WHERE c.snapshot_date = ? {where}
         ORDER BY c.ads_ever DESC, c.days_running DESC LIMIT ?""", [as_of] + params + [args.limit]):
         surv = "" if r["survival"] is None else f"{r['survival']:.0%}"
+        from urllib.parse import urlparse as _up
         t.add_row(r["store_domain"], r["page_name"] or "", r["launch_date"] or "", str(r["days_running"] or ""),
                   str(r["ads_ever"]), str(r["ads_active"]), surv,
                   r["product_handle"] or (f"/pages/{r['page_handle']}" if r["page_handle"] else ""),
-                  (r["landing_url"] or "")[:60])
+                  (_up(r["landing_url"]).path if r["landing_url"] else "")[:60])
     console.print(t)
 
     lin = conn.execute(f"""
-        SELECT s.store_domain, a.ad_id, a.page_name, a.lineage_of, a.lineage_similarity, a.first_seen_date,
-               o.ad_start_date AS parent_start, a.product_handle
+        SELECT s.store_domain, a.page_name, a.lineage_of, o.ad_start_date AS parent_start, COUNT(*) n,
+               AVG(a.lineage_similarity) sim, MAX(a.product_handle) product_handle, substr(o.headline, 1, 40) headline
         FROM meta_ads a JOIN meta_ads o ON o.ad_id = a.lineage_of JOIN stores s ON s.id = a.store_id
-        WHERE a.lineage_of IS NOT NULL {where} ORDER BY a.first_seen_date DESC LIMIT ?""", params + [args.limit]).fetchall()
+        WHERE a.lineage_of IS NOT NULL AND COALESCE(a.page_ignored, 0) = 0 {where}
+        GROUP BY s.store_domain, a.page_name, a.lineage_of ORDER BY n DESC LIMIT ?""", params + [args.limit]).fetchall()
     if lin:
-        t = Table(title="lineage: new ads that re-use older copy (>70% similar, parent 14+ days)")
-        for c in ("store", "new ad", "page", "first seen", "parent ad", "parent start", "similarity", "product"):
+        t = Table(title="lineage: older ads whose copy new ads re-use (>70% similar, parent 14+ days)")
+        for c in ("store", "page", "parent ad", "parent start", "parent headline", "new ads", "avg sim", "product"):
             t.add_column(c)
         for r in lin:
-            t.add_row(r["store_domain"], r["ad_id"], r["page_name"] or "", r["first_seen_date"], r["lineage_of"],
-                      r["parent_start"] or "", f"{r['lineage_similarity']:.0%}", r["product_handle"] or "")
+            t.add_row(r["store_domain"], r["page_name"] or "", r["lineage_of"], r["parent_start"] or "",
+                      r["headline"] or "", str(r["n"]), f"{r['sim']:.0%}", r["product_handle"] or "")
         console.print(t)
 
     al = conn.execute(f"""SELECT a.rule, a.product_handle, a.detail, s.store_domain FROM alerts a JOIN stores s ON s.id = a.store_id

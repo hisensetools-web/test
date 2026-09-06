@@ -174,6 +174,10 @@ EU reach. Send that table back before enabling more stores.
 3. **Lineage.** An ad whose Meta start date is within 7 days, whose headline+text is more
    than 70% similar (word-trigram Jaccard) to an ad 14+ days old on the same page, is linked
    to that ad.
+   **Page relevance.** A domain keyword search also returns unrelated advertisers. Any page
+   none of whose ads land on the store (or resolve to a product) is marked ignored in
+   `meta_pages_daily`; its ads stay in the database but are left out of concepts, lineage,
+   alerts and the Signals counts. `ads-report` lists ignored pages.
 4. **Per-ad daily metrics.** `days_running`, and `engagement`, `engagement_delta`,
    `engagement_per_day` (7-day average) when engagement counts exist, which the Ad Library
    does not provide, so these stay empty.
@@ -182,13 +186,19 @@ EU reach. Send that table back before enabling more stores.
    - 5: `engagement_per_day` at least 2x its value a week earlier on a single ad.
    - 6: a concept with every ad still active after 14+ days while the page's number of
      active concepts fell versus a week earlier.
-   - 7: an ad with lineage to an ad running 20+ days, on the day it is first seen.
+   - 7: new ads with lineage to an ad running 20+ days, one alert per (page, parent ad)
+     with the count, on the day they are first seen. A store launching 40 copies of one
+     proven ad yields one line.
 6. **Signals tab Meta columns:** `ads_pointing_here` (active ads resolved to that handle),
    `engagement_per_day` (average, empty without engagement data), `days_running_max`,
    `concept_status` (e.g. `2/3 concepts alive, intact 27d`).
 
 `ads-report` prints per-page status, products ranked by active ads pointing at them (with
-how they were resolved), concepts, lineage and today's alerts; `--raw` adds the per-ad rows.
+how they were resolved), the raw advertised handles (channel-suffixed handles that are not
+in products.json show "no" and which product they were resolved to), the landing pages
+that were fetched and what handles were found on them (unresolved first, so you can see
+why an advertorial did not map), concepts, lineage grouped by parent ad, and today's
+alerts; `--raw` adds the per-ad rows.
 
 **Tables:** `meta_ads` (one row per ad ever seen, first/last seen dates, texts, links,
 copy fingerprint, product/page handle, concept id, lineage), `meta_ads_daily` (one row per

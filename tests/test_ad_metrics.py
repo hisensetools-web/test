@@ -177,8 +177,14 @@ class ProcessStoreTests(unittest.TestCase):
         # alerts: rule 7 fires for ad 3 (parent 27d >= 20)
         alerts = ad_metrics.run_alerts(self.conn, self.sid, "supp.com", self.TODAY)
         self.assertEqual([a["rule"] for a in alerts], [7])
-        self.assertIn("ad 3", alerts[0]["detail"])
+        self.assertIn("1 new ad on Supp re-use copy from ad 1 running 27d", alerts[0]["detail"])
+        self.assertIn("e.g. 3", alerts[0]["detail"])
+        self.assertEqual(alerts[0]["handle"], "ceylon-cinnamon-google")
         self.assertEqual(ad_metrics.run_alerts(self.conn, self.sid, "supp.com", self.TODAY), [])   # idempotent
+        # raw advertised handle is kept even when it resolved elsewhere
+        self.assertEqual(rows["5"]["landing_handle"], "nope-not-a-product")
+        self.assertEqual(rows["1"]["landing_handle"], "ceylon-cinnamon-google")
+        self.assertEqual(rows["4"]["landing_handle"], None)
         # Signals join
         sig = ad_metrics.meta_for_signals(self.conn, self.sid, self.TODAY)
         self.assertEqual(sig["ceylon-cinnamon-google"]["ads_pointing_here"], 3)
@@ -227,3 +233,59 @@ class ProcessStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PageRelevanceTests(unittest.TestCase):
+    def test_pages_that_never_land_on_store_are_ignored(self):
+        ads = [
+            {"page_name": "Brand", "landing_url": "https://supp.com/products/x", "landing_domain": "supp.com", "product_handle": "x"},
+            {"page_name": "Brand", "landing_url": "https://other.com/p", "landing_domain": "other.com", "product_handle": None},
+            {"page_name": "Persona", "landing_url": "https://supp.com/pages/av1", "landing_domain": "supp.com", "product_handle": None},
+            {"page_name": "Funnel", "landing_url": "https://getsupp.co/go", "landing_domain": "getsupp.co", "product_handle": "x"},
+            {"page_name": "Stranger", "landing_url": "https://pureveenarg.com/products/z", "landing_domain": "pureveenarg.com", "product_handle": None},
+            {"page_name": "Stranger", "landing_url": "https://glowfem.com/", "landing_domain": "glowfem.com", "product_handle": None},
+            {"page_name": "NoUrls", "landing_url": None, "landing_domain": None, "product_handle": None},
+        ]
+        rel = ad_metrics.page_relevance(ads, "supp.com")
+        self.assertEqual(rel["Brand"]["ignored"], 0)
+        self.assertEqual(rel["Persona"]["ignored"], 0)
+        self.assertEqual(rel["Funnel"]["ignored"], 0)        # resolved through a redirect domain
+        self.assertEqual(rel["Stranger"]["ignored"], 1)
+        self.assertEqual(rel["NoUrls"]["ignored"], 0)        # nothing to judge by -> keep
+        self.assertEqual((rel["Brand"]["ads"], rel["Brand"]["with_url"], rel["Brand"]["on_store"]), (2, 2, 1))
+
+    def test_ignored_page_excluded_from_concepts_alerts_and_signals(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "supp.com")
+        db.write_product_snapshot(conn, sid, "2026-09-06", [_prod(1, "hero", "Hero", pos=0)])
+        copy = "You've heard turmeric helps with inflammation but never this about fillers and dosing."
+        ads = [_ad("a", "Brand", "2026-08-01", "https://supp.com/products/hero", copy),
+               _ad("b", "Brand", "2026-09-06", "https://supp.com/products/hero", copy + " Now."),
+               _ad("c", "Stranger", "2026-08-01", "https://pureveenarg.com/products/z", copy),
+               _ad("d", "Stranger", "2026-09-06", "https://pureveenarg.com/products/z", copy + " Now.")]
+        for a in ads[2:]:
+            a["landing_domain"] = "pureveenarg.com"
+        meta_ads.record_scrape(conn, sid, "2026-09-06", ads, "supp.com")
+        m = ad_metrics.process_store(conn, sid, "supp.com", "2026-09-06", None, fetch_landings=False)
+        self.assertEqual(m["ignored"], 2)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM meta_concepts_daily").fetchone()[0], 2)   # only Brand's
+        self.assertIsNone(conn.execute("SELECT concept_id FROM meta_ads WHERE ad_id='c'").fetchone()[0])
+        alerts = ad_metrics.run_alerts(conn, sid, "supp.com", "2026-09-06")
+        self.assertEqual(len(alerts), 1)
+        self.assertIn("on Brand", alerts[0]["detail"])
+        pages = {r["page_name"]: r["ignored"] for r in conn.execute("SELECT page_name, ignored FROM meta_pages_daily")}
+        self.assertEqual(pages, {"Brand": 0, "Stranger": 1})
+        self.assertEqual(ad_metrics.meta_for_signals(conn, sid, "2026-09-06")["hero"]["ads_pointing_here"], 2)
+
+    def test_rule7_groups_many_children_into_one_alert(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "supp.com")
+        db.write_product_snapshot(conn, sid, "2026-09-06", [_prod(1, "hero", "Hero")])
+        copy = "Clinically dosed turmeric with no filler, you've probably never heard this before today."
+        ads = [_ad("parent", "Brand", "2026-07-20", "https://supp.com/products/hero", copy)]
+        ads += [_ad(f"kid{i}", "Brand", "2026-09-05", "https://supp.com/products/hero", copy + f" v{i}") for i in range(12)]
+        meta_ads.record_scrape(conn, sid, "2026-09-06", ads, "supp.com")
+        ad_metrics.process_store(conn, sid, "supp.com", "2026-09-06", None, fetch_landings=False)
+        alerts = ad_metrics.run_alerts(conn, sid, "supp.com", "2026-09-06")
+        self.assertEqual(len(alerts), 1)
+        self.assertTrue(alerts[0]["detail"].startswith("12 new ads on Brand re-use copy from ad parent running 48d"))

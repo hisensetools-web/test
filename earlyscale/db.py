@@ -140,6 +140,20 @@ CREATE TABLE IF NOT EXISTS meta_concepts_daily (
     PRIMARY KEY (snapshot_date, concept_id)
 );
 
+-- Per page per day: how much of a page's traffic lands on the store; pages that never do
+-- are "ignored" (keyword search picked up an unrelated advertiser).
+CREATE TABLE IF NOT EXISTS meta_pages_daily (
+    snapshot_date   TEXT NOT NULL,
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    page_name       TEXT NOT NULL,
+    page_id         TEXT,
+    ads             INTEGER NOT NULL,
+    ads_with_url    INTEGER NOT NULL,
+    on_store        INTEGER NOT NULL,   -- ads landing on the store domain or resolved to a product
+    ignored         INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_date, store_id, page_name)
+);
+
 -- Fetched ad landing pages (advertorials, redirectors) and what product they point at.
 CREATE TABLE IF NOT EXISTS landing_pages (
     url             TEXT PRIMARY KEY,   -- sans query string
@@ -203,7 +217,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # Part B increment 2 columns (ALTER is idempotent via the column check).
     wanted = {
         "meta_ads": [("concept_id", "TEXT"), ("lineage_of", "TEXT"), ("lineage_similarity", "REAL"),
-                     ("landing_resolved_via", "TEXT")],
+                     ("landing_resolved_via", "TEXT"), ("landing_handle", "TEXT"), ("page_ignored", "INTEGER")],
+        "alerts": [("dedupe_key", "TEXT")],
         "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
                            ("engagement_per_day", "REAL")],
     }
