@@ -431,7 +431,7 @@ open the task's Properties in Task Scheduler and pick "Run whether user is logge
 Linux/macOS cron equivalent (09:00 daily):
 
 ```
-0 6 * * * cd /path/to/tracker && .venv/bin/python tracker.py run >> logs/run_$(date +\%F).log 2>&1
+0 9 * * * cd /path/to/tracker && .venv/bin/python tracker.py run >> logs/run_$(date +\%F).log 2>&1
 ```
 
 `watchlist.csv` ships with three test stores (gymshark, allbirds, colourpop). Add more with:
