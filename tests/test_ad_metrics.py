@@ -155,7 +155,7 @@ class ProcessStoreTests(unittest.TestCase):
         self.assertEqual(rows["4"]["landing_resolved_via"], "page-fetch")
         self.assertIsNone(rows["5"]["product_handle"])
         self.assertEqual(rows["5"]["landing_resolved_via"], "url-unmatched")
-        self.assertEqual(session.get.call_count, 2)   # av1 fetched once (cache); nope-not-a-product fetched once
+        self.assertEqual(session.get.call_count, 3)   # nope.json probe, av1 once (cached), nope page once
         # concepts: 1+2 chain (08-10, 08-11), 3 alone (09-06), 4 alone, 5 alone, 6 alone
         self.assertEqual(rows["1"]["concept_id"], rows["2"]["concept_id"])
         self.assertNotEqual(rows["1"]["concept_id"], rows["3"]["concept_id"])
@@ -333,3 +333,94 @@ class TransitiveLandingTests(unittest.TestCase):
         ad_metrics.run_alerts(conn, sid, "supp.com", "2026-09-06")
         left = [r[0] for r in conn.execute("SELECT detail FROM alerts")]
         self.assertEqual(left, ["shopify rule, untouched"])
+
+
+class UnlistedProductTests(unittest.TestCase):
+    PRODUCT_JSON = json.dumps({"product": {
+        "id": 15551846285652, "title": "Turmeric Curcumin Capsules (1,000mg)", "handle": "turmeric-1-000mg-o2",
+        "published_at": "2026-06-27T16:52:29+01:00", "created_at": "2026-06-27T16:52:29+01:00",
+        "updated_at": "2026-09-06T10:45:54+01:00", "vendor": "Bioroot Labs", "product_type": "Dietary Supplements",
+        "tags": "", "variants": [{"id": 56260941545812, "title": "Default Title", "price": "19.00",
+                                  "compare_at_price": "38.00", "sku": "TU-001", "available": True}]}})
+
+    def _conn(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "supp.com")
+        db.write_product_snapshot(conn, sid, "2026-09-06", [_prod(1, "turmeric-1000mg", "Turmeric Curcumin Capsules (1,000mg)", pos=0)])
+        return conn, sid
+
+    def _session(self, log):
+        session = mock.Mock(spec=requests.Session)
+
+        def get(url, **kw):
+            log.append(url)
+            r = requests.Response(); r.encoding = "utf-8"; r.url = url
+            if url.endswith("/products/turmeric-1-000mg-o2.json"):
+                r.status_code = 200; r.headers["Content-Type"] = "application/json"; r._content = self.PRODUCT_JSON.encode()
+            elif "/pages/li10" in url:
+                r.status_code = 200; r._content = b'<a href="/products/turmeric-1-000mg-o2">Buy</a>'
+            else:
+                r.status_code = 404; r._content = b""
+            return r
+        session.get.side_effect = get
+        return session
+
+    def test_unlisted_advertised_product_gets_its_own_row_and_ads(self):
+        conn, sid = self._conn()
+        ads = [_ad("1", "Brand", "2026-09-01", "https://supp.com/products/turmeric-1-000mg-o2?utm=1", "offer copy one"),
+               _ad("2", "Brand", "2026-09-01", "https://supp.com/products/turmeric-1-000mg-o2", "offer copy two"),
+               _ad("3", "Brand", "2026-08-01", "https://supp.com/products/turmeric-1000mg", "base copy")]
+        meta_ads.record_scrape(conn, sid, "2026-09-06", ads, "q")
+        log = []
+        m = ad_metrics.process_store(conn, sid, "supp.com", "2026-09-06", self._session(log))
+        self.assertEqual(m["unlisted"], 1)
+        self.assertEqual(log, ["https://supp.com/products/turmeric-1-000mg-o2.json"])   # one probe, no page fetches
+        rows = {r["ad_id"]: dict(r) for r in conn.execute("SELECT * FROM meta_ads")}
+        self.assertEqual(rows["1"]["product_handle"], "turmeric-1-000mg-o2")      # not folded into the base product
+        self.assertEqual(rows["1"]["landing_resolved_via"], "url")
+        self.assertEqual(rows["3"]["product_handle"], "turmeric-1000mg")
+        pd = {r["handle"]: dict(r) for r in conn.execute("SELECT * FROM products_daily WHERE snapshot_date='2026-09-06'")}
+        self.assertEqual(pd["turmeric-1-000mg-o2"]["unlisted"], 1)
+        self.assertEqual(pd["turmeric-1-000mg-o2"]["min_price"], 19.0)
+        self.assertEqual(pd["turmeric-1-000mg-o2"]["product_id"], 15551846285652)
+        self.assertEqual(pd["turmeric-1000mg"]["unlisted"], 0)
+        # Signals: own row, tagged unlisted, same family as the listed product (same title), ads attributed to it
+        sig = {r[2]: r for r in sheets.signals_rows(conn)}
+        self.assertEqual(sig["turmeric-1-000mg-o2"][3], "variant+unlisted")
+        self.assertEqual(sig["turmeric-1-000mg-o2"][1], sig["turmeric-1000mg"][1])
+        self.assertEqual(sig["turmeric-1-000mg-o2"][11], 2)
+        self.assertEqual(sig["turmeric-1000mg"][11], 1)
+        # a normal Shopify snapshot for the same day must not wipe the unlisted row
+        db.write_product_snapshot(conn, sid, "2026-09-06", [_prod(1, "turmeric-1000mg", "Turmeric Curcumin Capsules (1,000mg)")])
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM products_daily WHERE unlisted = 1").fetchone()[0], 1)
+        # next day: cached (no refetch), carried into the new snapshot day
+        meta_ads.record_scrape(conn, sid, "2026-09-07", ads, "q")
+        log.clear()
+        ad_metrics.process_store(conn, sid, "supp.com", "2026-09-07", self._session(log))
+        self.assertEqual(log, [])
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM products_daily WHERE unlisted = 1 AND snapshot_date='2026-09-07'").fetchone()[0], 1)
+
+    def test_cached_unresolved_page_rematches_after_unlisted_discovery(self):
+        conn, sid = self._conn()
+        # day 1: only the advertorial is known; it links to a handle nobody knows yet -> unresolved, cached
+        ads = [_ad("a", "Persona", "2026-09-01", "https://supp.com/pages/li10", "advertorial copy")]
+        meta_ads.record_scrape(conn, sid, "2026-09-06", ads, "q")
+        session = mock.Mock(spec=requests.Session)
+
+        def get_day1(url, **kw):
+            r = requests.Response(); r.encoding = "utf-8"; r.url = url
+            if "/pages/li10" in url:
+                r.status_code = 200; r._content = b'<a href="/products/turmeric-1-000mg-o2">Buy</a>'
+            else:
+                r.status_code = 404; r._content = b""
+            return r
+        session.get.side_effect = get_day1
+        ad_metrics.process_store(conn, sid, "supp.com", "2026-09-06", session)
+        self.assertIsNone(conn.execute("SELECT product_handle FROM meta_ads WHERE ad_id='a'").fetchone()[0])
+        # same day, a product ad appears whose .json now resolves; li10 must re-match from its cached candidates
+        ads.append(_ad("b", "Brand", "2026-09-05", "https://supp.com/products/turmeric-1-000mg-o2", "offer copy"))
+        meta_ads.record_scrape(conn, sid, "2026-09-06", ads, "q")
+        log = []
+        ad_metrics.process_store(conn, sid, "supp.com", "2026-09-06", self._session(log))
+        self.assertEqual(conn.execute("SELECT product_handle FROM meta_ads WHERE ad_id='a'").fetchone()[0], "turmeric-1-000mg-o2")
+        self.assertNotIn("https://supp.com/pages/li10", log)   # served from cache, re-matched

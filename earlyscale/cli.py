@@ -216,9 +216,9 @@ def _post_process_store(conn, store_id: int, domain: str, snapshot_date: str, se
     try:
         m = ad_metrics.process_store(conn, store_id, domain, snapshot_date, session, fetch_landings)
         alerts = ad_metrics.run_alerts(conn, store_id, domain, snapshot_date)
-        log.info("%-28s metrics: resolved=%s/%s concepts=%s lineage=%s pages_fetched=%s alerts=%d",
-                 domain, m.get("resolved", 0), m.get("ads", 0), m.get("concepts", 0), m.get("lineage", 0),
-                 m.get("pages_fetched", 0), len(alerts))
+        log.info("%-28s metrics: resolved=%s/%s unlisted_products=%s concepts=%s lineage=%s pages_fetched=%s alerts=%d",
+                 domain, m.get("resolved", 0), m.get("ads", 0), m.get("unlisted", 0), m.get("concepts", 0),
+                 m.get("lineage", 0), m.get("pages_fetched", 0), len(alerts))
         return m
     except Exception as e:  # noqa: BLE001
         log.error("%-28s metrics FAILED: %s", domain, e)
@@ -319,13 +319,14 @@ def cmd_ads_report(args) -> int:
         t.add_column(c)
     for r in conn.execute(f"""
         SELECT s.store_domain, a.landing_handle, COUNT(*) n, a.product_handle,
-               EXISTS (SELECT 1 FROM products_daily p WHERE p.store_id = s.id AND p.handle = a.landing_handle
-                       AND p.snapshot_date = (SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = s.id)) listed
+               (SELECT CASE WHEN COALESCE(p.unlisted, 0) = 1 THEN 'unlisted' ELSE 'yes' END FROM products_daily p
+                 WHERE p.store_id = s.id AND p.handle = a.landing_handle
+                   AND p.snapshot_date = (SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = s.id)) listed
         FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id JOIN stores s ON s.id = d.store_id
         WHERE d.snapshot_date = ? AND d.is_active = 1 AND a.landing_handle IS NOT NULL AND COALESCE(a.page_ignored, 0) = 0 {where}
         GROUP BY s.store_domain, a.landing_handle ORDER BY n DESC LIMIT ?""", [as_of] + params + [args.limit]):
-        t.add_row(r["store_domain"], r["landing_handle"], str(r["n"]), "[green]yes[/]" if r["listed"] else "[yellow]no[/]",
-                  r["product_handle"] or "[red]-[/]")
+        listed = {"yes": "[green]yes[/]", "unlisted": "[cyan]unlisted (live page, fetched)[/]"}.get(r["listed"], "[yellow]no[/]")
+        t.add_row(r["store_domain"], r["landing_handle"], str(r["n"]), listed, r["product_handle"] or "[red]-[/]")
     console.print(t)
 
     t = Table(title="landing pages fetched (advertorials / unmatched URLs), unresolved first")

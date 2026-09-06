@@ -201,7 +201,7 @@ def _snapshot_on_or_before(conn: sqlite3.Connection, store_id: int, target: str)
 def load_store_products(conn: sqlite3.Connection, store_id: int, snapshot_date: str) -> list[dict]:
     return [dict(r) for r in conn.execute(
         """SELECT product_id, handle, title, published_at, updated_at, min_price, variant_count,
-                  sold_out_variants, collection_position
+                  sold_out_variants, collection_position, COALESCE(unlisted, 0) AS unlisted
            FROM products_daily WHERE store_id = ? AND snapshot_date = ?""", (store_id, snapshot_date))]
 
 
@@ -245,8 +245,11 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
         old = ctx["rank_7d"].get(p["product_id"]) if ctx["rank_7d_date"] else None
         rank_delta = "" if (rank is None or old is None) else (old + 1) - rank   # positive = climbed
         sold_out = "Y" if p["variant_count"] and p["sold_out_variants"] >= p["variant_count"] else "N"
+        tag = channel_tag(p["handle"])
+        if p.get("unlisted"):
+            tag = f"{tag}+unlisted" if tag else "unlisted"
         rows.append([
-            ctx["store"], fam[p["product_id"]], p["handle"], channel_tag(p["handle"]),
+            ctx["store"], fam[p["product_id"]], p["handle"], tag,
             "" if days is None else days, p["published_at"] or "",
             "" if p["min_price"] is None else p["min_price"], sold_out,
             "" if rank is None else rank, rank_delta, fam_new_7d[fam[p["product_id"]]],

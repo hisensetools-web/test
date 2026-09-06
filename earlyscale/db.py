@@ -219,6 +219,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "meta_ads": [("concept_id", "TEXT"), ("lineage_of", "TEXT"), ("lineage_similarity", "REAL"),
                      ("landing_resolved_via", "TEXT"), ("landing_handle", "TEXT"), ("page_ignored", "INTEGER")],
         "alerts": [("dedupe_key", "TEXT")],
+        "products_daily": [("unlisted", "INTEGER DEFAULT 0")],   # 1 = live product page not in products.json (found via ads)
         "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
                            ("engagement_per_day", "REAL")],
     }
@@ -291,8 +292,11 @@ def write_product_snapshot(conn: sqlite3.Connection, store_id: int, snapshot_dat
     shopify.normalise_products(). Same-day re-runs replace that day's rows only."""
     fetched_at = fetched_at or utcnow_iso()
     with conn:  # single transaction: a crash mid-write leaves no partial day
-        conn.execute("DELETE FROM products_daily WHERE snapshot_date = ? AND store_id = ?", (snapshot_date, store_id))
-        conn.execute("DELETE FROM variants_daily WHERE snapshot_date = ? AND store_id = ?", (snapshot_date, store_id))
+        conn.execute("DELETE FROM products_daily WHERE snapshot_date = ? AND store_id = ? AND COALESCE(unlisted, 0) = 0",
+                     (snapshot_date, store_id))
+        conn.execute("""DELETE FROM variants_daily WHERE snapshot_date = ? AND store_id = ? AND product_id NOT IN
+                        (SELECT product_id FROM products_daily WHERE snapshot_date = ? AND store_id = ? AND unlisted = 1)""",
+                     (snapshot_date, store_id, snapshot_date, store_id))
         conn.executemany(
             """INSERT INTO products_daily
                (snapshot_date, store_id, product_id, handle, title, vendor, product_type, tags,
@@ -307,6 +311,8 @@ def write_product_snapshot(conn: sqlite3.Connection, store_id: int, snapshot_dat
                 for p in products
             ],
         )
+        # unlisted products discovered through ads are re-attached to the new day's snapshot
+        # (write_product_snapshot only replaces the listed catalogue)
         conn.executemany(
             """INSERT INTO variants_daily
                (snapshot_date, store_id, product_id, variant_id, title, sku, price, compare_at_price, available)
@@ -318,3 +324,26 @@ def write_product_snapshot(conn: sqlite3.Connection, store_id: int, snapshot_dat
             ],
         )
     return len(products)
+
+
+def write_unlisted_product(conn: sqlite3.Connection, store_id: int, snapshot_date: str, p: dict,
+                           fetched_at: str | None = None) -> None:
+    """Add one product that is live on the store but absent from products.json (found because
+    ads point at it). Idempotent per (day, store, product)."""
+    fetched_at = fetched_at or utcnow_iso()
+    with conn:
+        conn.execute(
+            """INSERT OR REPLACE INTO products_daily
+               (snapshot_date, store_id, product_id, handle, title, vendor, product_type, tags,
+                created_at, published_at, updated_at, variant_count, sold_out_variants,
+                min_price, max_price, collection_position, fetched_at, unlisted)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+            (snapshot_date, store_id, p["product_id"], p["handle"], p["title"], p["vendor"], p["product_type"],
+             json.dumps(p["tags"]), p["created_at"], p["published_at"], p["updated_at"], p["variant_count"],
+             p["sold_out_variants"], p["min_price"], p["max_price"], None, fetched_at))
+        conn.executemany(
+            """INSERT OR REPLACE INTO variants_daily
+               (snapshot_date, store_id, product_id, variant_id, title, sku, price, compare_at_price, available)
+               VALUES (?,?,?,?,?,?,?,?,?)""",
+            [(snapshot_date, store_id, p["product_id"], v["variant_id"], v["title"], v["sku"], v["price"],
+              v["compare_at_price"], 1 if v["available"] else 0) for v in p["variants"]])

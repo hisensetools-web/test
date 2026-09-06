@@ -165,7 +165,11 @@ EU reach. Send that table back before enabling more stores.
 
 1. **Landing URL to product.** `/products/<handle>` on the store's domain matches
    products.json directly (channel-suffixed handles match exactly; unknown suffixes fall back
-   to the longest known prefix). `/pages/<x>` advertorials and other URLs are fetched once a
+   to the longest known prefix). An advertised handle that is a live product page but absent
+   from products.json (offer / subscription variants are often published this way) is fetched
+   as `/products/<handle>.json` and recorded in `products_daily` with `unlisted = 1`, so it
+   gets its own Signals row (channel tag ends in `unlisted`), joins its family by title, and
+   the ads pointing at it are counted against it rather than folded into the listed product. `/pages/<x>` advertorials and other URLs are fetched once a
    week and their buy links, `/cart/add` variant ids and embedded product JSON are read; the
    best-supported known handle wins. Advertorials with no product link keep `page_handle`
    and a blank product. Fetch results are cached in `landing_pages`.

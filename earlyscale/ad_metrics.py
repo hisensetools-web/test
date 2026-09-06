@@ -24,7 +24,7 @@ from urllib.parse import parse_qs, urljoin, urlparse
 
 import requests
 
-from . import config
+from . import config, db as _db, shopify
 
 log = logging.getLogger("earlyscale.ad_metrics")
 
@@ -166,8 +166,18 @@ def _resolve_url(conn: sqlite3.Connection, url: str, store_domain: str, known: s
         return cache[key]
     row = conn.execute("SELECT * FROM landing_pages WHERE url = ?", (key,)).fetchone()
     if _fresh(row, today):
-        cache[key] = dict(row)
-        return cache[key]
+        hit = dict(row)
+        if hit.get("product_handle") is None and hit.get("candidates"):
+            # a page cached as unresolved may match now (e.g. an unlisted product was discovered since)
+            for part in hit["candidates"].split(","):
+                h = part.split(":")[0].replace("via:", "")
+                m = match_handle(h, known) if h and not h.startswith(("error", "unlisted-product")) else None
+                if m:
+                    hit["product_handle"] = m
+                    conn.execute("UPDATE landing_pages SET product_handle = ? WHERE url = ?", (m, key))
+                    break
+        cache[key] = hit
+        return hit
     if session is None:
         cache[key] = dict(row) if row else {"product_handle": None, "page_handle": handle_from_url(url)[1]}
         return cache[key]
@@ -207,6 +217,70 @@ def _resolve_url(conn: sqlite3.Connection, url: str, store_domain: str, known: s
         (hit["url"], hit["fetched_at"], hit["status"], hit["final_url"], hit["product_handle"],
          hit["page_handle"], hit["candidates"][:500]))
     return hit
+
+
+def discover_unlisted_products(conn: sqlite3.Connection, store_id: int, store_domain: str, ads: list[dict],
+                               known: set[str], session: requests.Session | None, cache: dict[str, dict],
+                               today: str, max_fetch: int = 40) -> int:
+    """Ads often point at product pages that are live but not in products.json (offer /
+    subscription variants). Fetch /products/<handle>.json for each such advertised handle and
+    record it in products_daily as unlisted, so it gets its own Signals row. Returns count added."""
+    if session is None:
+        return 0
+    wanted: dict[str, str] = {}
+    for a in ads:
+        ph, _ = handle_from_url(a.get("landing_url"))
+        if ph and ph not in known and same_store(a.get("landing_domain"), store_domain) and ph not in wanted:
+            u = urlparse(a["landing_url"])
+            wanted[ph] = f"{u.scheme}://{u.netloc}/products/{ph}.json"
+    added = 0
+    for handle, url in list(wanted.items())[:max_fetch]:
+        row = conn.execute("SELECT * FROM landing_pages WHERE url = ?", (url,)).fetchone()
+        product = None
+        if _fresh(row, today) and row["status"] == 200 and row["candidates"].startswith("unlisted-product:"):
+            product = _cached_unlisted(conn, store_id, handle)
+        if product is None and not _fresh(row, today):
+            hit = {"url": url, "fetched_at": today, "status": None, "final_url": None, "product_handle": None,
+                   "page_handle": None, "candidates": ""}
+            try:
+                r = session.get(url, timeout=config.REQUEST_TIMEOUT, allow_redirects=True,
+                                headers={"Accept": "application/json"})
+                hit["status"], hit["final_url"] = r.status_code, r.url
+                if r.status_code == 200 and "json" in r.headers.get("Content-Type", ""):
+                    data = r.json().get("product") or {}
+                    if data.get("id") and data.get("handle"):
+                        product = shopify.normalise_product(data)
+                        hit["product_handle"] = product["handle"]
+                        hit["candidates"] = f"unlisted-product:{product['product_id']}"
+            except (requests.RequestException, ValueError) as e:
+                hit["status"], hit["candidates"] = -1, f"error:{str(e)[:80]}"
+            conn.execute("""INSERT OR REPLACE INTO landing_pages (url, fetched_at, status, final_url, product_handle, page_handle, candidates)
+                            VALUES (?,?,?,?,?,?,?)""", (hit["url"], hit["fetched_at"], hit["status"], hit["final_url"],
+                                                       hit["product_handle"], hit["page_handle"], hit["candidates"]))
+        if product is not None:
+            _db.write_unlisted_product(conn, store_id, today, product)
+            known.add(product["handle"])
+            added += 1
+    return added
+
+
+def _cached_unlisted(conn: sqlite3.Connection, store_id: int, handle: str) -> dict | None:
+    """Re-use the most recent unlisted product row for this handle (carry it into today)."""
+    r = conn.execute("""SELECT * FROM products_daily WHERE store_id = ? AND handle = ? AND unlisted = 1
+                        ORDER BY snapshot_date DESC LIMIT 1""", (store_id, handle)).fetchone()
+    if r is None:
+        return None
+    variants = [dict(v) for v in conn.execute(
+        "SELECT * FROM variants_daily WHERE store_id = ? AND product_id = ? AND snapshot_date = ?",
+        (store_id, r["product_id"], r["snapshot_date"]))]
+    import json as _json
+    return {"product_id": r["product_id"], "handle": r["handle"], "title": r["title"], "vendor": r["vendor"],
+            "product_type": r["product_type"], "tags": _json.loads(r["tags"] or "[]"), "created_at": r["created_at"],
+            "published_at": r["published_at"], "updated_at": r["updated_at"], "variant_count": r["variant_count"],
+            "sold_out_variants": r["sold_out_variants"], "min_price": r["min_price"], "max_price": r["max_price"],
+            "collection_position": None,
+            "variants": [{"variant_id": v["variant_id"], "title": v["title"], "sku": v["sku"], "price": v["price"],
+                          "compare_at_price": v["compare_at_price"], "available": bool(v["available"])} for v in variants]}
 
 
 def _strip(url: str) -> str:
@@ -312,6 +386,10 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
         return {"ads": 0}
     known, v2h = _known_handles(conn, store_id)
     cache: dict[str, dict] = {}
+    unlisted = discover_unlisted_products(conn, store_id, store_domain, ads, known, session if fetch_landings else None,
+                                          cache, today)
+    if unlisted:
+        known, v2h = _known_handles(conn, store_id)
     resolved = 0
     for a in ads:
         r = resolve_landing(conn, store_id, store_domain, a, known, v2h, session if fetch_landings else None, cache, today)
@@ -396,6 +474,7 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
              round(active / ever, 3) if ever else None))
     conn.commit()
     return {"ads": len(all_ads), "ignored": len(all_ads) - len(ads), "resolved": resolved, "concepts": len(by_c),
+            "unlisted": unlisted,
             "lineage": len(lineage), "pages_fetched": sum(1 for h in cache.values() if h.get("status") is not None)}
 
 
