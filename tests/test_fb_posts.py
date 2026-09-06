@@ -117,7 +117,9 @@ class ListenerTests(unittest.TestCase):
                      (sid, d(20), d(1), TODAY))
         conn.commit()
         calls = []
-        srv = HTTPServer(("127.0.0.1", 0), fb_posts.make_listener(lambda: db.connect(tmp.name), lambda: TODAY, lambda *a: calls.append(a)))
+        hashes = []
+        srv = HTTPServer(("127.0.0.1", 0), fb_posts.make_listener(lambda: db.connect(tmp.name), lambda: TODAY, lambda *a: calls.append(a),
+                                                                  hash_fn=lambda u: (hashes.append(u), "IMGHASH")[1]))
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
         urlopen = opener.open
@@ -125,7 +127,8 @@ class ListenerTests(unittest.TestCase):
             body = json.dumps([
                 {"permalink": "https://www.facebook.com/777/posts/900?__cft__[0]=x", "page_name": "BioRoot",
                  "primary_text": "Ceylon cinnamon softgels that actually work for blood sugar support, try them today", "reactions": "1.2K", "comments": 12},
-                {"post_id": "feed_abc", "page_name": "BioRoot", "primary_text": "no permalink yet", "url": "https://www.facebook.com/"},
+                {"post_id": "feed_abc", "page_name": "BioRoot", "primary_text": "no permalink yet", "url": "https://www.facebook.com/",
+                 "image_url": "https://scontent.xx.fbcdn.net/v/creative.jpg"},
             ]).encode()
             req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/capture", data=body, headers={"Content-Type": "application/json"})
             with urlopen(req) as r:
@@ -138,6 +141,9 @@ class ListenerTests(unittest.TestCase):
         rows = {r["post_id"]: dict(r) for r in conn.execute("SELECT * FROM fb_posts")}
         self.assertEqual(rows["900"]["ad_id"], "1001")
         self.assertEqual(rows["feed_abc"]["permalink"], "feed://feed_abc")
+        # the creative is downloaded and hashed once, so observer posts can also match an ad by creative
+        self.assertEqual(rows["feed_abc"]["image_hash"], "IMGHASH")
+        self.assertEqual(hashes, ["https://scontent.xx.fbcdn.net/v/creative.jpg"])
         self.assertEqual(conn.execute("SELECT reactions FROM meta_ads_daily WHERE ad_id = '1001' AND snapshot_date = ?", (TODAY,)).fetchone()[0], 1200)
         # the daily refresh only opens real permalinks
         c = fb_posts.refresh_engagement(conn, None, TODAY, fetch=lambda b, u: ({"reactions": 1}, "ok"), wait=lambda: None)

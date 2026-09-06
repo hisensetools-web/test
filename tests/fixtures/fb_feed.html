@@ -1,0 +1,41 @@
+<!doctype html><html><body><div id="feed">
+  <div role="article" id="organic">
+    <h3><a href="https://www.facebook.com/123456789012/"><strong>Some Friend</strong></a></h3>
+    <div dir="auto">Just a normal post about lunch</div>
+    <div>3 comments 1 share</div>
+  </div>
+
+  <div role="article" id="ad1">
+    <h3><a href="https://www.facebook.com/777000111222/"><strong>BioRoot Labs</strong></a></h3>
+    <a class="ts" href="#" aria-label="2 hours ago">2h</a>
+    <div data-ad-preview="message" dir="auto">Doctors are stunned by this 3,000 year old cinnamon ritual.</div>
+    <img src="https://scontent.xx.fbcdn.net/v/t39/creative1.jpg?_nc_cat=1">
+    <a href="https://l.facebook.com/l.php?u=https%3A%2F%2Fbiorootlabs.com%2Fproducts%2Fceylon-cinnamon%3Futm%3Dfb&amp;h=AT1">Shop now</a>
+    <span aria-label="Sponsored">Sponsored</span>
+    <div>1.2K reactions 57 comments 9 shares</div>
+  </div>
+
+  <div role="article" id="ad2">
+    <h3><a href="https://www.facebook.com/profile.php?id=998877665544"><strong>Metabolae</strong></a></h3>
+    <span>Sponsored</span>
+    <div dir="auto">Still buying regular cinnamon? Read this first.</div>
+    <div aria-label="All reactions: 340">340</div>
+    <div>12 comments 2 shares</div>
+  </div>
+</div>
+<script>
+  document.querySelector('#ad1 .ts').addEventListener('mouseover', function () {
+    this.href = 'https://www.facebook.com/777000111222/posts/9988776655443322?__cft__[0]=abc&__tn__=x';
+  });
+  window.__appendAd3 = function () {
+    var d = document.createElement('div');
+    d.setAttribute('role', 'article');
+    d.id = 'ad3';
+    d.innerHTML = '<h3><a href="https://www.facebook.com/555444333222/"><strong>Neurobella</strong></a></h3>' +
+      '<a href="https://www.facebook.com/555444333222/posts/1122334455667788">5h</a>' +
+      '<div data-ad-comet-preview="message" dir="auto">15-in-1 eye formula, now shipping.</div>' +
+      '<div>88 reactions 4 comments</div>';
+    document.getElementById('feed').appendChild(d);
+  };
+</script>
+</body></html>

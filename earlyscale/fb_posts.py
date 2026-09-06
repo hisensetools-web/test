@@ -94,7 +94,7 @@ def parse_capture(obj: dict | str) -> dict:
     return {"post_id": str(pid), "permalink": link, "page_id": obj.get("page_id") or page_id_from_url(link),
             "page_name": obj.get("page_name") or obj.get("page"), "primary_text": obj.get("primary_text") or obj.get("text"),
             "headline": obj.get("headline"), "landing_url": obj.get("landing_url") or obj.get("link"),
-            "image_url": obj.get("image_url"), "counts": counts}
+            "image_url": obj.get("image_url"), "image_hash": obj.get("image_hash"), "counts": counts}
 
 
 def parse_captures_text(text: str) -> list[dict]:
@@ -291,12 +291,14 @@ def hash_image(url: str, session=None) -> str | None:
 
 # ---------------------------------------------------------------- local listener for the browser observer
 
-def make_listener(conn_or_factory, today_fn, on_capture=None):
+def make_listener(conn_or_factory, today_fn, on_capture=None, hash_fn=None):
     """HTTP handler: POST /capture with a JSON capture or array of captures (from tools/fb_observer),
     GET /health. Bound to 127.0.0.1 only. `conn_or_factory` is a connection (single-threaded server)
     or a zero-arg callable returning one (opened lazily in the serving thread)."""
     from http.server import BaseHTTPRequestHandler
     state = {"conn": None if callable(conn_or_factory) else conn_or_factory}
+    hash_fn = hash_image if hash_fn is None else hash_fn
+    hashed: dict[str, str | None] = {}   # one download per creative URL per session
 
     def get_conn():
         if state["conn"] is None:
@@ -339,6 +341,11 @@ def make_listener(conn_or_factory, today_fn, on_capture=None):
             new = 0
             for c in caps:
                 try:
+                    url = c.get("image_url")
+                    if url and not c.get("image_hash") and hash_fn:
+                        if url not in hashed:
+                            hashed[url] = hash_fn(url)
+                        c["image_hash"] = hashed[url]
                     if record_capture(conn, c, today, source="observer"):
                         new += 1
                 except Exception as e:  # noqa: BLE001

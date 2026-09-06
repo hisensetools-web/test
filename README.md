@@ -329,8 +329,17 @@ python tracker.py fb-bait          # open hero product pages to seed retargeting
 python tracker.py fb-report        # captured posts, matches, count history
 ```
 
-Facebook's markup changes without notice; the observer's selectors are best-effort. The popup
-shows the last capture it made, which is the thing to paste when a field comes back empty.
+The observer's extraction code is exercised by `tests/test_fb_observer.py`, which loads
+`content.js` into real Chromium against a fake feed and checks both ways Facebook marks an ad, the
+timestamp link whose href only appears on hover, the `l.facebook.com` landing redirect, the counts,
+posts scrolled in after load, and that nothing is captured twice. Facebook's markup still changes
+without notice, so the popup shows the last capture it made: that is the thing to paste when a
+field comes back empty.
+
+Each capture's creative is downloaded once and hashed, which groups repeats of the same creative
+across sessions. It rarely matches an Ad Library `creative_hash` outright, because Facebook
+re-encodes a different rendition for the feed, so the post-to-ad join is carried by text
+similarity in practice.
 
 **Daily run:** with `META_ADS=1` the scheduled `run` now does: Shopify pass -> stock probe -> Ad
 Library search scrape -> single-ad pages (A) -> boosted-post counts -> captured-post counts (B)
