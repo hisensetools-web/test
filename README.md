@@ -56,8 +56,12 @@ removed handles, ordered by store score.
 
 ## Scheduling (Windows)
 
-`run_daily.bat` activates `.venv` if present (else the `py -3.11` launcher, else `python`),
-runs `python tracker.py run` and appends stdout+stderr to `logs\run_YYYY-MM-DD.log`.
+`run_daily.bat` probes, in order, `.venv\Scripts\python.exe`, `py -3`, `python` and `python3`,
+and uses the first one that actually runs and reports Python 3.11 or newer (so a machine
+with only 3.14 and no `py` launcher works, and the Microsoft Store `python` stub is skipped).
+It then runs `tracker.py run` and appends stdout+stderr to `logs\run_YYYY-MM-DD.log`, with
+the chosen interpreter and version in the start line. If nothing qualifies it logs an error
+and exits with code 9009.
 Register it in Task Scheduler for 06:00 daily from PowerShell in the project folder:
 
 ```powershell
