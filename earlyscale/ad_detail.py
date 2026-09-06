@@ -131,6 +131,21 @@ def parse_ad_detail_html(html: str, ad_id: str | None = None) -> dict | None:
     return None
 
 
+REMOVED_MARKERS = ("no longer available", "isn't available", "is not available", "couldn't find", "could not find",
+                   "not currently available", "ad has been removed", "this content isn't available")
+
+
+def no_record_reason(html: str, ad_id: str) -> str:
+    """Why a single-ad page carried no record: removed (the library says the ad is gone), no-record:<hint>."""
+    low = (html or "").lower()
+    text = re.sub(r"<[^>]+>", " ", low)
+    if any(m in text for m in REMOVED_MARKERS):
+        return "removed"
+    blocks = len(SJS_RE.findall(html or ""))
+    has_id = str(ad_id) in (html or "")
+    return f"no-record:sjs={blocks},id_in_html={'y' if has_id else 'n'},bytes={len(html or '')}"
+
+
 def detail_from_list_node(node: dict) -> dict:
     """The same record shape from a search-results node (the list payload also carries end_date and
     page_like_count), so every scraped ad gets a 'list' reading for free each day."""
@@ -177,7 +192,7 @@ def fetch_ad_detail(browser, ad_id: str, page=None, dismiss: bool = True) -> tup
         page = ctx.new_page()
     try:
         page.goto(detail_url(ad_id), wait_until="domcontentloaded", timeout=config.META_NAV_TIMEOUT_MS)
-        meta_ads._wait(1.5, 3)
+        meta_ads._wait(0.8, 1.6)
         if dismiss:   # cookie banner: once per context is enough (each probe costs ~3 s)
             meta_ads._dismiss_dialogs(page)
         u = page.url.lower()
@@ -189,7 +204,9 @@ def fetch_ad_detail(browser, ad_id: str, page=None, dismiss: bool = True) -> tup
             d = parse_ad_detail_html(html)   # record present but under another id key
             if d is not None and d["ad_id"] != str(ad_id):
                 d = None
-        return d, ("ok" if d else "no-record")
+        if d is None:
+            return None, no_record_reason(html, ad_id)
+        return d, "ok"
     except Exception as e:  # noqa: BLE001
         return None, f"error:{type(e).__name__}"
     finally:
@@ -300,6 +317,10 @@ def record_detail(conn: sqlite3.Connection, store_id: int, ad_id: str, today: st
            VALUES (?,?,?,?,?,?,?,?,?,?)""",
         (today, ad_id, store_id, source, d.get("start_date"), d.get("end_date"), d.get("is_active"),
          d.get("page_like_count"), status, _utcnow()))
+    if status == "removed":
+        conn.execute("""UPDATE meta_ads SET delivery_status = 'off', detail_fetched_date = ?,
+                          switched_off_date = COALESCE(switched_off_date, last_delivered, ad_end_date, ?) WHERE ad_id = ?""",
+                     (today, today, ad_id))
     if detail:
         conn.execute("""UPDATE meta_ads SET page_profile_id = COALESCE(?, page_profile_id),
                           page_categories = COALESCE(?, page_categories), page_id = COALESCE(page_id, ?),
@@ -338,10 +359,13 @@ def delivery_state(readings: list[tuple[str, str | None]], today: str, stale_day
 
 
 def update_delivery(conn: sqlite3.Connection, ad_id: str, today: str) -> dict:
-    readings = [(r[0], r[1]) for r in conn.execute(
-        "SELECT snapshot_date, end_date FROM meta_ad_detail_daily WHERE ad_id = ? AND snapshot_date <= ? ORDER BY snapshot_date",
-        (ad_id, today))]
+    rows = conn.execute(
+        "SELECT snapshot_date, end_date, status FROM meta_ad_detail_daily WHERE ad_id = ? AND snapshot_date <= ? ORDER BY snapshot_date",
+        (ad_id, today)).fetchall()
+    readings = [(r[0], r[1]) for r in rows]
     st = delivery_state(readings, today)
+    if rows and rows[-1]["status"] == "removed":
+        st = {"last_delivered": st["last_delivered"], "status": "off", "switched_off_date": st["last_delivered"] or rows[-1][0]}
     if st["status"]:
         conn.execute("""UPDATE meta_ads SET last_delivered = ?, delivery_status = ?,
                           switched_off_date = CASE WHEN ? = 'off' THEN COALESCE(switched_off_date, ?) ELSE NULL END
@@ -461,9 +485,9 @@ def fetch_store_details(conn: sqlite3.Connection, browser, store_id: int, today:
                         fetch=fetch_ad_detail, hash_fetch=_hash_url, wait=None) -> dict:
     """Fetch the single-ad page for the selected ads, record readings, hash creatives. Stops on a login wall."""
     todo = select_for_detail(conn, store_id, today, cap)
-    wait = wait or (lambda: meta_ads._wait(2, 5))
-    counts = {"selected": len(todo), "ok": 0, "no_record": 0, "errors": 0, "login_wall": 0, "hashed": 0, "hash_failed": 0,
-              "relaunches": 0, "context_recycles": 0}
+    wait = wait or (lambda: meta_ads._wait(1, 2.5))
+    counts = {"selected": len(todo), "ok": 0, "no_record": 0, "removed": 0, "errors": 0, "login_wall": 0, "hashed": 0,
+              "hash_failed": 0, "relaunches": 0, "context_recycles": 0}
     session = requests.Session()
     live = bool(todo) and browser is not None and fetch is fetch_ad_detail
     holder = {"ctx": None, "page": None, "pages": 0}
@@ -533,7 +557,9 @@ def _fetch_loop(conn, browser, holder, fresh_page, store_id, today, todo, counts
             fp = fingerprint_creatives(conn, item["ad_id"], detail, fetch=hash_fetch, session=session)
             counts["hashed"] += fp["hashed"]
             counts["hash_failed"] += fp["failed"]
-        elif status == "no-record":
+        elif status == "removed":
+            counts["removed"] += 1
+        elif status.startswith("no-record"):
             counts["no_record"] += 1
         else:
             counts["errors"] += 1

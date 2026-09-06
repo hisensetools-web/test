@@ -62,6 +62,22 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(got["page_profile_id"], "123456789")
 
 
+class NoRecordTests(unittest.TestCase):
+    def test_removed_vs_no_record_reason(self):
+        self.assertEqual(ad_detail.no_record_reason("<html><body><div>This ad is no longer available.</div></body></html>", "1"), "removed")
+        r = ad_detail.no_record_reason('<html><script data-sjs>{"a":1}</script>1001 x</html>', "1001")
+        self.assertEqual(r, "no-record:sjs=1,id_in_html=y,bytes=52")
+
+    def test_removed_marks_ad_off(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        conn.execute("INSERT INTO meta_ads (ad_id, store_id, first_seen_date, last_seen_date, ad_end_date) VALUES ('1', ?, ?, ?, ?)", (sid, d(5), d(1), d(3)))
+        ad_detail.record_detail(conn, sid, "1", TODAY, None, "removed")
+        ad_detail.update_delivery(conn, "1", TODAY)
+        r = conn.execute("SELECT delivery_status, switched_off_date FROM meta_ads WHERE ad_id = '1'").fetchone()
+        self.assertEqual(tuple(r), ("off", d(3)))
+
+
 class DeliveryTests(unittest.TestCase):
     def test_on_while_end_date_advances(self):
         r = [(d(2), d(2)), (d(1), d(1)), (TODAY, TODAY)]

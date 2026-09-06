@@ -499,9 +499,9 @@ def _detail_pass_store(conn, browser, store_id: int, domain: str, snapshot_date:
     try:
         c = ad_detail.fetch_store_details(conn, browser, store_id, snapshot_date, cap)
         f = ad_detail.finalize_store(conn, store_id, snapshot_date)
-        log.info("%-28s detail: fetched %d/%d ok=%d no_record=%d errors=%d login_wall=%d creatives_hashed=%d relaunches=%d | delivering=%d off=%d pages=%d "
-                 "creative_lineage=%d alerts=%d %.0fs", domain, c["ok"] + c["no_record"] + c["errors"], c["selected"], c["ok"],
-                 c["no_record"], c["errors"], c["login_wall"], c["hashed"], c.get("relaunches", 0), f["delivering"], f["off"], f["pages"],
+        log.info("%-28s detail: fetched %d/%d ok=%d removed=%d no_record=%d errors=%d login_wall=%d creatives_hashed=%d relaunches=%d | delivering=%d off=%d pages=%d "
+                 "creative_lineage=%d alerts=%d %.0fs", domain, c["ok"] + c["removed"] + c["no_record"] + c["errors"], c["selected"], c["ok"],
+                 c["removed"], c["no_record"], c["errors"], c["login_wall"], c["hashed"], c.get("relaunches", 0), f["delivering"], f["off"], f["pages"],
                  f["creative_lineage"], f["alerts"], time.monotonic() - t0)
         return {**c, **f}
     except Exception as e:  # noqa: BLE001
@@ -538,7 +538,7 @@ def cmd_ads_detail(args) -> int:
                     conn.commit()
                 return 0
             t = Table(title=f"single-ad page pass ({snapshot_date})")
-            for c in ("store", "selected", "ok", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts"):
+            for c in ("store", "selected", "ok", "removed", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts"):
                 t.add_column(c, justify="left" if c == "store" else "right")
             for st in targets:
                 store_id = db.upsert_store(conn, st["store_domain"])
@@ -546,7 +546,7 @@ def cmd_ads_detail(args) -> int:
                 if not conn.execute("SELECT 1 FROM meta_ads WHERE store_id = ? LIMIT 1", (store_id,)).fetchone():
                     continue
                 r = _detail_pass_store(conn, handle, store_id, st["store_domain"], snapshot_date, args.max)
-                t.add_row(_short(st["store_domain"]), *[str(r.get(c, "")) for c in ("selected", "ok", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts")])
+                t.add_row(_short(st["store_domain"]), *[str(r.get(c, "")) for c in ("selected", "ok", "removed", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts")])
             console.print(t)
         finally:
             handle.close()
@@ -635,6 +635,16 @@ def cmd_ads_detail_report(args) -> int:
                   "" if not last or last["likes_slope_7d"] is None else f"{last['likes_slope_7d']:.1f}",
                   "" if not last or last["likes_slope_prev_7d"] is None else f"{last['likes_slope_prev_7d']:.1f}")
     console.print(t)
+    nr = conn.execute(f"""SELECT s.store_domain, d.status, COUNT(*) AS n FROM meta_ad_detail_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
+                          JOIN stores s ON s.id = a.store_id WHERE d.snapshot_date = ? AND d.source = 'detail' AND d.status != 'ok' {where}
+                          GROUP BY s.store_domain, d.status ORDER BY s.store_domain, n DESC""", [as_of] + params).fetchall()
+    if nr:
+        t = Table(title=f"single-ad pages without a record on {as_of} (removed = the library says the ad is gone)")
+        for c in ("store", "status", "pages"):
+            t.add_column(c, justify="right" if c == "pages" else "left")
+        for r in nr:
+            t.add_row(_short(r["store_domain"]), r["status"], str(r["n"]))
+        console.print(t)
     cov = conn.execute(f"""SELECT s.store_domain, COUNT(DISTINCT a.ad_id) AS ads, SUM(a.delivery_status = 'on') AS on_, SUM(a.delivery_status = 'off') AS off,
                              SUM(a.detail_fetched_date IS NOT NULL) AS fetched, SUM(a.creative_hash IS NOT NULL) AS hashed,
                              SUM(a.lineage_via = 'creative') AS lin_creative
@@ -1277,4 +1287,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     _setup_logging(args.verbose)
-    return args.fn(args)
+    try:
+        return args.fn(args)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]interrupted[/] - everything recorded so far is in the database; the next run continues from there")
+        return 130
