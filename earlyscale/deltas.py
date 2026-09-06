@@ -72,9 +72,10 @@ class StoreDelta:
 
     @property
     def change_score(self) -> int:
-        """Crude 'how much moved' number used to sort the report. Zero-history stores
-        still score on new/updated products so a fresh watchlist isn't all ties."""
-        s = self.new_products_7d + self.updated_products_7d
+        """Crude 'how much moved' number used to sort the report. updated_products_7d is
+        deliberately left out: inventory apps bump updated_at on every product daily, so it
+        equals the catalogue size on most stores and would swamp the real signals."""
+        s = self.new_products_7d
         if self.has_history:
             s += abs(self.sold_out_variants_delta or 0) + (self.price_changes or 0) \
                  + (self.new_handles or 0) + (self.removed_handles or 0)

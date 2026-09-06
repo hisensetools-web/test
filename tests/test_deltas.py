@@ -51,7 +51,7 @@ class SingleDayTests(unittest.TestCase):
         self.assertIsNone(d.price_changes)
         self.assertIsNone(d.new_handles)
         self.assertEqual(d.changes, [])
-        self.assertEqual(d.change_score, 3)
+        self.assertEqual(d.change_score, 1)   # new_products_7d only; updated_7d excluded
 
 
 class TwoDayTests(unittest.TestCase):
@@ -71,7 +71,7 @@ class TwoDayTests(unittest.TestCase):
         self.assertEqual(d.price_changes, 2)            # S and M of cloud-hoodie; L unchanged
         self.assertEqual(d.new_handles, 1)
         self.assertEqual(d.removed_handles, 1)
-        self.assertEqual(d.change_score, 1 + 2 + 0 + 2 + 1 + 1)
+        self.assertEqual(d.change_score, 1 + 0 + 2 + 1 + 1)
 
     def test_product_changes(self):
         kinds = {(c.kind, c.handle) for c in self.d.changes}

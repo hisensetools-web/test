@@ -46,7 +46,7 @@ Per store the report shows:
 | `Δ sold-out` | 2 days | change in that count vs the previous snapshot |
 | `price Δ` | 2 days | variants whose price differs from the previous snapshot (new variants don't count) |
 | `+handles` / `-handles` | 2 days | products that appeared / disappeared from products.json |
-| `score` | — | `new 7d + upd 7d + |Δ sold-out| + price Δ + +handles + -handles`, the sort key |
+| `score` | — | `new 7d + |Δ sold-out| + price Δ + +handles + -handles`, the sort key. `upd 7d` is excluded on purpose: inventory apps touch every product daily, so it equals the catalogue size on most stores |
 
 "Previous snapshot" is the store's most recent earlier snapshot, not calendar yesterday, so
 a missed day doesn't break the comparison. With one day of history the 2-day columns show
