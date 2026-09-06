@@ -452,3 +452,50 @@ class RedirectedHandleTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT product_handle FROM meta_ads WHERE ad_id='1'").fetchone()[0], "turmeric-1000mg")
         lp = conn.execute("SELECT candidates FROM landing_pages WHERE url LIKE '%turmeric.json'").fetchone()[0]
         self.assertEqual(lp, "redirect:turmeric-1000mg")
+
+
+class EncodedHandleTests(unittest.TestCase):
+    def test_percent_encoded_handles_decode_and_match(self):
+        self.assertEqual(ad_metrics.handle_from_url("https://uk.avalaine.com/products/nervana-%C2%AE-magnesium-patches?x=1"),
+                         ("nervana-®-magnesium-patches", None))
+        self.assertEqual(ad_metrics.handle_from_url("https://lumiqour.com/products/turkey-tail-probiotic%e2%84%a2.json"),
+                         ("turkey-tail-probiotic™", None))
+        known = {"nervana-®-magnesium-patches", "turkey-tail-probiotic™"}
+        self.assertEqual(ad_metrics.match_handle("nervana-®-magnesium-patches", known), "nervana-®-magnesium-patches")
+        html = '<a href="/products/shipping-protection-1">x</a><a href="/products/turkey-tail-probiotic%E2%84%A2">buy</a>'
+        ranked = ad_metrics.handles_from_html(html)
+        self.assertEqual(ranked[0][0], "turkey-tail-probiotic™")     # junk widget sorted last
+        self.assertEqual(ranked[-1][0], "shipping-protection-1")
+
+    def test_shipping_protection_never_wins_page_resolution(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "uk.avalaine.com")
+        db.write_product_snapshot(conn, sid, "2026-09-06", [_prod(1, "shipping-protection-1", "Shipping Protection"),
+                                                             _prod(2, "nervana-®-magnesium-patches", "Nervana Patches")])
+        session = mock.Mock(spec=requests.Session)
+
+        def get(url, **kw):
+            r = requests.Response(); r.encoding = "utf-8"; r.url = url; r.status_code = 200
+            r._content = (b'<a href="/products/shipping-protection-1">p</a><a href="/products/shipping-protection-1">p</a>'
+                          b'<a href="/products/nervana-%C2%AE-magnesium-patches">buy</a>')
+            return r
+        session.get.side_effect = get
+        ads = [_ad("1", "Susan", "2026-09-01", "https://uk.avalaine.com/pages/patches-story", "story copy here")]
+        ads[0]["landing_domain"] = "uk.avalaine.com"
+        meta_ads.record_scrape(conn, sid, "2026-09-06", ads, "q")
+        ad_metrics.process_store(conn, sid, "uk.avalaine.com", "2026-09-06", session)
+        self.assertEqual(conn.execute("SELECT product_handle FROM meta_ads WHERE ad_id='1'").fetchone()[0],
+                         "nervana-®-magnesium-patches")
+
+    def test_payload_shape_reports_null_fields(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        n = {"ad_archive_id": "1", "page_name": "P", "snapshot": {"body": {"text": "t"}, "link_url": None},
+             "aaa_info": {"eu_total_reach": None}, "reach_estimate": None}
+        a = meta_ads.normalise_ad(n)
+        meta_ads.record_scrape(conn, sid, "2026-09-06", [a], "q")
+        shape = {k: (c, z) for k, c, z in ad_metrics.payload_shape(conn, "2026-09-06")}
+        self.assertEqual(shape["aaa_info.eu_total_reach"], (1, 1))
+        self.assertEqual(shape["reach_estimate"], (1, 1))
+        self.assertEqual(shape["snapshot.link_url"], (1, 1))
+        self.assertIn("aaa_info.eu_total_reach=null", a["reach_keys"])

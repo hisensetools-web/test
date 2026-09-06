@@ -477,6 +477,14 @@ def cmd_ads_coverage(args) -> int:
                          WHERE d.snapshot_date = ? AND a.engagement_type = 'boosted' GROUP BY st""", (as_of,)).fetchall()
     if ps:
         console.print("[dim]boosted post fetch status: " + ", ".join(f"{r['st']} x{r['n']}" for r in ps) + "[/]")
+    if args.keys:
+        shape = ad_metrics.payload_shape(conn, as_of)
+        t = Table(title="fields present in the raw ad payloads (depth <= 2)", caption="null = present but empty")
+        for c in ("field", "ads", "null"):
+            t.add_column(c, justify="right" if c != "field" else "left")
+        for k, c, z in shape[:80]:
+            t.add_row(k, str(c), str(z))
+        console.print(t)
     return 0
 
 
@@ -645,6 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("ads-coverage", help="how measurable the scraped ads are: EU/UK reach, boosted vs dark, per store")
     s.add_argument("--date", help="snapshot date (default: latest)")
+    s.add_argument("--keys", action="store_true", help="also list which fields the raw payloads contain")
     s.set_defaults(fn=cmd_ads_coverage)
 
     s = sub.add_parser("sync-sheets", help="push latest snapshot + deltas to Google Sheets via Apps Script")

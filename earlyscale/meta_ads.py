@@ -181,6 +181,9 @@ def extract_reach(node: dict) -> dict:
         kl = k.lower()
         if isinstance(v, bool):
             continue
+        if v is None:
+            out["keys"].append(f"{full}=null")
+            continue
         if isinstance(v, (int, float)):
             out["keys"].append(f"{full}={int(v)}")
             if kl == "eu_total_reach" and out["eu_reach"] is None:

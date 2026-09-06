@@ -20,7 +20,7 @@ import sqlite3
 from collections import defaultdict
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import parse_qs, urljoin, urlparse
+from urllib.parse import parse_qs, unquote, urljoin, urlparse
 
 import requests
 
@@ -61,11 +61,29 @@ def handle_from_url(url: str | None) -> tuple[str | None, str | None]:
     path = urlparse(url).path
     m = PRODUCT_RE.search(path)
     if m:
-        return m.group(1).lower().rstrip("-"), None
+        return clean_handle(m.group(1)), None
     m = PAGE_RE.search(path)
     if m:
-        return None, m.group(1).lower()
+        return None, clean_handle(m.group(1))
     return None, None
+
+
+def clean_handle(raw: str) -> str:
+    """Shopify handles may contain ® ™ etc.; ad URLs percent-encode them. Decode and lower-case
+    so 'nervana-%C2%AE-magnesium-patches' matches the products.json handle."""
+    h = unquote(raw).lower().rstrip("-")
+    if h.endswith(".json") or h.endswith(".js"):
+        h = h.rsplit(".", 1)[0]
+    return h
+
+
+# Handles that are app widgets rather than products: never let them win a page-fetch resolution.
+JUNK_HANDLE_RE = re.compile(r"(shipping[-_]?protection|package[-_]?protection|route[-_]?package|order[-_]?protection|"
+                            r"insurance|gift[-_]?card|tip[-_]?jar|^tip$|^tips$|priority[-_]?processing|extended[-_]?warranty)", re.I)
+
+
+def is_junk_handle(h: str | None) -> bool:
+    return bool(h) and bool(JUNK_HANDLE_RE.search(h))
 
 
 def handles_from_html(html: str, variant_to_handle: dict[int, str] | None = None) -> list[tuple[str, int]]:
@@ -73,7 +91,7 @@ def handles_from_html(html: str, variant_to_handle: dict[int, str] | None = None
     Looks at /products/<handle> links, /cart/add + variant ids, and embedded product JSON."""
     counts: dict[str, int] = defaultdict(int)
     for m in PRODUCT_RE.finditer(html):
-        h = m.group(1).lower().rstrip("-").split(".")[0]
+        h = clean_handle(m.group(1))
         if h and h not in ("json", "js"):
             counts[h] += 1
     if variant_to_handle:
@@ -82,8 +100,9 @@ def handles_from_html(html: str, variant_to_handle: dict[int, str] | None = None
             if h:
                 counts[h] += 2   # a buy button is stronger evidence than a link
     for m in HTML_PRODUCT_JSON_RE.finditer(html):
-        counts[m.group(1).lower()] += 1
-    return sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        counts[clean_handle(m.group(1))] += 1
+    # widgets like shipping protection appear on every page; sort them last
+    return sorted(counts.items(), key=lambda kv: (is_junk_handle(kv[0]), -kv[1], kv[0]))
 
 
 def match_handle(candidate: str | None, known: set[str]) -> str | None:
@@ -183,9 +202,11 @@ def _resolve_url(conn: sqlite3.Connection, url: str, store_domain: str, known: s
         hit = dict(row)
         if hit.get("product_handle") is None and hit.get("candidates"):
             # a page cached as unresolved may match now (e.g. an unlisted product was discovered since)
-            for part in hit["candidates"].split(","):
-                h = part.split(":")[0].replace("via:", "")
-                m = match_handle(h, known) if h and not h.startswith(("error", "unlisted-product")) else None
+            parts = [p.split(":")[0].replace("via:", "") for p in hit["candidates"].split(",")]
+            parts = sorted((clean_handle(h) for h in parts if h and not h.startswith(("error", "unlisted-product", "redirect"))),
+                           key=is_junk_handle)
+            for h in parts:
+                m = match_handle(h, known)
                 if m:
                     hit["product_handle"] = m
                     conn.execute("UPDATE landing_pages SET product_handle = ? WHERE url = ?", (m, key))
@@ -208,9 +229,15 @@ def _resolve_url(conn: sqlite3.Connection, url: str, store_domain: str, known: s
         hit["candidates"] = ",".join(f"{h}:{n}" for h, n in cands[:8])
         for h, _ in cands:
             m = match_handle(h, known)
-            if m:
+            if m and not is_junk_handle(m):
                 hit["product_handle"] = m
                 break
+        if hit["product_handle"] is None:
+            for h, _ in cands:
+                m = match_handle(h, known)
+                if m:
+                    hit["product_handle"] = m
+                    break
         if hit["product_handle"] is None and depth < 1:
             # follow unlisted product pages one hop (skip the page we are already on)
             origin = f"{urlparse(final or url).scheme}://{urlparse(final or url).netloc}"
@@ -244,7 +271,8 @@ def discover_unlisted_products(conn: sqlite3.Connection, store_id: int, store_do
     wanted: dict[str, str] = {}
     for a in ads:
         ph, _ = handle_from_url(a.get("landing_url"))
-        if ph and ph not in known and same_store(a.get("landing_domain"), store_domain) and ph not in wanted:
+        if ph and ph not in known and same_store(a.get("landing_domain"), store_domain) and ph not in wanted \
+                and not is_junk_handle(ph):
             u = urlparse(a["landing_url"])
             wanted[ph] = f"{u.scheme}://{u.netloc}/products/{ph}.json"
     added = 0
@@ -804,3 +832,34 @@ def coverage(conn: sqlite3.Connection, as_of: str) -> list[dict]:
     if len(rows) > 1:
         rows.append(total)
     return rows
+
+
+def payload_shape(conn: sqlite3.Connection, as_of: str, max_depth: int = 2) -> list[tuple[str, int, int]]:
+    """Which fields the stored raw ad nodes actually contain: (key path, ads carrying it, ads where it is null).
+    Depth-limited so the list stays readable; list items are collapsed to '[]'."""
+    import json as _json
+    from . import meta_ads as _m
+    counts: dict[str, int] = defaultdict(int)
+    nulls: dict[str, int] = defaultdict(int)
+    n = 0
+    for r in conn.execute("""SELECT a.raw_json FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id
+                             WHERE d.snapshot_date = ? AND a.raw_json IS NOT NULL""", (as_of,)):
+        try:
+            node = _json.loads(r[0])
+        except ValueError:
+            continue
+        n += 1
+        seen: set[str] = set()
+        for path, k, v in _m._walk_items(node):
+            depth = path.count(".") + path.count("[") + (1 if path else 0)
+            if depth >= max_depth:
+                continue
+            base = re.sub(r"\[\d+\]", "[]", path)
+            key = f"{base}.{k}" if base else k
+            if key in seen:
+                continue
+            seen.add(key)
+            counts[key] += 1
+            if v is None or v == [] or v == {}:
+                nulls[key] += 1
+    return sorted(((k, c, nulls[k]) for k, c in counts.items()), key=lambda t: (-t[1], t[0]))
