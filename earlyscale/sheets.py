@@ -30,7 +30,9 @@ ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
                    "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
                    "variants_of_family_published_7d", "ads_pointing_here", "engagement_per_day",
-                   "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d"]
+                   "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d",
+                   "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d",
+                   "units_per_day_wow"]
 FAMILIES_HEADERS = ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
                     "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"]
 CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "families published 7d",
@@ -153,7 +155,13 @@ def _contexts(conn: sqlite3.Connection, as_of: str | None):
 
 def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     rows = [r for ctx in _contexts(conn, as_of) for r in signals.signals_rows_for_store(ctx)]
-    rows.sort(key=lambda r: (r[4] == "", r[4] if r[4] != "" else 0, r[0], r[2]))   # days_since_published asc
+    # products under 30 days old first, by units_per_day_wow desc (blank last); then everything else by age
+    def key(r):
+        days = r[4] if r[4] != "" else 10**6
+        young = days < 30
+        wow = r[22] if r[22] != "" else None
+        return (0 if young else 1, -(wow if wow is not None else -1) if young else 0, days, r[0], r[2])
+    rows.sort(key=key)
     return rows
 
 

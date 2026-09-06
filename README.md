@@ -100,7 +100,7 @@ three tabs, each with a bold frozen header row:
 
 | tab | rows | behaviour |
 |---|---|---|
-| **Signals** | one per product (latest snapshot) | overwritten every sync; sorted by `days_since_published`. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then four Meta columns filled by Part B |
+| **Signals** | one per product (latest snapshot) | overwritten every sync; products under 30 days old first, by `units_per_day_wow` desc, then everything else by age. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then the Meta columns filled by Part B and the six inventory columns (`signal_source`, `inventory_tracked`, `stock_level`, `units_sold_1d`, `units_per_day_7d`, `units_per_day_wow`) filled by the stock probe |
 | **Families** | one per product family per store | overwritten; a family = handles sharing a base name or normalised title. Handle count, newest/oldest published_at, launches in 7/14/30 days, best rank, handle list. Sorted by 7-day launches |
 | **Categories** | one per keyword category | overwritten; categories are title unigrams/bigrams shared by 2+ stores (nothing hardcoded), with store/family counts and newest publish date. Families with no shared keyword fall into `(uncategorised)` |
 | **Stores** | one per store in watchlist.csv | fully overwritten every sync, sorted by change score |
@@ -252,6 +252,69 @@ If Meta serves a login wall the pass stops for the day rather than hammering it.
 - If Playwright cannot download its browser, point `META_CHROMIUM_PATH` in `.env` at an
   installed Chromium/Chrome binary.
 
+## Inventory-delta sales tracking (store-side demand signal)
+
+Traffic tools see a store weeks late and the Ad Library gives no reach for US/UK advertisers,
+so the demand signal is read off the store itself: how fast its stock goes down.
+
+**Hero variants.** For every store in `INVENTORY_STORES` the daily run selects the top 15
+products of `/collections/all` (best-selling order) plus anything published in the last
+30 days, and skips shipping protection / package protection, warranties, insurance, gift
+cards, memberships, ebooks / digital downloads and $0 items. Every variant of a hero product
+is a hero variant, capped at `INVENTORY_MAX_VARIANTS` (40) per store per day, newest
+products first. A hidden bundle product in `products.json` is treated like any other
+product; when a bundle's own stock is not enforced at the cart and its page lists other
+products' variant ids, those components are probed too (`role = bundle_component`).
+
+**Probe.** Once per day per hero variant: `POST /cart/add.js` with quantity 9999 from a
+fresh session with browser headers. Shopify answers `422 "You can only add N ... to the
+cart"` when inventory is tracked, which is the stock level; `"sold out"` is 0. A `200`
+means the add went through (inventory not enforced), and the orphaned cart is cleared with
+`/cart/clear.js`. Probes are spaced by a random 5-15 s pause. The tracker never opens
+checkout and never creates an order (the mock store's `/checkout` returns 403 and a test
+asserts it is never hit).
+
+**Fallback chain**, recorded per reading in `signal_source`:
+
+| rung | when | what is stored |
+|---|---|---|
+| `cart_probe` | 422 with a count or a sold-out message | `stock_level` from the message |
+| `theme_inventory` | add succeeded, but the product page JSON carries `inventory_quantity` for the variant | that number |
+| `ads_only` | neither | `inventory_tracked = 0`; the variant is not probed again, it is only followed via ads |
+| `blocked` | 401/403/429/430/503, redirect or captcha | no reading; retried tomorrow (`consecutive_failures` counts) |
+
+**Derived numbers** (`inventory_daily`): `units_sold_1d` = previous available reading minus
+today's, floored at 0 and compared against the previous *available* reading rather than
+calendar yesterday, so a blocked day does not lose the sales. A rise is a restock: logged in
+`restock_units`, excluded from sales, and the interval containing it is dropped from the
+units/day maths. `units_per_day_7d` and `units_per_day_prev_7d` are units per measured day
+over the last 7 and the 7 before; `units_per_day_wow` is their ratio. The Signals tab sums
+these over a product's hero variants.
+
+**Alerts** (rules 9-11, written to `alerts/YYYY-MM-DD.md` and the Alerts tab):
+
+- 9: published < 30 days ago, `units_per_day_wow` >= 2.0 and `units_per_day_7d` >= 5
+- 10: >= 50 units/day and not in the store's top 10 (`collection_position <= 10`) in the snapshot a week ago
+- 11: stock hit 0 within 14 days of publish
+
+**Commands**
+
+```bash
+python tracker.py inventory                      # probe INVENTORY_STORES now (any date: --date)
+python tracker.py inventory --only a.com b.com   # probe specific stores regardless of .env
+python tracker.py inventory-report [--store a.com] [--days 14] [--raw]
+```
+
+`inventory-report` shows, per store, how many hero variants landed on each rung of the
+chain, then one row per hero variant with the raw `stock_level` reading for every day
+(`ads` = not tracked, `blk` = blocked, `-` = no reading), and the inventory alerts.
+
+**Rollout:** set `INVENTORY_STORES=neuro-bella.com,tryorgatics.com,metabolae.com` in `.env`
+and the scheduled `python tracker.py run` probes those three after the Shopify pass, before
+the Sheets sync. `INVENTORY=1` (or `run --inventory`) probes every watchlist store; do that
+only after the readings from the first stores look right. `--no-inventory` skips the pass.
+Budget: about 40 probes x 10 s = 7 minutes per store per day.
+
 ## Scheduling (Windows)
 
 `run_daily.bat` probes, in order, `.venv\Scripts\python.exe`, `py -3`, `python` and `python3`,
@@ -306,7 +369,9 @@ python tracker.py remove-store bad1.com bad2.com     # drops them from watchlist
 | `products_daily` | (day, store, product) | handle, title, type, tags (JSON), created/published/updated, variant_count, sold_out_variants, min/max price, `collection_position` (index in `/collections/all`, often best-selling order) |
 | `variants_daily` | (day, store, variant) | price, compare_at_price, available |
 | `runs`, `store_runs` | run / (run, store) | status, error text, products seen, pages, duration |
-| `ads_daily`, `alerts` | — | created now, populated from steps 3 and 5 |
+| `hero_variants` | (store, variant) | which variants are probed, role (new / rank / bundle_component), current rung, `inventory_tracked`, last probe date |
+| `inventory_daily` | (day, variant) | `stock_level`, `signal_source`, raw probe message, `units_sold_1d`, `restock_units`, `units_per_day_7d`, `units_per_day_prev_7d`, `units_per_day_wow` |
+| `alerts` | alert | rules 1-4 (deltas), 5-8 (Meta), 9-11 (inventory) |
 
 History is append-only across days. Re-running the same `--date` replaces only that day
 for that store, so a crashed or partial run can be repeated safely.
@@ -392,7 +457,8 @@ sheets/Code.gs          Apps Script web app to paste into the Sheet's script edi
 earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + pure normaliser + Meta page discovery
 earlyscale/deltas.py    pure delta calculations (7d counts, sold-out/price/handle deltas) + DB loaders
 earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture), parser, SQLite recording
-earlyscale/ad_metrics.py landing-URL join, concepts, lineage, daily ad metrics, alert rules 5-7, Signals join
+earlyscale/ad_metrics.py landing-URL join, concepts, lineage, daily ad metrics, alert rules 5-8, Signals join
+earlyscale/inventory.py  hero-variant selection, /cart/add.js stock probe + theme fallback, units-sold maths, alert rules 9-11
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O
 earlyscale/config.py    paths, .env loader, tunables

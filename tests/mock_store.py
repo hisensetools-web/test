@@ -99,7 +99,44 @@ def build_supplement_catalog(n: int, seed: int, now: datetime) -> list[dict]:
             "images": [], "options": [],
         })
         i += 1
+    # things hero selection must skip / treat specially
+    pid = 7_100_000_000_000 + seed * 1_000_000 + 900
+    products.append({
+        "id": pid, "title": "Shipping Protection", "handle": "shipping-protection", "body_html": "",
+        "published_at": now.isoformat(), "created_at": now.isoformat(), "updated_at": now.isoformat(),
+        "vendor": "Route", "product_type": "Insurance", "tags": [],
+        "variants": [{"id": pid * 10, "title": "Default Title", "sku": None, "price": "1.98", "compare_at_price": None,
+                      "available": True, "position": 1, "product_id": pid}], "images": [], "options": []})
+    pid = 7_100_000_000_000 + seed * 1_000_000 + 901
+    products.append({
+        "id": pid, "title": f"{heroes[0]} + {heroes[1]} Bundle", "handle": "starter-bundle", "body_html": "",
+        "published_at": (now - timedelta(days=3)).isoformat(), "created_at": (now - timedelta(days=3)).isoformat(),
+        "updated_at": now.isoformat(), "vendor": f"MockSupp{seed}", "product_type": "Bundle", "tags": ["bundle"],
+        "variants": [{"id": pid * 10, "title": "Default Title", "sku": None, "price": "79.00", "compare_at_price": None,
+                      "available": True, "position": 1, "product_id": pid}], "images": [], "options": []})
     return products
+
+
+def stock_model(products: list[dict], seed: int, day: int) -> dict[int, dict]:
+    """Deterministic per-variant inventory for the fake /cart/add.js and product pages.
+    mode: cart (422 with a count) | theme (add succeeds, page shows inventory_quantity) | none (untracked).
+    Stock falls by per_day units every day; one variant restocks on day 3."""
+    rng = random.Random(seed + 4242)
+    out = {}
+    for k, p in enumerate(products):
+        for v in p["variants"]:
+            mode = ["cart", "cart", "cart", "theme", "none"][k % 5]
+            base = rng.randint(40, 400)
+            per_day = rng.choice([0, 1, 2, 3, 5, 8, 12, 20, 45])
+            if p["handle"].startswith("shipping-"):
+                mode, per_day = "none", 0
+            stock = max(0, base - per_day * (day - 1))
+            if k == 1 and day >= 3:
+                stock += 150   # restock
+            if not v["available"]:
+                stock = 0
+            out[v["id"]] = {"mode": mode, "stock": stock, "per_day": per_day, "handle": p["handle"]}
+    return out
 
 
 def mutate(products: list[dict], seed: int, now: datetime) -> list[dict]:
@@ -128,8 +165,11 @@ def mutate(products: list[dict], seed: int, now: datetime) -> list[dict]:
 
 def make_handler(products: list[dict], collection: list[dict], delay_first_page_status: int | None,
                  require_browser: bool = False, redirect_to: str | None = None,
-                 html_unless_json_accept: bool = False):
-    state = {"first_products_call": True, "hits": 0}
+                 html_unless_json_accept: bool = False, stock: dict[int, dict] | None = None,
+                 cart_status: int | None = None):
+    state = {"first_products_call": True, "hits": 0, "cart_posts": 0, "cart_clears": 0, "checkout_hits": 0}
+    stock = stock or {}
+    by_handle = {p["handle"]: p for p in products}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # quiet
@@ -180,6 +220,48 @@ def make_handler(products: list[dict], collection: list[dict], delay_first_page_
                     return
             elif u.path == "/collections/all/products.json":
                 src = collection
+            elif u.path.startswith("/checkout"):
+                state["checkout_hits"] += 1   # the tracker must never come here
+                self.send_response(403)
+                self.end_headers()
+                return
+            elif u.path.startswith("/products/") and u.path.endswith(".json"):
+                p = by_handle.get(u.path[len("/products/"):-5])
+                if p is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                self._send_json(200, {"product": p})
+                return
+            elif u.path.startswith("/products/"):
+                p = by_handle.get(u.path[len("/products/"):])
+                if p is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                variants = []
+                for v in p["variants"]:
+                    st = stock.get(v["id"], {})
+                    d = {"id": v["id"], "title": v["title"], "price": int(float(v["price"]) * 100), "available": v["available"]}
+                    if st.get("mode") == "theme":
+                        d["inventory_quantity"] = st["stock"]
+                        d["inventory_management"] = "shopify"
+                    variants.append(d)
+                extra = ""
+                if p["product_type"] == "Bundle":
+                    comps = [x for x in products if x["product_type"] != "Bundle" and not x["handle"].startswith("shipping")][:2]
+                    extra = "".join(f'<div class="bundle-item" data-variant-id="{c["variants"][0]["id"]}">{c["title"]}</div>'
+                                    f'<script>window.bundleItems = [{{"variant_id": {c["variants"][0]["id"]}}}]</script>' for c in comps)
+                html = (f'<html><head><title>{p["title"]}</title></head><body><h1>{p["title"]}</h1>'
+                        f'<script type="application/json" id="ProductJson">{json.dumps({"id": p["id"], "handle": p["handle"], "variants": variants})}</script>'
+                        f'{extra}<form action="/cart/add"><input type="hidden" name="id" value="{p["variants"][0]["id"]}"></form>'
+                        f'</body></html>').encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
             elif u.path.startswith("/pages/"):
                 # advertorial: links to the first product and has a buy form with a variant id
                 p0 = products[0]
@@ -209,6 +291,56 @@ def make_handler(products: list[dict], collection: list[dict], delay_first_page_
             start = (page - 1) * limit
             self._send_json(200, {"products": src[start:start + limit]})
 
+        def do_POST(self):
+            u = urlparse(self.path)
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n) if n else b""
+            if u.path.startswith("/checkout"):
+                state["checkout_hits"] += 1
+                self.send_response(403)
+                self.end_headers()
+                return
+            if u.path == "/cart/clear.js":
+                state["cart_clears"] += 1
+                self._send_json(200, {"token": "x", "item_count": 0, "items": []})
+                return
+            if u.path != "/cart/add.js":
+                self.send_response(404)
+                self.end_headers()
+                return
+            state["cart_posts"] += 1
+            if cart_status:   # simulate a WAF / bot challenge on the cart endpoint
+                self._send_json(cart_status, {"error": "blocked"})
+                return
+            try:
+                data = json.loads(body or b"{}")
+                item = (data.get("items") or [data])[0]
+                vid, qty = int(item.get("id")), int(item.get("quantity", 1))
+            except (ValueError, TypeError, AttributeError, IndexError):
+                self._send_json(422, {"status": 422, "message": "Cart Error", "description": "Invalid request"})
+                return
+            st = stock.get(vid)
+            if st is None:
+                self._send_json(404, {"status": 404, "message": "Cart Error", "description": "Cannot find variant"})
+                return
+            name = st["handle"].replace("-", " ").title()
+            if st["mode"] == "cart":
+                if st["stock"] <= 0:
+                    self._send_json(422, {"status": 422, "message": "Cart Error",
+                                          "description": f"The product '{name}' is already sold out."})
+                elif qty > st["stock"]:
+                    self._send_json(422, {"status": 422, "message": "Cart Error",
+                                          "description": f"You can only add {st['stock']} {name} to the cart."})
+                else:
+                    self._send_json(200, {"items": [{"id": vid, "quantity": qty}]})
+                return
+            # theme / none: inventory not enforced at the cart
+            self._send_json(200, {"items": [{"id": vid, "quantity": qty}]})
+
+        @classmethod
+        def stats(cls):
+            return dict(state)
+
     return Handler
 
 
@@ -228,6 +360,10 @@ def main(argv=None):
                     help="answer .json URLs with the storefront HTML (200) unless Accept asks for JSON")
     ap.add_argument("--redirect-to", metavar="ORIGIN",
                     help="301 every request to ORIGIN (simulates apex -> www redirect)")
+    ap.add_argument("--day", type=int, default=None,
+                    help="simulated day number for stock levels (default 1, or 2 with --mutate); stock falls daily")
+    ap.add_argument("--cart-status", type=int, default=None, metavar="STATUS",
+                    help="answer every /cart/add.js with this status (e.g. 403) to test the blocked path")
     args = ap.parse_args(argv)
     now = datetime.now(timezone.utc).replace(microsecond=0)
     products = (build_supplement_catalog if args.catalog == "supplements" else build_catalog)(args.products, args.seed, now)
@@ -236,10 +372,12 @@ def main(argv=None):
     # "best-selling" collection order: deterministic shuffle so position differs from catalog order
     collection = list(products)
     random.Random(args.seed + 7).shuffle(collection)
+    day = args.day or (2 if args.mutate else 1)
+    stock = stock_model(products, args.seed, day)
     srv = HTTPServer(("127.0.0.1", args.port), make_handler(products, collection, args.fail_first,
                                                              args.require_browser, args.redirect_to,
-                                                             args.html_unless_json_accept))
-    print(f"mock store on http://127.0.0.1:{args.port} products={len(products)} seed={args.seed} mutate={args.mutate}")
+                                                             args.html_unless_json_accept, stock, args.cart_status))
+    print(f"mock store on http://127.0.0.1:{args.port} products={len(products)} seed={args.seed} mutate={args.mutate} day={day}")
     srv.serve_forever()
 
 

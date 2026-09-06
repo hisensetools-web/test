@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import sys
 import time
 from datetime import date, datetime
@@ -11,7 +12,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import ad_metrics, config, db, deltas, meta_ads, sheets, shopify
+from . import ad_metrics, config, db, deltas, inventory, meta_ads, sheets, shopify
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist
 
 console = Console()
@@ -111,6 +112,13 @@ def cmd_run(args) -> int:
             console.print(f"ads: [green]{a_ok} ok[/], [red]{a_failed} failed[/]")
         except Exception as e:  # noqa: BLE001 - never let the ad pass break the daily run
             console.print(f"[red]ads pass failed:[/] {e}")
+    inv_stores = inventory_targets(stores, only, args.inventory)
+    if inv_stores and not args.no_inventory:
+        console.print(f"inventory probe pass ({len(inv_stores)} store(s), waits={config.INVENTORY_WAIT_MIN:.0f}-{config.INVENTORY_WAIT_MAX:.0f}s) ...")
+        try:
+            run_inventory_pass(conn, inv_stores, snapshot_date)
+        except Exception as e:  # noqa: BLE001 - never let the probe break the daily run
+            console.print(f"[red]inventory pass failed:[/] {e}")
     if config.SHEETS_WEBHOOK_URL and not args.no_sync:
         if args.watchlist:
             sheets.set_watchlist_path(Path(args.watchlist))
@@ -234,6 +242,171 @@ def _post_process_store(conn, store_id: int, domain: str, snapshot_date: str, se
     except Exception as e:  # noqa: BLE001
         log.error("%-28s metrics FAILED: %s", domain, e)
         return {}
+
+
+def inventory_targets(stores: list[dict], only: set[str] | None, force_all: bool = False) -> list[dict]:
+    """Stores to probe: INVENTORY_STORES from .env (or every store when INVENTORY=1 / --inventory)."""
+    wanted = None if (force_all or config.INVENTORY_ALL) else set(config.INVENTORY_STORES)
+    out = []
+    for s in stores:
+        d = s["store_domain"]
+        if only and d not in only:
+            continue
+        bare = re.sub(r"^www\.", "", d.split("//")[-1].lower())
+        if wanted is None or d.lower() in wanted or bare in wanted or f"www.{bare}" in wanted:
+            out.append(s)
+    return out
+
+
+def run_inventory_pass(conn, stores: list[dict], snapshot_date: str) -> list[dict]:
+    """Probe hero variants of each store, compute sales and alerts. A failing store never aborts the pass."""
+    results = []
+    for s in stores:
+        domain = s["store_domain"]
+        store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
+        conn.commit()
+        t0 = time.monotonic()
+        try:
+            counts = inventory.probe_store(conn, store_id, domain, snapshot_date)
+            alerts = inventory.run_alerts(conn, store_id, domain, snapshot_date)
+            log.info("%-28s heroes: cart_probe=%d theme=%d ads_only=%d blocked=%d components=%d skipped=%d alerts=%d %.0fs",
+                     domain, counts["cart_probe"], counts["theme_inventory"], counts["ads_only"], counts["blocked"],
+                     counts["components"], counts["skipped"], len(alerts), time.monotonic() - t0)
+            results.append({"store": domain, "ok": True, **counts, "alerts": len(alerts)})
+        except Exception as e:  # noqa: BLE001 - by design
+            log.error("%-28s inventory FAILED: %s", domain, e)
+            results.append({"store": domain, "ok": False, "error": str(e)})
+    md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
+    if md:
+        log.info("alerts written to %s", md)
+    return results
+
+
+def cmd_inventory(args) -> int:
+    snapshot_date = _parse_date(args.date)
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    if not stores:
+        console.print("[red]watchlist is empty[/]")
+        return 2
+    conn = db.connect(args.db)
+    only = set(args.only) if args.only else None
+    targets = inventory_targets(stores, only, force_all=bool(only) or args.all)
+    if not targets:
+        console.print("[red]no stores selected.[/] Set INVENTORY_STORES=a.com,b.com in .env, or pass --only a.com b.com")
+        return 2
+    missing = [s["store_domain"] for s in targets if inventory.latest_products(conn, db.upsert_store(conn, s["store_domain"]))[0] is None]
+    if missing:
+        console.print(f"[yellow]no products snapshot yet for:[/] {', '.join(missing)} - run `python tracker.py run --only ...` first")
+    console.print(f"inventory: snapshot_date={snapshot_date} stores={len(targets)} waits={config.INVENTORY_WAIT_MIN:.0f}-{config.INVENTORY_WAIT_MAX:.0f}s "
+                  f"max_variants={config.INVENTORY_MAX_VARIANTS}/store")
+    t0 = time.monotonic()
+    results = run_inventory_pass(conn, targets, snapshot_date)
+    t = Table(title="hero variants by fallback rung")
+    for c in ("store", "cart_probe", "theme_inventory", "ads_only", "blocked", "components", "skipped", "alerts"):
+        t.add_column(c, justify="left" if c == "store" else "right")
+    for r in results:
+        if r["ok"]:
+            t.add_row(r["store"], *[str(r[c]) for c in ("cart_probe", "theme_inventory", "ads_only", "blocked", "components", "skipped", "alerts")])
+        else:
+            t.add_row(r["store"], f"[red]FAILED: {r['error'][:60]}[/]", "", "", "", "", "", "")
+    console.print(t)
+    console.print(f"done in {time.monotonic() - t0:.0f}s. Readings: `python tracker.py inventory-report`")
+    return 0 if any(r["ok"] for r in results) else 1
+
+
+def _short(domain: str) -> str:
+    return re.sub(r"^https?://", "", domain or "")
+
+
+def cmd_inventory_report(args) -> int:
+    conn = db.connect(args.db)
+    as_of = _parse_date(args.date) if args.date else conn.execute("SELECT MAX(snapshot_date) FROM inventory_daily").fetchone()[0]
+    if not as_of:
+        console.print("no inventory readings yet - run `python tracker.py inventory`")
+        return 1
+    days = args.days
+    where, params = "", []
+    if args.store:
+        where, params = " AND s.store_domain = ?", [args.store]
+    # 1. per-store rung counts (latest state of each hero variant)
+    t = Table(title=f"fallback chain per store (hero variants, as of {as_of})")
+    for c in ("store", "heroes", "cart_probe", "theme_inventory", "ads_only", "blocked/never", "stock=0", "tracked %"):
+        t.add_column(c, justify="left" if c == "store" else "right")
+    rows = conn.execute(f"""
+        SELECT s.store_domain, COUNT(*) AS n,
+               SUM(h.signal_source = 'cart_probe') AS cp, SUM(h.signal_source = 'theme_inventory') AS th,
+               SUM(h.signal_source = 'ads_only') AS ao, SUM(h.signal_source IS NULL) AS nv,
+               SUM(h.inventory_tracked = 1) AS tracked,
+               SUM((SELECT stock_level FROM inventory_daily i WHERE i.store_id = h.store_id AND i.variant_id = h.variant_id
+                    AND i.stock_level IS NOT NULL ORDER BY i.snapshot_date DESC LIMIT 1) = 0) AS zero
+        FROM hero_variants h JOIN stores s ON s.id = h.store_id WHERE 1=1 {where}
+        GROUP BY s.store_domain ORDER BY s.store_domain""", params).fetchall()
+    for r in rows:
+        pct = f"{100 * (r['tracked'] or 0) / r['n']:.0f}%" if r["n"] else ""
+        t.add_row(_short(r["store_domain"]), str(r["n"]), str(r["cp"] or 0), str(r["th"] or 0), str(r["ao"] or 0),
+                  str(r["nv"] or 0), str(r["zero"] or 0), pct)
+    console.print(t)
+    # 2. raw readings: one row per hero variant, one column per day
+    dates = [r[0] for r in conn.execute("SELECT DISTINCT snapshot_date FROM inventory_daily WHERE snapshot_date <= ? ORDER BY snapshot_date DESC LIMIT ?",
+                                        (as_of, days))][::-1]
+    t = Table(title=f"raw stock_level readings, last {len(dates)} day(s)  ('-' = no reading, 'ads' = not tracked, 'blk' = blocked)")
+    for c in ("store", "handle", "variant", "role", "price", "source"):
+        t.add_column(c)
+    for d in dates:
+        t.add_column(d[5:], justify="right")
+    for c in ("sold 1d", "u/day 7d", "wow"):
+        t.add_column(c, justify="right")
+    heroes = conn.execute(f"""
+        SELECT s.store_domain, h.* FROM hero_variants h JOIN stores s ON s.id = h.store_id WHERE 1=1 {where}
+        ORDER BY s.store_domain, h.role = 'rank', h.handle, h.variant_id""", params).fetchall()
+    shown = 0
+    for h in heroes:
+        if args.limit and shown >= args.limit:
+            break
+        readings = {r["snapshot_date"]: r for r in conn.execute(
+            "SELECT * FROM inventory_daily WHERE store_id = ? AND variant_id = ? AND snapshot_date <= ?",
+            (h["store_id"], h["variant_id"], as_of))}
+        if not readings and not args.all:
+            continue
+        cells = []
+        for d in dates:
+            r = readings.get(d)
+            if r is None:
+                cells.append("-")
+            elif r["stock_level"] is not None:
+                cells.append(str(r["stock_level"]))
+            else:
+                cells.append({"ads_only": "ads", "blocked": "blk"}.get(r["signal_source"], "?"))
+        last = readings.get(dates[-1]) if dates else None
+        def f(v, fmt="{}"):
+            return "" if v is None else fmt.format(v)
+        vt = h["variant_title"] or ""
+        t.add_row(_short(h["store_domain"]), h["handle"], "" if vt == "Default Title" else vt, h["role"] or "",
+                  f(h["price"], "{:.2f}"), h["signal_source"] or "", *cells,
+                  f(last["units_sold_1d"]) if last else "", f(last["units_per_day_7d"], "{:.1f}") if last else "",
+                  f(last["units_per_day_wow"], "x{:.2f}") if last else "")
+        shown += 1
+    console.print(t)
+    if args.raw:
+        t = Table(title="raw probe messages (latest reading per variant)")
+        for c in ("store", "handle", "variant_id", "source", "message"):
+            t.add_column(c)
+        for h in heroes[: args.limit or None]:
+            r = conn.execute("SELECT signal_source, raw_message FROM inventory_daily WHERE store_id = ? AND variant_id = ? ORDER BY snapshot_date DESC LIMIT 1",
+                             (h["store_id"], h["variant_id"])).fetchone()
+            if r:
+                t.add_row(_short(h["store_domain"]), h["handle"], str(h["variant_id"]), r["signal_source"] or "", (r["raw_message"] or "")[:100])
+        console.print(t)
+    al = conn.execute(f"""SELECT a.snapshot_date, a.rule, s.store_domain, a.product_handle, a.detail FROM alerts a JOIN stores s ON s.id = a.store_id
+                          WHERE a.rule IN (9, 10, 11) {where} ORDER BY a.snapshot_date DESC, a.rule LIMIT 40""", params).fetchall()
+    if al:
+        t = Table(title="inventory alerts (rules 9-11)")
+        for c in ("date", "rule", "store", "handle", "detail"):
+            t.add_column(c)
+        for r in al:
+            t.add_row(r["snapshot_date"], f"{r['rule']} {inventory.RULES[r['rule']]}", r["store_domain"], r["product_handle"] or "", r["detail"])
+        console.print(t)
+    return 0
 
 
 def cmd_ads(args) -> int:
@@ -627,7 +800,25 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-sync", action="store_true", help="skip the Google Sheets sync even if SHEETS_WEBHOOK_URL is set")
     s.add_argument("--ads", action="store_true", help="also scrape the Meta Ad Library (same as META_ADS=1 in .env)")
     s.add_argument("--no-ads", action="store_true", help="skip the Meta pass even if META_ADS=1")
+    s.add_argument("--inventory", action="store_true", help="probe stock on every store (same as INVENTORY=1; default: INVENTORY_STORES only)")
+    s.add_argument("--no-inventory", action="store_true", help="skip the stock probe even if INVENTORY_STORES is set")
     s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("inventory", help="probe hero-variant stock via /cart/add.js (fallback: theme inventory_quantity) and compute units sold")
+    s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today)")
+    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="probe these store domains (overrides INVENTORY_STORES)")
+    s.add_argument("--all", action="store_true", help="probe every watchlist store")
+    s.set_defaults(fn=cmd_inventory)
+
+    s = sub.add_parser("inventory-report", help="raw stock_level readings per hero variant and per-store fallback-rung counts")
+    s.add_argument("--date", help="as of this snapshot date (default: latest)")
+    s.add_argument("--store", help="one store domain")
+    s.add_argument("--days", type=int, default=14, help="how many daily columns to show")
+    s.add_argument("--limit", type=int, default=200, help="max variant rows")
+    s.add_argument("--all", action="store_true", help="include hero variants with no reading yet")
+    s.add_argument("--raw", action="store_true", help="also print the raw probe messages")
+    s.set_defaults(fn=cmd_inventory_report)
 
     s = sub.add_parser("ads", help="scrape the Meta Ad Library for watchlist stores (Part B)")
     s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today)")

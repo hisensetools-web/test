@@ -68,3 +68,12 @@ META_AD_LIBRARY_BASE = os.environ.get("META_AD_LIBRARY_BASE", "https://www.faceb
 LANDING_REFRESH_DAYS = int(os.environ.get("LANDING_REFRESH_DAYS", "7"))  # re-fetch advertorial pages this often
 META_MAX_POSTS = int(os.environ.get("META_MAX_POSTS", "25"))     # boosted posts to fetch per store per run
 META_REACH_MIN = int(os.environ.get("META_REACH_MIN", "1000"))    # ignore reach-slope alerts below this reach
+
+# Inventory-delta sales tracking. INVENTORY_STORES = comma list of domains to probe daily (rollout gate);
+# INVENTORY=1 probes every watchlist store.
+INVENTORY_STORES = [d.strip().lower() for d in os.environ.get("INVENTORY_STORES", "").split(",") if d.strip()]
+INVENTORY_ALL = os.environ.get("INVENTORY", "").strip() in ("1", "true", "yes")
+INVENTORY_WAIT_MIN = float(os.environ.get("INVENTORY_WAIT_MIN", "5"))
+INVENTORY_WAIT_MAX = float(os.environ.get("INVENTORY_WAIT_MAX", "15"))
+INVENTORY_MAX_VARIANTS = int(os.environ.get("INVENTORY_MAX_VARIANTS", "40"))   # per store per day
+INVENTORY_PROBE_QTY = 9999

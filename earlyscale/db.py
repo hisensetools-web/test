@@ -165,6 +165,44 @@ CREATE TABLE IF NOT EXISTS landing_pages (
     candidates      TEXT                -- handle:count,... found on the page
 );
 
+-- Inventory-delta sales tracking: which variants we probe and what they read each day.
+CREATE TABLE IF NOT EXISTS hero_variants (
+    store_id            INTEGER NOT NULL REFERENCES stores(id),
+    variant_id          INTEGER NOT NULL,
+    product_id          INTEGER NOT NULL,
+    handle              TEXT NOT NULL,
+    variant_title       TEXT,
+    price               REAL,
+    role                TEXT,               -- new | rank | bundle_component
+    bundle_like         INTEGER DEFAULT 0,
+    selected_at         TEXT NOT NULL,
+    last_selected_at    TEXT,
+    signal_source       TEXT,               -- cart_probe | theme_inventory | ads_only
+    inventory_tracked   INTEGER,            -- NULL unknown, 1 yes, 0 no (stop probing)
+    last_probe_date     TEXT,
+    consecutive_failures INTEGER DEFAULT 0,
+    note                TEXT,
+    PRIMARY KEY (store_id, variant_id)
+);
+
+CREATE TABLE IF NOT EXISTS inventory_daily (
+    snapshot_date       TEXT NOT NULL,
+    store_id            INTEGER NOT NULL REFERENCES stores(id),
+    variant_id          INTEGER NOT NULL,
+    product_id          INTEGER NOT NULL,
+    stock_level         INTEGER,            -- NULL when the rung gave no number
+    signal_source       TEXT NOT NULL,      -- cart_probe | theme_inventory | ads_only | blocked
+    raw_message         TEXT,
+    probed_at           TEXT NOT NULL,
+    prev_reading_date   TEXT,
+    units_sold_1d       INTEGER,
+    restock_units       INTEGER,
+    units_per_day_7d    REAL,
+    units_per_day_prev_7d REAL,
+    units_per_day_wow   REAL,
+    PRIMARY KEY (snapshot_date, variant_id)
+);
+
 CREATE TABLE IF NOT EXISTS meta_page_runs (
     id              INTEGER PRIMARY KEY,
     store_id        INTEGER NOT NULL REFERENCES stores(id),

@@ -219,10 +219,12 @@ def store_signal_context(conn: sqlite3.Connection, store_id: int, store_domain: 
     rank_7d: dict[int, int | None] = {}
     if week_ago:
         rank_7d = {p["product_id"]: p["collection_position"] for p in load_store_products(conn, store_id, week_ago)}
-    from . import ad_metrics
+    from . import ad_metrics, inventory
     meta = ad_metrics.meta_for_signals(conn, store_id, today)
+    inv = inventory.inventory_for_signals(conn, store_id, today)
     return {"store_id": store_id, "store": store_domain, "date": today, "as_of": as_of_d,
-            "products": products, "families": fam, "rank_7d": rank_7d, "rank_7d_date": week_ago, "meta": meta}
+            "products": products, "families": fam, "rank_7d": rank_7d, "rank_7d_date": week_ago, "meta": meta,
+            "inventory": inv}
 
 
 def _blank(v):
@@ -238,8 +240,10 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
             fam_new_7d[fam[p["product_id"]]] += 1
     rows = []
     meta = ctx.get("meta") or {}
+    inv = ctx.get("inventory") or {}
     for p in ctx["products"]:
         m = meta.get(p["handle"], {})
+        iv = inv.get(p["handle"], {})
         days = _days_between(p["published_at"], as_of)
         rank = None if p["collection_position"] is None else p["collection_position"] + 1
         old = ctx["rank_7d"].get(p["product_id"]) if ctx["rank_7d_date"] else None
@@ -255,6 +259,8 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
             "" if rank is None else rank, rank_delta, fam_new_7d[fam[p["product_id"]]],
             m.get("ads_pointing_here", ""), _blank(m.get("engagement_per_day")), _blank(m.get("days_running_max")),
             m.get("concept_status", ""), _blank(m.get("eu_reach_slope_7d")), _blank(m.get("comment_delta_1d")),
+            iv.get("signal_source", ""), iv.get("inventory_tracked", ""), _blank(iv.get("stock_level")),
+            _blank(iv.get("units_sold_1d")), _blank(iv.get("units_per_day_7d")), _blank(iv.get("units_per_day_wow")),
         ])
     return rows
 
