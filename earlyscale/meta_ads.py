@@ -391,11 +391,15 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
             if result.blocked:
                 return
             stale = 0
+            log.info("%s: page open, %d ads in the first load; scrolling (%d-%ds between scrolls, up to %d scrolls)",
+                     _short(url), len(nodes), int(config.META_WAIT_MIN), int(config.META_WAIT_MAX), max_scrolls)
             for i in range(max_scrolls):
                 before = len(nodes)
                 page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
                 result.scrolls += 1
                 _wait()
+                if (i + 1) % 5 == 0:
+                    log.info("%s: scroll %d/%d, %d ads so far", _short(url), i + 1, max_scrolls, len(nodes))
                 _check_blocked(page, result)
                 if result.blocked:
                     break
@@ -426,6 +430,13 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
     if result.blocked:
         raise MetaBlocked(result.note or "blocked")
     return result
+
+
+def _short(url: str) -> str:
+    """The search term from an Ad Library URL, for log lines."""
+    from urllib.parse import parse_qs, urlparse as _up
+    q = parse_qs(_up(url).query)
+    return (q.get("q") or q.get("view_all_page_id") or ["?"])[0]
 
 
 def _dismiss_dialogs(page) -> None:
