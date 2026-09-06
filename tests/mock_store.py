@@ -180,6 +180,19 @@ def make_handler(products: list[dict], collection: list[dict], delay_first_page_
                     return
             elif u.path == "/collections/all/products.json":
                 src = collection
+            elif u.path.startswith("/pages/"):
+                # advertorial: links to the first product and has a buy form with a variant id
+                p0 = products[0]
+                html = (f'<html><body><h1>{p0["title"]} story</h1>'
+                        f'<a href="/products/{p0["handle"]}?utm=adv">Read more</a>'
+                        f'<form action="/cart/add"><input type="hidden" name="id" value="{p0["variants"][0]["id"]}"></form>'
+                        f'</body></html>').encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
             elif u.path == "/":
                 html = b'<html><body><footer><a href="https://www.facebook.com/sharer/sharer.php?u=x">share</a>' \
                        b'<a href="https://www.facebook.com/MockStorePage">fb</a></footer></body></html>'

@@ -44,8 +44,16 @@ load();
 BLOCKED = "<html><head><title>Log in to Facebook</title></head><body><h1>You must log in to continue.</h1></body></html>"
 
 
-def make_handler(batches: int, block: bool):
+def make_handler(batches: int, block: bool, landing: str | None = None, handles: list[str] | None = None):
     base = json.loads(FIX.read_text())
+    if landing:
+        # point every ad at the given store origin: products/<handle> for the first two ads, /pages/av1 for the third
+        res = base["data"]["ad_library_main"]["search_results_connection"]["edges"][0]["node"]["collated_results"]
+        hs = handles or ["ceylon-cinnamon-capsules-tt", "ceylon-cinnamon-capsules"]
+        res[0]["snapshot"]["link_url"] = f"{landing}/products/{hs[0]}?utm_source=fb"
+        res[1]["snapshot"]["link_url"] = f"{landing}/pages/av1"
+        res[2]["snapshot"]["link_url"] = None
+        res[2]["snapshot"]["cards"][0]["link_url"] = f"{landing}/products/{hs[-1]}"
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -95,8 +103,10 @@ def main(argv=None):
     ap.add_argument("--port", type=int, default=8095)
     ap.add_argument("--batches", type=int, default=3)
     ap.add_argument("--block", action="store_true", help="serve a login wall instead of results")
+    ap.add_argument("--landing", help="store origin to point landing URLs at, e.g. http://127.0.0.1:8011")
+    ap.add_argument("--handles", nargs="+", help="product handles to use in landing URLs")
     a = ap.parse_args(argv)
-    srv = HTTPServer(("127.0.0.1", a.port), make_handler(a.batches, a.block))
+    srv = HTTPServer(("127.0.0.1", a.port), make_handler(a.batches, a.block, a.landing, a.handles))
     print(f"fake Ad Library on http://127.0.0.1:{a.port}/ads/library/ batches={a.batches} block={a.block}")
     srv.serve_forever()
 

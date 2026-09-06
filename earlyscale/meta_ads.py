@@ -178,7 +178,9 @@ def normalise_ad(node: dict) -> dict:
     )
     aaa = node.get("aaa_info") or {}
     eu_reach = _first(aaa.get("eu_total_reach"), node.get("eu_total_reach"))
-    fp_src = f"{_strip_query(asset)}|{(body_text or '').lower()[:500]}"
+    # Meta gives every ad its own asset URL, so hashing the asset made every fingerprint unique.
+    # Hash the copy instead: identical text+headline across ads/pages = same creative concept.
+    fp_src = f"{(headline or '').lower().strip()}|{(body_text or '').lower()[:500]}"
     social = {}
     for key in ("reactions", "comments", "shares"):
         for cand in (f"{key}_count", key, f"{key[:-1]}_count"):
@@ -294,7 +296,10 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
                 result.scrolls += 1
                 _wait()
                 _check_blocked(page, result)
-                if result.blocked or len(nodes) >= max_ads:
+                if result.blocked:
+                    break
+                if len(nodes) >= max_ads:
+                    result.note = f"stopped at max_ads={max_ads} (page has more)"
                     break
                 stale = stale + 1 if len(nodes) == before else 0
                 if stale >= 2:

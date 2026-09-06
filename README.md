@@ -3,7 +3,7 @@
 Detects Shopify products in their first weeks of paid-social scaling by snapshotting
 leading signals daily and alerting on week-over-week deltas. Full spec: [CLAUDE.md](CLAUDE.md).
 
-**Status: build steps 1–2 of 6, Sheets sync, Part B increment 1** — `products.json` fetcher, SQLite schema, daily snapshot,
+**Status: build steps 1–2 of 6, Sheets sync, Part A, Part B** — `products.json` fetcher, SQLite schema, daily snapshot,
 delta calculations and the `report` / `product` commands. Meta Ad Library (step 3),
 landing-URL join (4), alerts (5) and the full cron/README pass (6) are not built yet.
 
@@ -131,7 +131,7 @@ exist keep their data; new tabs are created on the next sync.
   old rows from the Products tab when needed; the SQLite database keeps full history.
 - Advanced: `SHEETS_CHUNK_BYTES` (default 40000) sets the payload size per POST.
 
-## Meta Ad Library (Part B, increment 1: raw ads into SQLite)
+## Meta Ad Library (Part B)
 
 `python tracker.py ads` opens the public Ad Library in headless Chromium, one browser, one
 page at a time, with random 3-8 s pauses between scrolls and a rotating desktop
@@ -160,10 +160,41 @@ python tracker.py ads-report --store somestore.com  # per-page status + raw ad r
 type, headline, primary text, landing URL, fingerprint (hash of creative asset + text),
 EU reach. Send that table back before enabling more stores.
 
+**What happens after each page is scraped** (also runnable on its own with
+`python tracker.py ads-metrics`, no browser needed):
+
+1. **Landing URL to product.** `/products/<handle>` on the store's domain matches
+   products.json directly (channel-suffixed handles match exactly; unknown suffixes fall back
+   to the longest known prefix). `/pages/<x>` advertorials and other URLs are fetched once a
+   week and their buy links, `/cart/add` variant ids and embedded product JSON are read; the
+   best-supported known handle wins. Advertorials with no product link keep `page_handle`
+   and a blank product. Fetch results are cached in `landing_pages`.
+2. **Concepts.** Same page + same landing URL (sans query) + launch dates chaining within
+   1 day = one concept. Per day: ads ever, ads active, survival = active / ever, days running.
+3. **Lineage.** An ad whose Meta start date is within 7 days, whose headline+text is more
+   than 70% similar (word-trigram Jaccard) to an ad 14+ days old on the same page, is linked
+   to that ad.
+4. **Per-ad daily metrics.** `days_running`, and `engagement`, `engagement_delta`,
+   `engagement_per_day` (7-day average) when engagement counts exist, which the Ad Library
+   does not provide, so these stay empty.
+5. **Alerts** (rules 5-7, appended to the `alerts` table, `alerts/YYYY-MM-DD.md`, and the
+   Alerts tab on the next sync):
+   - 5: `engagement_per_day` at least 2x its value a week earlier on a single ad.
+   - 6: a concept with every ad still active after 14+ days while the page's number of
+     active concepts fell versus a week earlier.
+   - 7: an ad with lineage to an ad running 20+ days, on the day it is first seen.
+6. **Signals tab Meta columns:** `ads_pointing_here` (active ads resolved to that handle),
+   `engagement_per_day` (average, empty without engagement data), `days_running_max`,
+   `concept_status` (e.g. `2/3 concepts alive, intact 27d`).
+
+`ads-report` prints per-page status, products ranked by active ads pointing at them (with
+how they were resolved), concepts, lineage and today's alerts; `--raw` adds the per-ad rows.
+
 **Tables:** `meta_ads` (one row per ad ever seen, first/last seen dates, texts, links,
-fingerprint), `meta_ads_daily` (one row per ad per day; an ad that stops appearing in the
-active search gets an `is_active = 0` row that day, which is how disappearance is
-tracked), `meta_page_runs` (status per page per run: ok / blocked / error).
+copy fingerprint, product/page handle, concept id, lineage), `meta_ads_daily` (one row per
+ad per day; an ad that stops appearing in the active search gets an `is_active = 0` row
+that day, which is how disappearance is tracked), `meta_concepts_daily`, `landing_pages`,
+`meta_page_runs` (status per page per run: ok / blocked / error).
 
 **Daily run:** the Shopify pass never depends on Meta. Set `META_ADS=1` in `.env` (or pass
 `--ads`) and `python tracker.py run` scrapes after the Shopify pass, before the Sheets
@@ -178,8 +209,8 @@ If Meta serves a login wall the pass stops for the day rather than hammering it.
 - The GraphQL payload shape is based on the library's current responses and was verified
   offline against a local stand-in (`tests/fake_ad_library.py`), not against Meta from the
   build environment. The first real run is the real test.
-- Landing URL to product join, concepts, lineage, alerts and the Signals Meta columns are
-  increment 2.
+- The concept, lineage and alert rules need a few days of snapshots before they say much:
+  rule 6 compares against a week earlier, rule 7 needs an ad older than 20 days on record.
 - If Playwright cannot download its browser, point `META_CHROMIUM_PATH` in `.env` at an
   installed Chromium/Chrome binary.
 
@@ -323,6 +354,7 @@ sheets/Code.gs          Apps Script web app to paste into the Sheet's script edi
 earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + pure normaliser + Meta page discovery
 earlyscale/deltas.py    pure delta calculations (7d counts, sold-out/price/handle deltas) + DB loaders
 earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture), parser, SQLite recording
+earlyscale/ad_metrics.py landing-URL join, concepts, lineage, daily ad metrics, alert rules 5-7, Signals join
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O
 earlyscale/config.py    paths, .env loader, tunables

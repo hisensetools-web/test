@@ -60,8 +60,9 @@ META_ADS_ENABLED = os.environ.get("META_ADS", "").strip() in ("1", "true", "yes"
 META_WAIT_MIN = float(os.environ.get("META_WAIT_MIN", "3"))
 META_WAIT_MAX = float(os.environ.get("META_WAIT_MAX", "8"))
 META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "40"))
-META_MAX_ADS = int(os.environ.get("META_MAX_ADS", "600"))
+META_MAX_ADS = int(os.environ.get("META_MAX_ADS", "3000"))
 META_NAV_TIMEOUT_MS = int(os.environ.get("META_NAV_TIMEOUT_MS", "45000"))
 META_CHROMIUM_PATH = os.environ.get("META_CHROMIUM_PATH", "").strip()  # optional explicit browser binary
 # Override only for offline testing against tests/fake_ad_library.py
 META_AD_LIBRARY_BASE = os.environ.get("META_AD_LIBRARY_BASE", "https://www.facebook.com/ads/library/")
+LANDING_REFRESH_DAYS = int(os.environ.get("LANDING_REFRESH_DAYS", "7"))  # re-fetch advertorial pages this often

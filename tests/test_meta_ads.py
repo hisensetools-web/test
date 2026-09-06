@@ -49,13 +49,14 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(car["landing_url"], "https://ceylonhealth.com/products/ceylon-cinnamon-capsules")
         self.assertEqual(car["asset_url"], "https://scontent.xx.fbcdn.net/v/card1.jpg?oh=1")
 
-    def test_fingerprint_ignores_asset_query_string_and_case(self):
+    def test_fingerprint_is_copy_based_not_asset_based(self):
         n = meta_ads.extract_ads(json.loads((FIX / "ad_library_graphql.json").read_text()))[0]
         a = meta_ads.normalise_ad(n)
         n2 = json.loads(json.dumps(n))
-        n2["snapshot"]["videos"][0]["video_preview_image_url"] = "https://scontent.xx.fbcdn.net/v/prev1.jpg?oh=DIFFERENT"
+        n2["ad_archive_id"] = "other"
+        n2["snapshot"]["videos"][0]["video_preview_image_url"] = "https://scontent.xx.fbcdn.net/v/OTHER_ASSET.jpg"
         n2["snapshot"]["body"]["text"] = n["snapshot"]["body"]["text"].upper()
-        self.assertEqual(meta_ads.normalise_ad(n2)["fingerprint"], a["fingerprint"])
+        self.assertEqual(meta_ads.normalise_ad(n2)["fingerprint"], a["fingerprint"])   # same copy -> same fp
         n2["snapshot"]["body"]["text"] = "completely different copy"
         self.assertNotEqual(meta_ads.normalise_ad(n2)["fingerprint"], a["fingerprint"])
 

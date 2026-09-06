@@ -11,7 +11,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import config, db, deltas, meta_ads, sheets, shopify
+from . import ad_metrics, config, db, deltas, meta_ads, sheets, shopify
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist
 
 console = Console()
@@ -171,6 +171,7 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
     if only:
         stores = [s for s in stores if s["store_domain"] in only]
     ok = failed = 0
+    session = shopify.make_session()   # for landing-page fetches
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=headless, **meta_ads.launch_kwargs())
         try:
@@ -191,6 +192,7 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                              domain, counts["total"], counts["new"], counts["disappeared"], res.scrolls,
                              res.responses, time.monotonic() - t0, res.note)
                     ok += 1
+                    _post_process_store(conn, store_id, domain, snapshot_date, session)
                 except meta_ads.MetaBlocked as e:
                     meta_ads.record_page_run(conn, store_id, snapshot_date, query, "blocked", str(e), 0, 0,
                                              time.monotonic() - t0)
@@ -209,6 +211,20 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
     return ok, failed
 
 
+def _post_process_store(conn, store_id: int, domain: str, snapshot_date: str, session, fetch_landings: bool = True) -> dict:
+    """Landing join, concepts, lineage, per-day metrics and alerts for one store. Never raises."""
+    try:
+        m = ad_metrics.process_store(conn, store_id, domain, snapshot_date, session, fetch_landings)
+        alerts = ad_metrics.run_alerts(conn, store_id, domain, snapshot_date)
+        log.info("%-28s metrics: resolved=%s/%s concepts=%s lineage=%s pages_fetched=%s alerts=%d",
+                 domain, m.get("resolved", 0), m.get("ads", 0), m.get("concepts", 0), m.get("lineage", 0),
+                 m.get("pages_fetched", 0), len(alerts))
+        return m
+    except Exception as e:  # noqa: BLE001
+        log.error("%-28s metrics FAILED: %s", domain, e)
+        return {}
+
+
 def cmd_ads(args) -> int:
     snapshot_date = _parse_date(args.date)
     stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
@@ -222,8 +238,34 @@ def cmd_ads(args) -> int:
                   f"headless={not args.headed}")
     t0 = time.monotonic()
     ok, failed = run_ads_pass(conn, stores, snapshot_date, only, headless=not args.headed, max_scrolls=args.max_scrolls)
-    console.print(f"done in {time.monotonic() - t0:.0f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
+    md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
+    console.print(f"done in {time.monotonic() - t0:.0f}s: [green]{ok} ok[/], [red]{failed} failed[/]"
+                  + (f"; alerts written to {md}" if md else ""))
     return 1 if ok == 0 and failed else 0
+
+
+def cmd_ads_metrics(args) -> int:
+    """Recompute the landing join / concepts / lineage / alerts from stored ads (no scraping)."""
+    snapshot_date = _parse_date(args.date) if args.date else None
+    conn = db.connect(args.db)
+    if snapshot_date is None:
+        snapshot_date = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily").fetchone()[0]
+    if not snapshot_date:
+        console.print("[red]no ad snapshots yet[/]")
+        return 2
+    session = shopify.make_session()
+    stores = conn.execute(
+        """SELECT DISTINCT s.id, s.store_domain FROM meta_ads_daily d JOIN stores s ON s.id = d.store_id
+           WHERE d.snapshot_date = ? ORDER BY s.store_domain""", (snapshot_date,)).fetchall()
+    if args.only:
+        stores = [s for s in stores if s["store_domain"] in set(args.only)]
+    console.print(f"ads-metrics: snapshot_date={snapshot_date} stores={len(stores)} fetch_landings={not args.no_fetch}")
+    for s in stores:
+        _post_process_store(conn, s["id"], s["store_domain"], snapshot_date, session, fetch_landings=not args.no_fetch)
+    md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
+    if md:
+        console.print(f"alerts written to {md}")
+    return 0
 
 
 def cmd_ads_report(args) -> int:
@@ -251,6 +293,70 @@ def cmd_ads_report(args) -> int:
         t.add_row(r["store_domain"], r["query"] or "", f"[{colour}]{r['status']}[/]", str(r["ads_found"]),
                   str(r["active"]), str(r["new_today"]), str(r["gone"]), str(r["scrolls"]), (r["detail"] or "")[:50])
     console.print(t)
+
+    t = Table(title=f"products by active ads pointing at them (as of {as_of})")
+    for c in ("store", "product handle", "active ads", "pages", "oldest ad (days)", "newest ad (days)", "concepts", "landing kinds"):
+        t.add_column(c)
+    for r in conn.execute(f"""
+        SELECT s.store_domain, a.product_handle, COUNT(*) n, COUNT(DISTINCT a.page_name) pages,
+               MAX(d.days_running) oldest, MIN(d.days_running) newest, COUNT(DISTINCT a.concept_id) concepts,
+               SUM(a.landing_resolved_via = 'url') direct, SUM(a.landing_resolved_via = 'page-fetch') via_page
+        FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id JOIN stores s ON s.id = d.store_id
+        WHERE d.snapshot_date = ? AND d.is_active = 1 AND a.product_handle IS NOT NULL {where}
+        GROUP BY s.store_domain, a.product_handle ORDER BY n DESC LIMIT ?""", [as_of] + params + [args.limit]):
+        t.add_row(r["store_domain"], r["product_handle"], str(r["n"]), str(r["pages"]), str(r["oldest"] or ""),
+                  str(r["newest"] or ""), str(r["concepts"]), f"direct {r['direct'] or 0}, via page {r['via_page'] or 0}")
+    console.print(t)
+    unresolved = conn.execute(f"""
+        SELECT a.landing_domain, a.page_handle, COUNT(*) n FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
+        JOIN stores s ON s.id = d.store_id WHERE d.snapshot_date = ? AND d.is_active = 1 AND a.product_handle IS NULL {where}
+        GROUP BY a.landing_domain, a.page_handle ORDER BY n DESC LIMIT 10""", [as_of] + params).fetchall()
+    if unresolved:
+        console.print("[dim]active ads with no product match: " + "; ".join(
+            f"{r['landing_domain'] or 'no url'}{('/pages/' + r['page_handle']) if r['page_handle'] else ''} x{r['n']}"
+            for r in unresolved) + "[/]")
+
+    t = Table(title=f"concepts (page + landing + launch window), by days running")
+    for c in ("store", "page", "launched", "days", "ads", "active", "survival", "product / page handle", "landing"):
+        t.add_column(c, overflow="fold")
+    for r in conn.execute(f"""
+        SELECT s.store_domain, c.page_name, c.launch_date, c.days_running, c.ads_ever, c.ads_active, c.survival,
+               c.product_handle, c.page_handle, c.landing_url
+        FROM meta_concepts_daily c JOIN stores s ON s.id = c.store_id WHERE c.snapshot_date = ? {where}
+        ORDER BY c.ads_ever DESC, c.days_running DESC LIMIT ?""", [as_of] + params + [args.limit]):
+        surv = "" if r["survival"] is None else f"{r['survival']:.0%}"
+        t.add_row(r["store_domain"], r["page_name"] or "", r["launch_date"] or "", str(r["days_running"] or ""),
+                  str(r["ads_ever"]), str(r["ads_active"]), surv,
+                  r["product_handle"] or (f"/pages/{r['page_handle']}" if r["page_handle"] else ""),
+                  (r["landing_url"] or "")[:60])
+    console.print(t)
+
+    lin = conn.execute(f"""
+        SELECT s.store_domain, a.ad_id, a.page_name, a.lineage_of, a.lineage_similarity, a.first_seen_date,
+               o.ad_start_date AS parent_start, a.product_handle
+        FROM meta_ads a JOIN meta_ads o ON o.ad_id = a.lineage_of JOIN stores s ON s.id = a.store_id
+        WHERE a.lineage_of IS NOT NULL {where} ORDER BY a.first_seen_date DESC LIMIT ?""", params + [args.limit]).fetchall()
+    if lin:
+        t = Table(title="lineage: new ads that re-use older copy (>70% similar, parent 14+ days)")
+        for c in ("store", "new ad", "page", "first seen", "parent ad", "parent start", "similarity", "product"):
+            t.add_column(c)
+        for r in lin:
+            t.add_row(r["store_domain"], r["ad_id"], r["page_name"] or "", r["first_seen_date"], r["lineage_of"],
+                      r["parent_start"] or "", f"{r['lineage_similarity']:.0%}", r["product_handle"] or "")
+        console.print(t)
+
+    al = conn.execute(f"""SELECT a.rule, a.product_handle, a.detail, s.store_domain FROM alerts a JOIN stores s ON s.id = a.store_id
+                          WHERE a.snapshot_date = ? AND a.rule >= 5 {where} ORDER BY a.rule""", [as_of] + params).fetchall()
+    if al:
+        t = Table(title=f"alerts {as_of}")
+        for c in ("rule", "store", "product", "detail"):
+            t.add_column(c, overflow="fold")
+        for r in al:
+            t.add_row(f"{r['rule']} {ad_metrics.RULES.get(r['rule'], '')}", r["store_domain"], r["product_handle"] or "", r["detail"])
+        console.print(t)
+    if not args.raw:
+        console.print("[dim]add --raw for the per-ad rows[/]")
+        return 0
 
     t = Table(title=f"raw ads (as of {as_of}, newest start first, limit {args.limit})")
     for c in ("store", "ad id", "page", "start", "days", "act", "type", "headline", "primary text", "landing", "fp", "eu"):
@@ -420,11 +526,18 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-scrolls", type=int, help=f"scroll cap per page (default {config.META_MAX_SCROLLS})")
     s.set_defaults(fn=cmd_ads)
 
-    s = sub.add_parser("ads-report", help="raw ad rows and per-page scrape status")
+    s = sub.add_parser("ads-report", help="per-page status, products by ads, concepts, lineage, alerts (--raw for ad rows)")
     s.add_argument("--date", help="snapshot date (default: latest)")
     s.add_argument("--store", help="one store domain")
     s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--raw", action="store_true", help="also print the per-ad rows")
     s.set_defaults(fn=cmd_ads_report)
+
+    s = sub.add_parser("ads-metrics", help="recompute landing join / concepts / lineage / alerts from stored ads")
+    s.add_argument("--date", help="snapshot date (default: latest)")
+    s.add_argument("--only", nargs="+", metavar="DOMAIN")
+    s.add_argument("--no-fetch", action="store_true", help="do not fetch advertorial landing pages")
+    s.set_defaults(fn=cmd_ads_metrics)
 
     s = sub.add_parser("sync-sheets", help="push latest snapshot + deltas to Google Sheets via Apps Script")
     s.add_argument("--date", help="sync the snapshot as of this date (default: latest)")

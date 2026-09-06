@@ -123,6 +123,34 @@ CREATE TABLE IF NOT EXISTS meta_ads_daily (
     PRIMARY KEY (snapshot_date, ad_id)
 );
 
+-- One row per concept per day (concept = page + landing URL + launch dates within 1 day).
+CREATE TABLE IF NOT EXISTS meta_concepts_daily (
+    snapshot_date   TEXT NOT NULL,
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    concept_id      TEXT NOT NULL,
+    page_name       TEXT,
+    landing_url     TEXT,
+    product_handle  TEXT,
+    page_handle     TEXT,
+    launch_date     TEXT,
+    days_running    INTEGER,
+    ads_ever        INTEGER,
+    ads_active      INTEGER,
+    survival        REAL,               -- ads_active / ads_ever
+    PRIMARY KEY (snapshot_date, concept_id)
+);
+
+-- Fetched ad landing pages (advertorials, redirectors) and what product they point at.
+CREATE TABLE IF NOT EXISTS landing_pages (
+    url             TEXT PRIMARY KEY,   -- sans query string
+    fetched_at      TEXT NOT NULL,
+    status          INTEGER,
+    final_url       TEXT,
+    product_handle  TEXT,
+    page_handle     TEXT,
+    candidates      TEXT                -- handle:count,... found on the page
+);
+
 CREATE TABLE IF NOT EXISTS meta_page_runs (
     id              INTEGER PRIMARY KEY,
     store_id        INTEGER NOT NULL REFERENCES stores(id),
@@ -172,7 +200,19 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ads_daily'").fetchone():
         if conn.execute("SELECT COUNT(*) FROM ads_daily").fetchone()[0] == 0:
             conn.execute("DROP TABLE ads_daily")
-            conn.commit()
+    # Part B increment 2 columns (ALTER is idempotent via the column check).
+    wanted = {
+        "meta_ads": [("concept_id", "TEXT"), ("lineage_of", "TEXT"), ("lineage_similarity", "REAL"),
+                     ("landing_resolved_via", "TEXT")],
+        "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
+                           ("engagement_per_day", "REAL")],
+    }
+    for table, cols in wanted.items():
+        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for name, typ in cols:
+            if name not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+    conn.commit()
 
 
 # ---------------------------------------------------------------- stores
