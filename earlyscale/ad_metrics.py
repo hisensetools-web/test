@@ -138,49 +138,75 @@ def resolve_landing(conn: sqlite3.Connection, store_id: int, store_domain: str, 
         if m:
             return {"product_handle": m, "page_handle": None, "resolved_via": "url"}
         out["resolved_via"] = "url-unmatched"
-        out["product_handle"] = None
     if pg:
         out["page_handle"] = pg
-    key = _strip(url)
-    hit = cache.get(key)
-    if hit is None:
-        row = conn.execute("SELECT * FROM landing_pages WHERE url = ?", (key,)).fetchone()
-        if row and row["fetched_at"] >= (date.fromisoformat(today) - timedelta(days=config.LANDING_REFRESH_DAYS)).isoformat():
-            hit = dict(row)
-        elif session is not None:
-            hit = {"url": key, "fetched_at": today, "status": None, "final_url": None, "product_handle": None,
-                   "page_handle": pg, "candidates": ""}
-            try:
-                final, html, status = fetch_landing(session, url)
-                hit["status"], hit["final_url"] = status, final
-                fph, fpg = handle_from_url(final)
-                cands = handles_from_html(html, v2h) if html else []
-                if fph and same_store(urlparse(final).netloc, store_domain):
-                    cands.insert(0, (fph, 99))
-                hit["candidates"] = ",".join(f"{h}:{n}" for h, n in cands[:8])
-                for h, _ in cands:
-                    m = match_handle(h, known)
-                    if m:
-                        hit["product_handle"] = m
-                        break
-                hit["page_handle"] = fpg or pg
-            except requests.RequestException as e:
-                hit["status"] = -1
-                hit["candidates"] = f"error:{str(e)[:80]}"
-            conn.execute(
-                """INSERT OR REPLACE INTO landing_pages (url, fetched_at, status, final_url, product_handle, page_handle, candidates)
-                   VALUES (?,?,?,?,?,?,?)""",
-                (hit["url"], hit["fetched_at"], hit["status"], hit["final_url"], hit["product_handle"],
-                 hit["page_handle"], hit["candidates"]))
-        else:
-            hit = {"product_handle": None, "page_handle": pg}
-        cache[key] = hit
+    hit = _resolve_url(conn, url, store_domain, known, v2h, session, cache, today, depth=0)
     if hit.get("product_handle"):
         out["product_handle"] = hit["product_handle"]
         out["resolved_via"] = "page-fetch"
     if hit.get("page_handle") and not out["page_handle"]:
         out["page_handle"] = hit["page_handle"]
     return out
+
+
+def _fresh(row, today: str) -> bool:
+    return row is not None and row["fetched_at"] >= (
+        date.fromisoformat(today) - timedelta(days=config.LANDING_REFRESH_DAYS)).isoformat()
+
+
+def _resolve_url(conn: sqlite3.Connection, url: str, store_domain: str, known: set[str], v2h: dict[int, str],
+                 session: requests.Session | None, cache: dict[str, dict], today: str, depth: int) -> dict:
+    """Fetch (or reuse) one landing page and work out which listed product it sells.
+
+    Candidates are the handles found on the page. A candidate that is itself an unlisted
+    product page (e.g. an offer variant not in products.json) is followed one hop: its own
+    page usually names the listed product. Results persist in landing_pages."""
+    key = _strip(url)
+    if key in cache:
+        return cache[key]
+    row = conn.execute("SELECT * FROM landing_pages WHERE url = ?", (key,)).fetchone()
+    if _fresh(row, today):
+        cache[key] = dict(row)
+        return cache[key]
+    if session is None:
+        cache[key] = dict(row) if row else {"product_handle": None, "page_handle": handle_from_url(url)[1]}
+        return cache[key]
+    hit = {"url": key, "fetched_at": today, "status": None, "final_url": None, "product_handle": None,
+           "page_handle": handle_from_url(url)[1], "candidates": ""}
+    cache[key] = hit
+    try:
+        final, html, status = fetch_landing(session, url)
+        hit["status"], hit["final_url"] = status, final
+        fph, fpg = handle_from_url(final)
+        cands = handles_from_html(html, v2h) if html else []
+        if fph and same_store(urlparse(final).netloc, store_domain):
+            cands.insert(0, (fph, 99))
+        hit["candidates"] = ",".join(f"{h}:{n}" for h, n in cands[:8])
+        for h, _ in cands:
+            m = match_handle(h, known)
+            if m:
+                hit["product_handle"] = m
+                break
+        if hit["product_handle"] is None and depth < 1:
+            # follow unlisted product pages one hop (skip the page we are already on)
+            origin = f"{urlparse(final or url).scheme}://{urlparse(final or url).netloc}"
+            for h, _ in [c for c in cands if c[0] != fph][:2]:
+                sub = _resolve_url(conn, f"{origin}/products/{h}", store_domain, known, v2h, session, cache, today,
+                                   depth + 1)
+                if sub.get("product_handle"):
+                    hit["product_handle"] = sub["product_handle"]
+                    hit["candidates"] += f",via:{h}"
+                    break
+        hit["page_handle"] = fpg or hit["page_handle"]
+    except requests.RequestException as e:
+        hit["status"] = -1
+        hit["candidates"] = f"error:{str(e)[:80]}"
+    conn.execute(
+        """INSERT OR REPLACE INTO landing_pages (url, fetched_at, status, final_url, product_handle, page_handle, candidates)
+           VALUES (?,?,?,?,?,?,?)""",
+        (hit["url"], hit["fetched_at"], hit["status"], hit["final_url"], hit["product_handle"],
+         hit["page_handle"], hit["candidates"][:500]))
+    return hit
 
 
 def _strip(url: str) -> str:
@@ -477,6 +503,8 @@ def run_alerts(conn: sqlite3.Connection, store_id: int, store_domain: str, today
                                 f"{g['age']}d (avg {sum(g['sims']) / n:.0%} similar; e.g. {', '.join(g['ids'][:3])})"})
 
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    conn.execute("DELETE FROM alerts WHERE snapshot_date = ? AND store_id = ? AND rule >= 5 AND dedupe_key IS NULL",
+                 (today, store_id))
     written = []
     for f in found:
         key = f.get("key") or f"{f['rule']}|{f['detail']}"

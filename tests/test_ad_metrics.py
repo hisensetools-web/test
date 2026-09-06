@@ -289,3 +289,47 @@ class PageRelevanceTests(unittest.TestCase):
         alerts = ad_metrics.run_alerts(conn, sid, "supp.com", "2026-09-06")
         self.assertEqual(len(alerts), 1)
         self.assertTrue(alerts[0]["detail"].startswith("12 new ads on Brand re-use copy from ad parent running 48d"))
+
+
+class TransitiveLandingTests(unittest.TestCase):
+    def test_advertorial_linking_to_unlisted_offer_page_resolves_one_hop(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "supp.com")
+        db.write_product_snapshot(conn, sid, "2026-09-06", [_prod(1, "turmeric-1000mg", "Turmeric")])
+        session = mock.Mock(spec=requests.Session)
+        fetched = []
+
+        def get(url, **kw):
+            fetched.append(url)
+            r = requests.Response(); r.encoding = "utf-8"; r.url = url; r.status_code = 200
+            if "/pages/li10" in url:      # advertorial links only to the unlisted offer page
+                r._content = b'<a href="/products/turmeric-1-000mg-o2">Buy</a>'
+            elif "/products/turmeric-1-000mg-o2" in url:   # unlisted page names the listed product
+                r._content = b'<script>{"handle":"turmeric-1000mg"}</script>'
+            else:
+                r.status_code = 404; r._content = b""
+            return r
+        session.get.side_effect = get
+        ads = [_ad("1", "Persona", "2026-09-01", "https://supp.com/pages/li10", "story one about turmeric"),
+               _ad("2", "Persona", "2026-09-02", "https://supp.com/pages/li10?utm=x", "story two about turmeric")]
+        meta_ads.record_scrape(conn, sid, "2026-09-06", ads, "q")
+        m = ad_metrics.process_store(conn, sid, "supp.com", "2026-09-06", session)
+        self.assertEqual(m["resolved"], 2)
+        rows = {r["ad_id"]: dict(r) for r in conn.execute("SELECT * FROM meta_ads")}
+        self.assertEqual(rows["1"]["product_handle"], "turmeric-1000mg")
+        self.assertEqual(rows["1"]["page_handle"], "li10")
+        self.assertEqual(fetched, ["https://supp.com/pages/li10", "https://supp.com/products/turmeric-1-000mg-o2"])  # cached
+        lp = {r["url"]: dict(r) for r in conn.execute("SELECT * FROM landing_pages")}
+        self.assertIn("via:turmeric-1-000mg-o2", lp["https://supp.com/pages/li10"]["candidates"])
+        self.assertEqual(lp["https://supp.com/products/turmeric-1-000mg-o2"]["product_handle"], "turmeric-1000mg")
+
+    def test_legacy_per_ad_alert_rows_are_replaced(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "supp.com")
+        conn.execute("INSERT INTO alerts (snapshot_date, store_id, product_handle, rule, detail, created_at) VALUES "
+                     "('2026-09-06', ?, 'x', 7, 'old per-ad row', 'now')", (sid,))
+        conn.execute("INSERT INTO alerts (snapshot_date, store_id, product_handle, rule, detail, created_at) VALUES "
+                     "('2026-09-06', ?, 'x', 1, 'shopify rule, untouched', 'now')", (sid,))
+        ad_metrics.run_alerts(conn, sid, "supp.com", "2026-09-06")
+        left = [r[0] for r in conn.execute("SELECT detail FROM alerts")]
+        self.assertEqual(left, ["shopify rule, untouched"])
