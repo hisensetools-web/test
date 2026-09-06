@@ -190,6 +190,7 @@ EU reach. Send that table back before enabling more stores.
    - 5: `engagement_per_day` at least 2x its value a week earlier on a single ad.
    - 6: a concept with every ad still active after 14+ days while the page's number of
      active concepts fell versus a week earlier.
+   - 8: EU reach slope doubled week over week on one ad (see below).
    - 7: new ads with lineage to an ad running 20+ days, one alert per (page, parent ad)
      with the count, on the day they are first seen. A store launching 40 copies of one
      proven ad yields one line.
@@ -203,6 +204,29 @@ in products.json show "no" and which product they were resolved to), the landing
 that were fetched and what handles were found on them (unresolved first, so you can see
 why an advertorial did not map), concepts, lineage grouped by parent ad, and today's
 alerts; `--raw` adds the per-ad rows.
+
+**Reach curve and boosted-post comments (Part B, increment 3)**
+
+- Every ad's exact EU/EEA reach (`eu_total_reach`), exact UK reach when the country
+  breakdown carries a GB row, and any reach *range* (lower/upper bound) are stored per ad per
+  day. `reach_delta_1d` is the day-over-day change; `reach_slope_7d` is reach per day over the
+  last 7 days and `reach_slope_prev_7d` the 7 days before. Reach is cumulative in the
+  library, so the slope is the closest public proxy for daily budget, for any advertiser that
+  also delivers to the EU.
+- Rule 8: an ad's 7-day reach slope is at least 2x its prior-7-day slope (total reach at
+  least `META_REACH_MIN`, default 1000). Needs 14 days of snapshots.
+- Ads whose payload exposes an underlying Page or Instagram post get `engagement_type =
+  boosted` and `post_url`; the post is opened once a day in the browser (up to
+  `META_MAX_POSTS` per store) to read comment / reaction / share counts, from which
+  `comment_delta_1d` follows. Everything else is `dark`: blank is expected, not an error.
+  `post_status` records ok / login-wall / no-counts per day.
+- `python tracker.py ads-coverage` shows per store how measurable the ads are: % with exact
+  EU reach, % UK exact, % range only, % boosted, % of boosted posts whose counts were read,
+  % dark, plus which reach-related keys the raw payloads carried (so the parser can be
+  adjusted if Meta renames them). `ads-metrics --posts` re-derives everything from the stored
+  payloads and fetches posts without re-scraping.
+- Signals tab gains `eu_reach_slope_7d` and `comment_delta_1d` (summed over the active ads
+  pointing at each product).
 
 **Tables:** `meta_ads` (one row per ad ever seen, first/last seen dates, texts, links,
 copy fingerprint, product/page handle, concept id, lineage), `meta_ads_daily` (one row per

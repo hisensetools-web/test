@@ -217,11 +217,17 @@ def _migrate(conn: sqlite3.Connection) -> None:
     # Part B increment 2 columns (ALTER is idempotent via the column check).
     wanted = {
         "meta_ads": [("concept_id", "TEXT"), ("lineage_of", "TEXT"), ("lineage_similarity", "REAL"),
-                     ("landing_resolved_via", "TEXT"), ("landing_handle", "TEXT"), ("page_ignored", "INTEGER")],
+                     ("landing_resolved_via", "TEXT"), ("landing_handle", "TEXT"), ("page_ignored", "INTEGER"),
+                     ("post_url", "TEXT"), ("engagement_type", "TEXT"), ("reach_keys", "TEXT")],
         "alerts": [("dedupe_key", "TEXT")],
         "products_daily": [("unlisted", "INTEGER DEFAULT 0")],   # 1 = live product page not in products.json (found via ads)
         "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
-                           ("engagement_per_day", "REAL")],
+                           ("engagement_per_day", "REAL"),
+                           # reach curve (EU exact, UK exact or range) and the comment curve
+                           ("uk_reach", "INTEGER"), ("reach_range_lower", "INTEGER"), ("reach_range_upper", "INTEGER"),
+                           ("reach_source", "TEXT"), ("reach_delta_1d", "INTEGER"), ("reach_slope_7d", "REAL"),
+                           ("reach_slope_prev_7d", "REAL"), ("comment_delta_1d", "INTEGER"), ("post_status", "TEXT")],
+
     }
     for table, cols in wanted.items():
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}

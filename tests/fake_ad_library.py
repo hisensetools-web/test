@@ -44,7 +44,7 @@ load();
 BLOCKED = "<html><head><title>Log in to Facebook</title></head><body><h1>You must log in to continue.</h1></body></html>"
 
 
-def make_handler(batches: int, block: bool, landing: str | None = None, handles: list[str] | None = None):
+def make_handler(batches: int, block: bool, landing: str | None = None, handles: list[str] | None = None, port: int = 8095):
     base = json.loads(FIX.read_text())
     if landing:
         # point every ad at the given store origin: products/<handle> for the first two ads, /pages/av1 for the third
@@ -54,6 +54,8 @@ def make_handler(batches: int, block: bool, landing: str | None = None, handles:
         res[1]["snapshot"]["link_url"] = f"{landing}/pages/av1"
         res[2]["snapshot"]["link_url"] = None
         res[2]["snapshot"]["cards"][0]["link_url"] = f"{landing}/products/{hs[-1]}"
+        # boosted post lives on this same fake host so the browser can open it
+        res[1]["snapshot"]["root_reshared_post"]["url"] = f"http://127.0.0.1:{port}/55501/posts/987654321012345"
 
     class H(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -68,6 +70,10 @@ def make_handler(batches: int, block: bool, landing: str | None = None, handles:
 
         def do_GET(self):
             u = urlparse(self.path)
+            if "/posts/" in u.path:   # a "public post" page with embedded counts
+                body = ('<html><head><title>Post</title></head><body><script>{"comment_count":{"total_count":57},'
+                        '"reaction_count":{"count":1203},"share_count":{"count":9}}</script></body></html>')
+                return self._send(200, body.encode(), "text/html")
             if u.path.startswith("/ads/library"):
                 if block:
                     return self._send(200, BLOCKED.encode(), "text/html")
@@ -106,7 +112,7 @@ def main(argv=None):
     ap.add_argument("--landing", help="store origin to point landing URLs at, e.g. http://127.0.0.1:8011")
     ap.add_argument("--handles", nargs="+", help="product handles to use in landing URLs")
     a = ap.parse_args(argv)
-    srv = HTTPServer(("127.0.0.1", a.port), make_handler(a.batches, a.block, a.landing, a.handles))
+    srv = HTTPServer(("127.0.0.1", a.port), make_handler(a.batches, a.block, a.landing, a.handles, a.port))
     print(f"fake Ad Library on http://127.0.0.1:{a.port}/ads/library/ batches={a.batches} block={a.block}")
     srv.serve_forever()
 

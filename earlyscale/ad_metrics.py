@@ -32,6 +32,7 @@ RULES = {
     5: "engagement_per_day up 2x week over week on one ad",
     6: "concept fully alive 14+ days while the page's active concepts fell",
     7: "new ad with lineage to an ad running 20+ days",
+    8: "EU reach 7-day slope doubled vs the prior 7 days on one ad",
 }
 PRODUCT_RE = re.compile(r"/products/([a-z0-9][a-z0-9\-_.%]*)", re.I)
 PAGE_RE = re.compile(r"/pages/([a-z0-9][a-z0-9\-_.%]*)", re.I)
@@ -474,6 +475,11 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
                WHERE snapshot_date = ? AND ad_id = ?""",
             (_days(a["ad_start_date"] or a["first_seen_date"], today), eng, delta, per_day, today, a["ad_id"]))
 
+    # reach curve + comment curve (for every ad, ignored pages included: they are per-ad facts)
+    backfill_from_raw(conn, all_ads, today)
+    for a in all_ads:
+        compute_reach_metrics(conn, a["ad_id"], today)
+
     # per-concept daily rows
     by_c: dict[str, list[dict]] = defaultdict(list)
     for a in ads:
@@ -515,6 +521,78 @@ def page_relevance(ads: list[dict], store_domain: str) -> dict[str, dict]:
     return out
 
 
+def backfill_from_raw(conn: sqlite3.Connection, ads: list[dict], today: str) -> int:
+    """Ads scraped before the reach/post fields existed still carry their full GraphQL node in
+    raw_json; re-derive today's reach columns and the post link from it when missing."""
+    import json as _json
+    from . import meta_ads as _m
+    n = 0
+    for a in ads:
+        row = conn.execute("SELECT eu_total_reach, uk_reach, reach_range_lower, reach_source FROM meta_ads_daily "
+                           "WHERE snapshot_date = ? AND ad_id = ?", (today, a["ad_id"])).fetchone()
+        raw = a.get("raw_json")
+        if row is None or not raw or (row["reach_source"] is not None and a.get("engagement_type")):
+            continue
+        try:
+            node = _json.loads(raw)
+        except ValueError:
+            continue
+        reach = _m.extract_reach(node)
+        post = extract_post_or_existing(a, node)
+        conn.execute(
+            """UPDATE meta_ads_daily SET eu_total_reach = COALESCE(eu_total_reach, ?), uk_reach = COALESCE(uk_reach, ?),
+                 reach_range_lower = COALESCE(reach_range_lower, ?), reach_range_upper = COALESCE(reach_range_upper, ?),
+                 reach_source = COALESCE(reach_source, ?) WHERE snapshot_date = ? AND ad_id = ?""",
+            (reach["eu_reach"], reach["uk_reach"], reach["range_lower"], reach["range_upper"], reach["source"] or "none",
+             today, a["ad_id"]))
+        conn.execute("""UPDATE meta_ads SET post_url = COALESCE(post_url, ?), reach_keys = COALESCE(reach_keys, ?),
+                          engagement_type = CASE WHEN COALESCE(post_url, ?) IS NULL THEN 'dark' ELSE 'boosted' END
+                        WHERE ad_id = ?""", (post, reach["keys"], post, a["ad_id"]))
+        n += 1
+    return n
+
+
+def extract_post_or_existing(a: dict, node: dict) -> str | None:
+    from . import meta_ads as _m
+    return a.get("post_url") or _m.extract_post_url(node)
+
+
+def slope(points: list[tuple[str, int]]) -> float | None:
+    """Reach per day between the first and last point (dates ISO, reach cumulative). None if < 2 points."""
+    pts = sorted((d, v) for d, v in points if v is not None)
+    if len(pts) < 2:
+        return None
+    days = _days(pts[0][0], pts[-1][0]) or 0
+    if days <= 0:
+        return None
+    return round((pts[-1][1] - pts[0][1]) / days, 1)
+
+
+def compute_reach_metrics(conn: sqlite3.Connection, ad_id: str, today: str) -> None:
+    """reach_delta_1d, reach_slope_7d / prev_7d (EU exact reach, else UK exact), comment_delta_1d."""
+    rows = conn.execute(
+        """SELECT snapshot_date, eu_total_reach, uk_reach, comments FROM meta_ads_daily
+           WHERE ad_id = ? AND snapshot_date <= ? ORDER BY snapshot_date DESC LIMIT 15""", (ad_id, today)).fetchall()
+    if not rows or rows[0]["snapshot_date"] != today:
+        return
+    def reach_of(r):
+        return r["eu_total_reach"] if r["eu_total_reach"] is not None else r["uk_reach"]
+    series = [(r["snapshot_date"], reach_of(r)) for r in rows]
+    t = date.fromisoformat(today)
+    cur = [(d, v) for d, v in series if (t - date.fromisoformat(d)).days <= 7]
+    prev = [(d, v) for d, v in series if 7 <= (t - date.fromisoformat(d)).days <= 14]
+    delta = None
+    if len(series) >= 2 and series[0][1] is not None and series[1][1] is not None:
+        delta = series[0][1] - series[1][1]
+    cdelta = None
+    if len(rows) >= 2 and rows[0]["comments"] is not None and rows[1]["comments"] is not None:
+        cdelta = rows[0]["comments"] - rows[1]["comments"]
+    conn.execute(
+        """UPDATE meta_ads_daily SET reach_delta_1d = ?, reach_slope_7d = ?, reach_slope_prev_7d = ?, comment_delta_1d = ?
+           WHERE snapshot_date = ? AND ad_id = ?""",
+        (delta, slope(cur), slope(prev), cdelta, today, ad_id))
+
+
 def _engagement(row: dict) -> int | None:
     vals = [row.get(k) for k in ("reactions", "comments", "shares")]
     if all(v is None for v in vals):
@@ -553,6 +631,18 @@ def run_alerts(conn: sqlite3.Connection, store_id: int, store_domain: str, today
         if r["then_"] and r["then_"] > 0 and r["now"] >= 2 * r["then_"]:
             found.append({"rule": 5, "handle": r["product_handle"], "key": f"5|{r['ad_id']}",
                           "detail": f"ad {r['ad_id']} ({r['page_name']}): engagement/day {r['then_']} -> {r['now']}"})
+
+    # rule 8: EU reach slope doubled vs the prior 7 days (spend proxy), reach large enough to matter
+    for r in conn.execute(
+        """SELECT d.ad_id, d.reach_slope_7d, d.reach_slope_prev_7d, d.eu_total_reach, d.uk_reach, a.page_name, a.product_handle
+           FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
+           WHERE d.store_id = ? AND d.snapshot_date = ? AND d.reach_slope_7d IS NOT NULL AND d.reach_slope_prev_7d IS NOT NULL
+             AND COALESCE(a.page_ignored, 0) = 0""", (store_id, today)):
+        reach = r["eu_total_reach"] if r["eu_total_reach"] is not None else (r["uk_reach"] or 0)
+        if r["reach_slope_prev_7d"] > 0 and r["reach_slope_7d"] >= 2 * r["reach_slope_prev_7d"] and reach >= config.META_REACH_MIN:
+            found.append({"rule": 8, "handle": r["product_handle"], "key": f"8|{r['ad_id']}",
+                          "detail": f"ad {r['ad_id']} ({r['page_name']}): reach/day {r['reach_slope_prev_7d']:.0f} -> "
+                                    f"{r['reach_slope_7d']:.0f} (total reach {reach:,})"})
 
     # rule 6: concept with all ads active 14+ days while the page's active concepts fell
     active_concepts_by_page = defaultdict(int)
@@ -646,14 +736,18 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
         return {}
     out: dict[str, dict] = {}
     for r in conn.execute(
-        """SELECT a.product_handle, COUNT(*) AS n, MAX(d.days_running) AS dmax, AVG(d.engagement_per_day) AS epd
+        """SELECT a.product_handle, COUNT(*) AS n, MAX(d.days_running) AS dmax, AVG(d.engagement_per_day) AS epd,
+                  SUM(d.reach_slope_7d) AS slope, SUM(d.reach_slope_7d IS NOT NULL) AS slope_n,
+                  SUM(d.comment_delta_1d) AS cdelta, SUM(d.comment_delta_1d IS NOT NULL) AS cdelta_n
            FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
            WHERE d.store_id = ? AND d.snapshot_date = ? AND d.is_active = 1 AND a.product_handle IS NOT NULL
              AND COALESCE(a.page_ignored, 0) = 0
            GROUP BY a.product_handle""", (store_id, snap)):
         out[r["product_handle"]] = {"ads_pointing_here": r["n"], "days_running_max": r["dmax"],
                                     "engagement_per_day": None if r["epd"] is None else round(r["epd"], 1),
-                                    "concept_status": ""}
+                                    "concept_status": "",
+                                    "eu_reach_slope_7d": None if not r["slope_n"] else round(r["slope"], 1),
+                                    "comment_delta_1d": None if not r["cdelta_n"] else int(r["cdelta"])}
     for r in conn.execute(
         """SELECT product_handle, COUNT(*) AS concepts, SUM(ads_active > 0) AS alive, MAX(days_running) AS oldest,
                   MAX(CASE WHEN ads_active = ads_ever THEN days_running END) AS oldest_intact
@@ -664,3 +758,49 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
             intact = f", intact {r['oldest_intact']}d" if r["oldest_intact"] is not None else ""
             out[h]["concept_status"] = f"{r['alive']}/{r['concepts']} concepts alive{intact}"
     return out
+
+
+# ---------------------------------------------------------------- coverage
+
+def coverage(conn: sqlite3.Connection, as_of: str) -> list[dict]:
+    """Per store (plus a TOTAL row): how measurable the scraped ads are on `as_of`."""
+    rows = []
+    stores = conn.execute(
+        """SELECT DISTINCT s.id, s.store_domain FROM meta_ads_daily d JOIN stores s ON s.id = d.store_id
+           WHERE d.snapshot_date = ? ORDER BY s.store_domain""", (as_of,)).fetchall()
+    total = {"store": "TOTAL", "ads": 0, "eu_exact": 0, "uk_exact": 0, "range_only": 0, "no_reach": 0,
+             "boosted": 0, "with_comments": 0, "dark": 0, "keys": {}}
+    for s in stores:
+        rec = {"store": s["store_domain"], "ads": 0, "eu_exact": 0, "uk_exact": 0, "range_only": 0, "no_reach": 0,
+               "boosted": 0, "with_comments": 0, "dark": 0, "keys": {}}
+        for r in conn.execute(
+            """SELECT d.eu_total_reach, d.uk_reach, d.reach_range_lower, d.comments, a.engagement_type, a.reach_keys, d.post_status
+               FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
+               WHERE d.store_id = ? AND d.snapshot_date = ? AND COALESCE(a.page_ignored, 0) = 0""", (s["id"], as_of)):
+            rec["ads"] += 1
+            if r["eu_total_reach"] is not None:
+                rec["eu_exact"] += 1
+            elif r["uk_reach"] is not None:
+                rec["uk_exact"] += 1
+            elif r["reach_range_lower"] is not None:
+                rec["range_only"] += 1
+            else:
+                rec["no_reach"] += 1
+            if r["engagement_type"] == "boosted":
+                rec["boosted"] += 1
+                if r["comments"] is not None:
+                    rec["with_comments"] += 1
+            else:
+                rec["dark"] += 1
+            for k in (r["reach_keys"] or "").split(","):
+                name = k.split("=")[0].split(":")[0].strip()
+                if name:
+                    rec["keys"][name] = rec["keys"].get(name, 0) + 1
+        rows.append(rec)
+        for k in ("ads", "eu_exact", "uk_exact", "range_only", "no_reach", "boosted", "with_comments", "dark"):
+            total[k] += rec[k]
+        for k, v in rec["keys"].items():
+            total["keys"][k] = total["keys"].get(k, 0) + v
+    if len(rows) > 1:
+        rows.append(total)
+    return rows

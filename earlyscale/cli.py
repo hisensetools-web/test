@@ -193,6 +193,17 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                              res.responses, time.monotonic() - t0, res.note)
                     ok += 1
                     _post_process_store(conn, store_id, domain, snapshot_date, session)
+                    try:
+                        pe = meta_ads.fetch_boosted_engagement(conn, browser, store_id, snapshot_date)
+                        if pe["candidates"]:
+                            log.info("%-28s boosted posts: %d candidates, fetched %d, counts found %d",
+                                     domain, pe["candidates"], pe["fetched"], pe["with_counts"])
+                            for a in conn.execute("SELECT DISTINCT ad_id FROM meta_ads_daily WHERE store_id = ? AND snapshot_date = ?",
+                                                  (store_id, snapshot_date)):
+                                ad_metrics.compute_reach_metrics(conn, a["ad_id"], snapshot_date)
+                            conn.commit()
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("%-28s boosted post fetch failed: %s", domain, e)
                 except meta_ads.MetaBlocked as e:
                     meta_ads.record_page_run(conn, store_id, snapshot_date, query, "blocked", str(e), 0, 0,
                                              time.monotonic() - t0)
@@ -259,9 +270,28 @@ def cmd_ads_metrics(args) -> int:
            WHERE d.snapshot_date = ? ORDER BY s.store_domain""", (snapshot_date,)).fetchall()
     if args.only:
         stores = [s for s in stores if s["store_domain"] in set(args.only)]
-    console.print(f"ads-metrics: snapshot_date={snapshot_date} stores={len(stores)} fetch_landings={not args.no_fetch}")
-    for s in stores:
-        _post_process_store(conn, s["id"], s["store_domain"], snapshot_date, session, fetch_landings=not args.no_fetch)
+    console.print(f"ads-metrics: snapshot_date={snapshot_date} stores={len(stores)} fetch_landings={not args.no_fetch} "
+                  f"posts={args.posts}")
+    browser = pw = None
+    if args.posts:
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch(headless=True, **meta_ads.launch_kwargs())
+    try:
+        for s in stores:
+            _post_process_store(conn, s["id"], s["store_domain"], snapshot_date, session, fetch_landings=not args.no_fetch)
+            if browser is not None:
+                pe = meta_ads.fetch_boosted_engagement(conn, browser, s["id"], snapshot_date)
+                log.info("%-28s boosted posts: %d candidates, fetched %d, counts found %d", s["store_domain"],
+                         pe["candidates"], pe["fetched"], pe["with_counts"])
+                for a in conn.execute("SELECT DISTINCT ad_id FROM meta_ads_daily WHERE store_id = ? AND snapshot_date = ?",
+                                      (s["id"], snapshot_date)):
+                    ad_metrics.compute_reach_metrics(conn, a["ad_id"], snapshot_date)
+                conn.commit()
+    finally:
+        if browser is not None:
+            browser.close()
+            pw.stop()
     md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
     if md:
         console.print(f"alerts written to {md}")
@@ -392,11 +422,13 @@ def cmd_ads_report(args) -> int:
         return 0
 
     t = Table(title=f"raw ads (as of {as_of}, newest start first, limit {args.limit})")
-    for c in ("store", "ad id", "page", "start", "days", "act", "type", "headline", "primary text", "landing", "fp", "eu"):
+    for c in ("store", "ad id", "page", "start", "days", "act", "type", "headline", "primary text", "landing", "fp", "eu",
+              "reach/day", "type", "comments"):
         t.add_column(c, overflow="fold")
     rows = conn.execute(f"""
         SELECT s.store_domain, a.ad_id, a.page_name, a.ad_start_date, a.first_seen_date, d.is_active, a.creative_type,
-               a.headline, a.primary_text, a.landing_url, a.fingerprint, d.eu_total_reach
+               a.headline, a.primary_text, a.landing_url, a.fingerprint, d.eu_total_reach, d.uk_reach, d.reach_slope_7d,
+               a.engagement_type, d.comments
         FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id JOIN stores s ON s.id = d.store_id
         WHERE d.snapshot_date = ? {where}
         ORDER BY a.ad_start_date DESC, a.ad_id LIMIT ?""", [as_of] + params + [args.limit]).fetchall()
@@ -405,8 +437,46 @@ def cmd_ads_report(args) -> int:
         t.add_row(r["store_domain"], r["ad_id"], r["page_name"] or "", r["ad_start_date"] or "?",
                   "" if dr is None else str(dr), "[green]Y[/]" if r["is_active"] else "[red]N[/]",
                   r["creative_type"] or "", (r["headline"] or "")[:40], (r["primary_text"] or "")[:70],
-                  (r["landing_url"] or "")[:60], r["fingerprint"] or "", "" if r["eu_total_reach"] is None else str(r["eu_total_reach"]))
+                  (r["landing_url"] or "")[:60], r["fingerprint"] or "",
+                  "" if r["eu_total_reach"] is None else str(r["eu_total_reach"]),
+                  "" if r["reach_slope_7d"] is None else str(r["reach_slope_7d"]), r["engagement_type"] or "",
+                  "" if r["comments"] is None else str(r["comments"]))
     console.print(t)
+    return 0
+
+
+def cmd_ads_coverage(args) -> int:
+    conn = db.connect(args.db)
+    as_of = _parse_date(args.date) if args.date else conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily").fetchone()[0]
+    if not as_of:
+        console.print("[red]no ad snapshots yet[/]")
+        return 2
+    rows = ad_metrics.coverage(conn, as_of)
+    t = Table(title=f"Meta measurability per store (as of {as_of}; ignored pages excluded)",
+              caption="EU exact = exact EU/EEA reach number; UK exact = GB reach from the country breakdown; "
+                      "range = only a lower/upper bound; boosted = ad resolves to a Page/Instagram post; "
+                      "comments = boosted posts whose counts were read today; dark = no underlying post")
+    for c, j in (("store", "left"), ("ads", "right"), ("EU exact", "right"), ("UK exact", "right"), ("range only", "right"),
+                 ("no reach", "right"), ("boosted", "right"), ("comments", "right"), ("dark", "right")):
+        t.add_column(c, justify=j)
+
+    def pct(n, d):
+        return f"{n} ({n / d:.0%})" if d else "0"
+    for r in rows:
+        style = "bold" if r["store"] == "TOTAL" else ""
+        t.add_row(f"[{style}]{r['store']}[/]" if style else r["store"], str(r["ads"]),
+                  pct(r["eu_exact"], r["ads"]), pct(r["uk_exact"], r["ads"]), pct(r["range_only"], r["ads"]),
+                  pct(r["no_reach"], r["ads"]), pct(r["boosted"], r["ads"]), pct(r["with_comments"], r["boosted"]),
+                  pct(r["dark"], r["ads"]))
+    console.print(t)
+    keys = rows[-1]["keys"] if rows else {}
+    if keys:
+        console.print("[dim]reach-related keys seen in the raw payloads (ads carrying each): " +
+                      ", ".join(f"{k} x{v}" for k, v in sorted(keys.items(), key=lambda kv: -kv[1])[:12]) + "[/]")
+    ps = conn.execute("""SELECT COALESCE(d.post_status, 'not fetched') st, COUNT(*) n FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
+                         WHERE d.snapshot_date = ? AND a.engagement_type = 'boosted' GROUP BY st""", (as_of,)).fetchall()
+    if ps:
+        console.print("[dim]boosted post fetch status: " + ", ".join(f"{r['st']} x{r['n']}" for r in ps) + "[/]")
     return 0
 
 
@@ -570,7 +640,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--date", help="snapshot date (default: latest)")
     s.add_argument("--only", nargs="+", metavar="DOMAIN")
     s.add_argument("--no-fetch", action="store_true", help="do not fetch advertorial landing pages")
+    s.add_argument("--posts", action="store_true", help="also open boosted posts in a browser to read comment counts")
     s.set_defaults(fn=cmd_ads_metrics)
+
+    s = sub.add_parser("ads-coverage", help="how measurable the scraped ads are: EU/UK reach, boosted vs dark, per store")
+    s.add_argument("--date", help="snapshot date (default: latest)")
+    s.set_defaults(fn=cmd_ads_coverage)
 
     s = sub.add_parser("sync-sheets", help="push latest snapshot + deltas to Google Sheets via Apps Script")
     s.add_argument("--date", help="sync the snapshot as of this date (default: latest)")

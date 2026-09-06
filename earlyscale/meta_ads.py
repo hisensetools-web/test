@@ -147,6 +147,101 @@ def _strip_query(url: str | None) -> str:
     return f"{u.scheme}://{u.netloc}{u.path}"
 
 
+REACH_KEY_RE = re.compile(r"reach", re.I)
+POST_URL_RE = re.compile(
+    r"https?://(?:www\.|m\.|web\.)?(?:facebook|instagram)\.com[^\s\"'<>]*?"
+    r"(?:/posts/|/videos/|/reel/|/reels/|/photos/|permalink\.php\?story_fbid=|story\.php\?story_fbid=|/p/)[^\s\"'<>]*",
+    re.I)
+POST_ID_KEYS = ("post_id", "story_id", "boosted_post_id", "root_post_id", "source_post_id")
+
+
+def _walk_items(obj, path=""):
+    """Yield (path, key, value) for every dict entry in a nested structure."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield path, k, v
+            yield from _walk_items(v, f"{path}.{k}" if path else k)
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from _walk_items(v, f"{path}[{i}]")
+
+
+def extract_reach(node: dict) -> dict:
+    """EU exact reach, UK exact reach, and any reach *range*, wherever the Ad Library puts them.
+
+    Known: aaa_info.eu_total_reach (int) and aaa_info.age_country_gender_reach_breakdown
+    (per-country rows; GB summed gives an exact UK figure when present). Anything else with
+    "reach" in its key is recorded too: ints as exact, {lower_bound, upper_bound} as a range.
+    `keys` lists what was found so the coverage report can show it."""
+    out = {"eu_reach": None, "uk_reach": None, "range_lower": None, "range_upper": None, "source": None, "keys": []}
+    for path, k, v in _walk_items(node):
+        if not REACH_KEY_RE.search(k):
+            continue
+        full = f"{path}.{k}" if path else k
+        kl = k.lower()
+        if isinstance(v, bool):
+            continue
+        if isinstance(v, (int, float)):
+            out["keys"].append(f"{full}={int(v)}")
+            if kl == "eu_total_reach" and out["eu_reach"] is None:
+                out["eu_reach"] = int(v)
+            elif ("uk" in kl or "gb" in kl) and out["uk_reach"] is None:
+                out["uk_reach"] = int(v)
+        elif isinstance(v, dict) and ("lower_bound" in v or "upper_bound" in v):
+            lo, hi = v.get("lower_bound"), v.get("upper_bound")
+            out["keys"].append(f"{full}=[{lo}..{hi}]")
+            if out["range_lower"] is None and (lo is not None or hi is not None):
+                try:
+                    out["range_lower"] = int(lo) if lo is not None else None
+                    out["range_upper"] = int(hi) if hi is not None else None
+                    out["source"] = full
+                except (TypeError, ValueError):
+                    pass
+        elif isinstance(v, list) and kl == "age_country_gender_reach_breakdown":
+            gb = 0
+            found = False
+            for row in v:
+                if isinstance(row, dict) and str(row.get("country", "")).upper() in ("GB", "UK"):
+                    found = True
+                    for ag in row.get("age_gender_breakdowns") or []:
+                        for g in ("male", "female", "unknown"):
+                            val = ag.get(g)
+                            if isinstance(val, (int, float)):
+                                gb += int(val)
+            out["keys"].append(f"{full}:{len(v)} countries" + (f" GB={gb}" if found else ""))
+            if found and out["uk_reach"] is None:
+                out["uk_reach"] = gb
+    if out["eu_reach"] is not None:
+        out["source"] = "eu_total_reach" if out["source"] is None else out["source"]
+    elif out["uk_reach"] is not None and out["source"] is None:
+        out["source"] = "uk"
+    out["keys"] = ",".join(out["keys"])[:400] or None
+    return out
+
+
+def extract_post_url(node: dict) -> str | None:
+    """Underlying Page/Instagram post for a boosted-post ad, if the payload exposes one."""
+    snap = node.get("snapshot") or {}
+    for key in POST_ID_KEYS:
+        v = node.get(key) or snap.get(key)
+        if v and str(v).isdigit():
+            page_id = node.get("page_id") or snap.get("page_id")
+            return f"https://www.facebook.com/{page_id}/posts/{v}" if page_id else f"https://www.facebook.com/{v}"
+    rs = snap.get("root_reshared_post")
+    if isinstance(rs, dict):
+        for key in ("url", "permalink", "permalink_url", "link_url"):
+            if rs.get(key):
+                return str(rs[key])
+        if rs.get("id") and str(rs["id"]).isdigit():
+            return f"https://www.facebook.com/{rs['id']}"
+    for _, k, v in _walk_items(node):
+        if isinstance(v, str) and ("facebook.com" in v or "instagram.com" in v):
+            m = POST_URL_RE.search(v)
+            if m and "ads/library" not in m.group(0):
+                return m.group(0)
+    return None
+
+
 def normalise_ad(node: dict) -> dict:
     snap = node.get("snapshot") or {}
     cards = snap.get("cards") or []
@@ -176,8 +271,8 @@ def normalise_ad(node: dict) -> dict:
         first_card.get("original_image_url"), first_card.get("resized_image_url"),
         first_card.get("video_preview_image_url"),
     )
-    aaa = node.get("aaa_info") or {}
-    eu_reach = _first(aaa.get("eu_total_reach"), node.get("eu_total_reach"))
+    reach = extract_reach(node)
+    eu_reach = reach["eu_reach"]
     # Meta gives every ad its own asset URL, so hashing the asset made every fingerprint unique.
     # Hash the copy instead: identical text+headline across ads/pages = same creative concept.
     fp_src = f"{(headline or '').lower().strip()}|{(body_text or '').lower()[:500]}"
@@ -206,6 +301,12 @@ def normalise_ad(node: dict) -> dict:
         "platforms": ",".join(node.get("publisher_platform") or []) or None,
         "collation_count": node.get("collation_count"),
         "eu_total_reach": int(eu_reach) if isinstance(eu_reach, (int, float)) else None,
+        "uk_reach": reach["uk_reach"],
+        "reach_range_lower": reach["range_lower"],
+        "reach_range_upper": reach["range_upper"],
+        "reach_source": reach["source"],
+        "reach_keys": reach["keys"],
+        "post_url": extract_post_url(node),
         "reactions": social.get("reactions"),
         "comments": social.get("comments"),
         "shares": social.get("shares"),
@@ -388,12 +489,23 @@ def record_scrape(conn: sqlite3.Connection, store_id: int, snapshot_date: str, a
                     (snapshot_date, a["end_date"], a["page_name"], a["primary_text"], a["headline"],
                      a["landing_url"], a["landing_domain"], a["asset_url"], a["raw_json"], a["ad_id"]))
             conn.execute(
+                """UPDATE meta_ads SET post_url = COALESCE(?, post_url), reach_keys = ?,
+                     engagement_type = CASE WHEN COALESCE(?, post_url) IS NULL THEN 'dark' ELSE 'boosted' END
+                   WHERE ad_id = ?""",
+                (a.get("post_url"), a.get("reach_keys"), a.get("post_url"), a["ad_id"]))
+            prev = conn.execute("SELECT reactions, comments, shares, post_status FROM meta_ads_daily WHERE snapshot_date = ? AND ad_id = ?",
+                                (snapshot_date, a["ad_id"])).fetchone()
+            conn.execute(
                 """INSERT OR REPLACE INTO meta_ads_daily
-                   (snapshot_date, ad_id, store_id, is_active, position, eu_total_reach, reactions, comments,
-                    shares, collation_count, fetched_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
-                (snapshot_date, a["ad_id"], store_id, a["is_active"], pos, a["eu_total_reach"], a["reactions"],
-                 a["comments"], a["shares"], a["collation_count"], now))
+                   (snapshot_date, ad_id, store_id, is_active, position, eu_total_reach, uk_reach, reach_range_lower,
+                    reach_range_upper, reach_source, reactions, comments, shares, post_status, collation_count, fetched_at)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (snapshot_date, a["ad_id"], store_id, a["is_active"], pos, a["eu_total_reach"], a.get("uk_reach"),
+                 a.get("reach_range_lower"), a.get("reach_range_upper"), a.get("reach_source"),
+                 a["reactions"] if a["reactions"] is not None else (prev["reactions"] if prev else None),
+                 a["comments"] if a["comments"] is not None else (prev["comments"] if prev else None),
+                 a["shares"] if a["shares"] is not None else (prev["shares"] if prev else None),
+                 prev["post_status"] if prev else None, a["collation_count"], now))
         # ads seen on an earlier day for this store that did not show up today -> inactive row
         gone = [r["ad_id"] for r in conn.execute(
             "SELECT ad_id FROM meta_ads WHERE store_id = ? AND last_seen_date < ?", (store_id, snapshot_date))
@@ -422,3 +534,94 @@ def days_running(ad_start: str | None, first_seen: str, as_of: str) -> int | Non
         return (date.fromisoformat(as_of) - date.fromisoformat(start)).days
     except (TypeError, ValueError):
         return None
+
+
+# ---------------------------------------------------------------- boosted posts (browser, best effort)
+
+_COUNT_PATTERNS = {
+    "comments": [r'"comment_count"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)', r'"comments"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)',
+                 r'"comment_count"\s*:\s*(\d+)', r'"commentCount"\s*:\s*(\d+)', r'(\d[\d,.]*[KkMm]?)\s+comments?\b'],
+    "reactions": [r'"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)', r'"reactions"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
+                  r'"reaction_count"\s*:\s*(\d+)', r'"like_count"\s*:\s*(\d+)'],
+    "shares": [r'"share_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)', r'"share_count"\s*:\s*(\d+)', r'(\d[\d,.]*[KkMm]?)\s+shares?\b'],
+}
+
+
+def _to_int(text: str) -> int | None:
+    t = text.replace(",", "").strip()
+    mult = 1
+    if t[-1:].lower() == "k":
+        mult, t = 1000, t[:-1]
+    elif t[-1:].lower() == "m":
+        mult, t = 1_000_000, t[:-1]
+    try:
+        return int(float(t) * mult)
+    except ValueError:
+        return None
+
+
+def parse_post_counts(html: str) -> dict:
+    """Pull comment / reaction / share counts out of a Facebook post page's HTML, if present."""
+    out = {}
+    for key, pats in _COUNT_PATTERNS.items():
+        for pat in pats:
+            m = re.search(pat, html, re.I)
+            if m:
+                v = _to_int(m.group(1))
+                if v is not None:
+                    out[key] = v
+                    break
+    return out
+
+
+def fetch_post_counts(browser, url: str) -> tuple[dict, str]:
+    """Open a public post in a fresh context and read its counts. Returns (counts, status):
+    status is 'ok', 'login-wall', 'no-counts' or 'error:<reason>'."""
+    ctx = browser.new_context(user_agent=random.choice(USER_AGENTS), viewport={"width": 1366, "height": 850},
+                              locale="en-US")
+    page = ctx.new_page()
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=config.META_NAV_TIMEOUT_MS)
+        _wait(2, 4)
+        _dismiss_dialogs(page)
+        if "/login" in page.url.lower() or "/checkpoint" in page.url.lower():
+            return {}, "login-wall"
+        html = page.content()
+        counts = parse_post_counts(html)
+        if not counts:
+            body = (page.evaluate("() => document.body ? document.body.innerText : ''") or "")[:20000]
+            counts = parse_post_counts(body)
+        return counts, ("ok" if counts else "no-counts")
+    except Exception as e:  # noqa: BLE001
+        return {}, f"error:{type(e).__name__}"
+    finally:
+        ctx.close()
+
+
+def fetch_boosted_engagement(conn: sqlite3.Connection, browser, store_id: int, snapshot_date: str,
+                             max_posts: int | None = None) -> dict:
+    """For today's active boosted ads, fetch each underlying post once per day and store counts."""
+    max_posts = config.META_MAX_POSTS if max_posts is None else max_posts
+    rows = conn.execute(
+        """SELECT a.ad_id, a.post_url FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id AND d.snapshot_date = ?
+           WHERE a.store_id = ? AND a.post_url IS NOT NULL AND d.is_active = 1 AND d.post_status IS NULL
+             AND COALESCE(a.page_ignored, 0) = 0 ORDER BY d.position""", (snapshot_date, store_id)).fetchall()
+    seen: dict[str, tuple[dict, str]] = {}
+    fetched = ok = 0
+    for r in rows:
+        url = r["post_url"]
+        if url not in seen:
+            if fetched >= max_posts:
+                break
+            seen[url] = fetch_post_counts(browser, url)
+            fetched += 1
+            _wait()
+        counts, status = seen[url]
+        if counts:
+            ok += 1
+        conn.execute(
+            """UPDATE meta_ads_daily SET reactions = COALESCE(?, reactions), comments = COALESCE(?, comments),
+                 shares = COALESCE(?, shares), post_status = ? WHERE snapshot_date = ? AND ad_id = ?""",
+            (counts.get("reactions"), counts.get("comments"), counts.get("shares"), status, snapshot_date, r["ad_id"]))
+    conn.commit()
+    return {"candidates": len(rows), "fetched": fetched, "with_counts": ok}

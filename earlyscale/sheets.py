@@ -30,7 +30,7 @@ ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
                    "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
                    "variants_of_family_published_7d", "ads_pointing_here", "engagement_per_day",
-                   "days_running_max", "concept_status"]
+                   "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d"]
 FAMILIES_HEADERS = ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
                     "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"]
 CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "families published 7d",

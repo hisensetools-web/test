@@ -254,7 +254,7 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
             "" if p["min_price"] is None else p["min_price"], sold_out,
             "" if rank is None else rank, rank_delta, fam_new_7d[fam[p["product_id"]]],
             m.get("ads_pointing_here", ""), _blank(m.get("engagement_per_day")), _blank(m.get("days_running_max")),
-            m.get("concept_status", ""),
+            m.get("concept_status", ""), _blank(m.get("eu_reach_slope_7d")), _blank(m.get("comment_delta_1d")),
         ])
     return rows
 
