@@ -91,8 +91,9 @@ def mutate(products: list[dict], seed: int, now: datetime) -> list[dict]:
     return products
 
 
-def make_handler(products: list[dict], collection: list[dict], delay_first_page_status: int | None):
-    state = {"first_products_call": True}
+def make_handler(products: list[dict], collection: list[dict], delay_first_page_status: int | None,
+                 require_browser: bool = False, redirect_to: str | None = None):
+    state = {"first_products_call": True, "hits": 0}
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):  # quiet
@@ -107,8 +108,21 @@ def make_handler(products: list[dict], collection: list[dict], delay_first_page_
             self.wfile.write(data)
 
         def do_GET(self):
+            state["hits"] += 1
             u = urlparse(self.path)
             qs = parse_qs(u.query)
+            if redirect_to:  # behave like an apex host that 301s everything to www
+                self.send_response(301)
+                self.send_header("Location", redirect_to + self.path)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if require_browser:  # olavita.co-style WAF: 406 unless the request looks like a browser
+                ua = self.headers.get("User-Agent", "")
+                accept = self.headers.get("Accept", "")
+                if "Mozilla/" not in ua or "compatible;" in ua or "text/html" not in accept:
+                    self._send_json(406, {"error": "Not Acceptable"})
+                    return
             limit = min(int(qs.get("limit", ["30"])[0]), 250)
             page = int(qs.get("page", ["1"])[0])
             if u.path == "/products.json":
@@ -146,6 +160,10 @@ def main(argv=None):
     ap.add_argument("--mutate", action="store_true", help="apply day-2 changes to the catalog")
     ap.add_argument("--fail-first", type=int, default=None, metavar="STATUS",
                     help="answer the first /products.json request with this status (e.g. 430) to test retry")
+    ap.add_argument("--require-browser", action="store_true",
+                    help="answer 406 unless User-Agent/Accept look like a real browser")
+    ap.add_argument("--redirect-to", metavar="ORIGIN",
+                    help="301 every request to ORIGIN (simulates apex -> www redirect)")
     args = ap.parse_args(argv)
     now = datetime.now(timezone.utc).replace(microsecond=0)
     products = build_catalog(args.products, args.seed, now)
@@ -154,7 +172,8 @@ def main(argv=None):
     # "best-selling" collection order: deterministic shuffle so position differs from catalog order
     collection = list(products)
     random.Random(args.seed + 7).shuffle(collection)
-    srv = HTTPServer(("127.0.0.1", args.port), make_handler(products, collection, args.fail_first))
+    srv = HTTPServer(("127.0.0.1", args.port), make_handler(products, collection, args.fail_first,
+                                                             args.require_browser, args.redirect_to))
     print(f"mock store on http://127.0.0.1:{args.port} products={len(products)} seed={args.seed} mutate={args.mutate}")
     srv.serve_forever()
 

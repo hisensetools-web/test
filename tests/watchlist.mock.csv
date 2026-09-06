@@ -1,4 +1,6 @@
 store_domain,meta_page_name,meta_page_id,notes
 http://127.0.0.1:8001,MockOne,,mock store seed 1
-http://127.0.0.1:8002,MockTwo,,mock store seed 2
+http://127.0.0.1:8002,MockTwo,,mock store seed 2 (first request answers 430)
 http://127.0.0.1:8003,MockThree,,mock store seed 3
+http://127.0.0.1:8004,MockWaf,,answers 406 unless request looks like a browser (olavita.co)
+http://127.0.0.1:8005,MockApex,,apex 301s everything to :8006 (tryterrastrike.com)

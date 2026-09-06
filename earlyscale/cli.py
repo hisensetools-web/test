@@ -11,7 +11,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import config, db, shopify
+from . import config, db, deltas, shopify
 from .watchlist import append_to_watchlist, read_watchlist
 
 console = Console()
@@ -142,6 +142,82 @@ def cmd_status(args) -> int:
     return 0
 
 
+def _fmt_delta(v: int | None, signed: bool = True) -> str:
+    if v is None:
+        return "[dim]n/a[/]"
+    if v == 0:
+        return "0"
+    if signed:
+        return f"[red]+{v}[/]" if v > 0 else f"[green]{v}[/]"
+    return f"[yellow]{v}[/]"
+
+
+def cmd_report(args) -> int:
+    conn = db.connect(args.db)
+    as_of = _parse_date(args.date) if args.date else None
+    rows = deltas.all_store_deltas(conn, as_of)
+    if not rows:
+        console.print("[red]no snapshots yet[/] - run `python tracker.py run` first")
+        return 2
+    no_hist = [d for d in rows if not d.has_history]
+    t = Table(title=f"stores by change score (as of {rows[0].snapshot_date})", caption=
+              "7d columns need only today's snapshot; delta columns compare against the previous snapshot day. "
+              "n/a = insufficient history (1 day).")
+    for c, j in (("store", "left"), ("snap", "left"), ("vs", "left"), ("products", "right"), ("new 7d", "right"),
+                 ("upd 7d", "right"), ("sold-out", "right"), ("Δ sold-out", "right"), ("price Δ", "right"),
+                 ("+handles", "right"), ("-handles", "right"), ("score", "right")):
+        t.add_column(c, justify=j)
+    for d in rows[:args.top]:
+        t.add_row(d.store_domain, d.snapshot_date, d.prev_date or "[dim]1 day[/]", str(d.products),
+                  str(d.new_products_7d), str(d.updated_products_7d), str(d.sold_out_variants),
+                  _fmt_delta(d.sold_out_variants_delta), _fmt_delta(d.price_changes, signed=False),
+                  _fmt_delta(d.new_handles, signed=False), _fmt_delta(d.removed_handles, signed=False),
+                  f"[bold]{d.change_score}[/]")
+    console.print(t)
+    if no_hist:
+        console.print(f"[dim]{len(no_hist)} store(s) have a single snapshot; deltas appear after the next run.[/]")
+
+    changes = [(d, c) for d in rows for c in d.changes]
+    if changes:
+        t = Table(title=f"product changes (top {args.changes})")
+        for c in ("store", "handle", "change", "detail"):
+            t.add_column(c)
+        colour = {"new_handle": "cyan", "sold_out": "red", "price": "yellow", "restocked": "green", "removed": "dim"}
+        for d, c in changes[:args.changes]:
+            t.add_row(d.store_domain, c.handle, f"[{colour[c.kind]}]{c.kind}[/]", c.detail)
+        console.print(t)
+    elif any(d.has_history for d in rows):
+        console.print("[dim]no product-level changes vs the previous snapshot.[/]")
+    return 0
+
+
+def cmd_product(args) -> int:
+    conn = db.connect(args.db)
+    rows = deltas.product_history(conn, args.handle, args.store)
+    if not rows:
+        console.print(f"[red]no snapshots for handle[/] {args.handle}")
+        return 2
+    t = Table(title=f"{args.handle}  ({rows[0]['title'] or ''})", caption=f"published {rows[0]['published_at']}")
+    for c, j in (("date", "left"), ("store", "left"), ("variants", "right"), ("sold-out", "right"),
+                 ("min", "right"), ("max", "right"), ("coll. pos", "right"), ("updated_at", "left")):
+        t.add_column(c, justify=j)
+    prev = None
+    for r in rows:
+        so = str(r["sold_out_variants"])
+        if prev and prev["store_domain"] == r["store_domain"] and r["sold_out_variants"] != prev["sold_out_variants"]:
+            so = f"[red]{so}[/]" if r["sold_out_variants"] > prev["sold_out_variants"] else f"[green]{so}[/]"
+        price = f"{r['min_price']:.2f}" if r["min_price"] is not None else "-"
+        if prev and prev["store_domain"] == r["store_domain"] and r["min_price"] != prev["min_price"]:
+            price = f"[yellow]{price}[/]"
+        t.add_row(r["snapshot_date"], r["store_domain"], str(r["variant_count"]), so, price,
+                  f"{r['max_price']:.2f}" if r["max_price"] is not None else "-",
+                  str(r["collection_position"]) if r["collection_position"] is not None else "-",
+                  (r["updated_at"] or "")[:19])
+        prev = r
+    console.print(t)
+    return 0
+
+
 # ---------------------------------------------------------------- parser
 
 def build_parser() -> argparse.ArgumentParser:
@@ -167,6 +243,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--watchlist", help="alternate watchlist.csv path")
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
     s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("report", help="stores sorted by how much changed, with product-level changes")
+    s.add_argument("--date", help="report as of this snapshot date (default: latest)")
+    s.add_argument("--top", type=int, default=50, help="max stores to show")
+    s.add_argument("--changes", type=int, default=40, help="max product changes to show")
+    s.set_defaults(fn=cmd_report)
+
+    s = sub.add_parser("product", help="time series for one product handle")
+    s.add_argument("handle")
+    s.add_argument("--store", help="restrict to one store domain")
+    s.set_defaults(fn=cmd_product)
 
     s = sub.add_parser("status", help="what is in the database")
     s.add_argument("--limit", type=int, default=10)

@@ -26,7 +26,7 @@ class StoreFetchError(Exception):
 
 def make_session() -> requests.Session:
     s = requests.Session()
-    s.headers.update({"User-Agent": config.USER_AGENT, "Accept": "application/json"})
+    s.headers.update(config.BROWSER_HEADERS)
     return s
 
 
@@ -39,6 +39,49 @@ def base_url(store_domain: str) -> str:
     return f"{parsed.scheme}://{parsed.netloc}"
 
 
+def _origin(url: str) -> str:
+    u = urlparse(url)
+    return f"{u.scheme}://{u.netloc}"
+
+
+def _www_variant(base: str) -> str | None:
+    """https://example.com -> https://www.example.com (None if it already has www or is an IP/port)."""
+    u = urlparse(base)
+    host = u.netloc
+    if host.startswith("www.") or ":" in host or host.replace(".", "").isdigit() or host.count(".") < 1:
+        return None
+    return f"{u.scheme}://www.{host}"
+
+
+def resolve_base_url(session: requests.Session, store_domain: str) -> str:
+    """Find the origin that actually serves the storefront.
+
+    Many stores redirect apex -> www (or the reverse), and some apex hosts don't
+    answer at all (seen on tryterrastrike.com). We probe once, follow redirects,
+    and reuse the final origin for every later request so pagination never
+    bounces through a redirect. If the apex host is unreachable we try www."""
+    base = base_url(store_domain)
+    candidates = [base]
+    alt = _www_variant(base)
+    if alt:
+        candidates.append(alt)
+    last_err: Exception | None = None
+    for cand in candidates:
+        try:
+            r = session.get(f"{cand}/products.json", params={"limit": 1}, timeout=config.REQUEST_TIMEOUT,
+                            allow_redirects=True)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last_err = e
+            log.warning("%s unreachable (%s)%s", cand, type(e).__name__,
+                        "; trying www." if cand is not candidates[-1] else "")
+            continue
+        final = _origin(r.url)
+        if r.history:
+            log.info("%s redirected to %s; using that host", cand, final)
+        return final
+    raise StoreFetchError(f"unreachable: {last_err}")
+
+
 def get_json(session: requests.Session, url: str, params: dict | None = None,
              retries: int = config.REQUEST_RETRIES) -> dict:
     """GET a JSON document with timeout and exponential backoff.
@@ -49,7 +92,7 @@ def get_json(session: requests.Session, url: str, params: dict | None = None,
             r = session.get(url, params=params, timeout=config.REQUEST_TIMEOUT, allow_redirects=True)
             if r.status_code in (429, 430) or r.status_code >= 500:
                 raise StoreFetchError(f"HTTP {r.status_code}")
-            if r.status_code in (401, 403):
+            if r.status_code in (401, 403, 406):
                 raise StoreFetchError(f"HTTP {r.status_code} (password-protected or blocked)")  # no retry
             if r.status_code == 404:
                 raise StoreFetchError("HTTP 404 (not a Shopify storefront?)")  # no retry
@@ -109,8 +152,9 @@ def fetch_store(store_domain: str, session: requests.Session | None = None) -> t
     Returns (raw_products, {product_id: collection_position}, pages_fetched).
     The collection fetch is best-effort: failure there still yields products."""
     session = session or make_session()
-    base = base_url(store_domain)
+    base = resolve_base_url(session, store_domain)
     raw, pages = fetch_all_pages(session, f"{base}/products.json")
+    pages += 1  # the resolve probe
     positions: dict[int, int] = {}
     try:
         _polite_pause()

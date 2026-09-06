@@ -1,0 +1,20 @@
+{"products": [
+  {"id": 101, "title": "Cloud Hoodie", "handle": "cloud-hoodie", "published_at": "2026-08-30T10:00:00-04:00",
+   "created_at": "2026-08-29T10:00:00-04:00", "updated_at": "2026-09-06T08:00:00-04:00",
+   "vendor": "Acme", "product_type": "Hoodie", "tags": ["new", "core"],
+   "variants": [
+     {"id": 1011, "title": "S", "sku": "CH-S", "price": "49.00", "compare_at_price": "59.00", "available": false},
+     {"id": 1012, "title": "M", "sku": "CH-M", "price": "49.00", "compare_at_price": "79.00", "available": false},
+     {"id": 1013, "title": "L", "sku": "", "price": "64.00", "compare_at_price": null, "available": true}
+   ]},
+  {"id": 102, "title": "Ridge Wallet", "handle": "ridge-wallet", "published_at": "2024-01-15T10:00:00-05:00",
+   "created_at": "2024-01-10T10:00:00-05:00", "updated_at": "2024-06-01T08:00:00-04:00",
+   "vendor": "Acme", "product_type": "", "tags": "leather, bestseller",
+   "variants": [
+     {"id": 1021, "title": "Default Title", "sku": "RW", "price": "95.00", "available": true}
+   ]},
+  {"id": 104, "title": "Launch Drop", "handle": "launch-drop", "published_at": "2026-09-06T00:00:00Z",
+   "created_at": "2026-09-06T00:00:00Z", "updated_at": "2026-09-06T00:00:00Z",
+   "vendor": "Acme", "product_type": "Drop", "tags": ["new"],
+   "variants": [{"id": 1041, "title": "Default Title", "sku": "LD", "price": "44.00", "available": true}]}
+]}

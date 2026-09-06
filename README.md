@@ -3,9 +3,9 @@
 Detects Shopify products in their first weeks of paid-social scaling by snapshotting
 leading signals daily and alerting on week-over-week deltas. Full spec: [CLAUDE.md](CLAUDE.md).
 
-**Status: build step 1 of 6** — `products.json` fetcher, SQLite schema, daily snapshot.
-Deltas/report (step 2), Meta Ad Library (step 3), landing-URL join (4), alerts (5) and
-cron docs (6) are not built yet.
+**Status: build steps 1–2 of 6** — `products.json` fetcher, SQLite schema, daily snapshot,
+delta calculations and the `report` / `product` commands. Meta Ad Library (step 3),
+landing-URL join (4), alerts (5) and the full cron/README pass (6) are not built yet.
 
 ## Setup
 
@@ -27,6 +27,66 @@ python tracker.py status              # recent runs + per-store summary
 
 Start running this daily as soon as it works for you. Week-over-week metrics need
 at least 7–14 days of history before they mean anything.
+
+## Report
+
+```bash
+python tracker.py report                 # stores sorted by change score, then product-level changes
+python tracker.py report --date 2026-09-05 --top 20 --changes 100
+python tracker.py product <handle>       # time series for one handle (add --store domain to narrow)
+```
+
+Per store the report shows:
+
+| column | needs | meaning |
+|---|---|---|
+| `new 7d` | 1 day | products whose `published_at` is within the 7 days ending on the snapshot date (UTC) |
+| `upd 7d` | 1 day | same, for `updated_at` |
+| `sold-out` | 1 day | variants with `available: false` today |
+| `Δ sold-out` | 2 days | change in that count vs the previous snapshot |
+| `price Δ` | 2 days | variants whose price differs from the previous snapshot (new variants don't count) |
+| `+handles` / `-handles` | 2 days | products that appeared / disappeared from products.json |
+| `score` | — | `new 7d + upd 7d + |Δ sold-out| + price Δ + +handles + -handles`, the sort key |
+
+"Previous snapshot" is the store's most recent earlier snapshot, not calendar yesterday, so
+a missed day doesn't break the comparison. With one day of history the 2-day columns show
+`n/a` and the `vs` column says `1 day`. The product changes table lists new handles,
+sold-out / restocked products (with `(ALL)` when every variant is gone), price changes and
+removed handles, ordered by store score.
+
+## Scheduling (Windows)
+
+`run_daily.bat` activates `.venv` if present (else the `py -3.11` launcher, else `python`),
+runs `python tracker.py run` and appends stdout+stderr to `logs\run_YYYY-MM-DD.log`.
+Register it in Task Scheduler for 06:00 daily from PowerShell in the project folder:
+
+```powershell
+.\register_task.ps1
+```
+
+which runs exactly:
+
+```
+schtasks /Create /TN "ShopifyTracker Daily" /TR "\"C:\path\to\run_daily.bat\"" /SC DAILY /ST 06:00 /F
+```
+
+Verify / test / remove:
+
+```
+schtasks /Query /TN "ShopifyTracker Daily" /V /FO LIST
+schtasks /Run   /TN "ShopifyTracker Daily"
+schtasks /Delete /TN "ShopifyTracker Daily" /F
+```
+
+Without `/RU` and `/RP` the task only fires while you are logged on. To run when logged off,
+open the task's Properties in Task Scheduler and pick "Run whether user is logged on or not"
+(or re-register with `/RU <user> /RP <password>`).
+
+Linux/macOS cron equivalent (06:00 daily):
+
+```
+0 6 * * * cd /path/to/tracker && .venv/bin/python tracker.py run >> logs/run_$(date +\%F).log 2>&1
+```
 
 `watchlist.csv` ships with three test stores (gymshark, allbirds, colourpop). Add more with:
 
@@ -71,9 +131,16 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
 
 ## Behaviour on failure
 
+- Requests present as a normal desktop browser (Chrome User-Agent, HTML-first `Accept`,
+  `Accept-Language`). Some storefront WAFs answer 406 to anything else (seen on olavita.co).
+  Override with `USER_AGENT` in `.env` if a store needs something different.
+- Before paginating, the host is resolved once: `GET /products.json?limit=1` following
+  redirects, and the final origin (e.g. `https://www.store.com`) is reused for every later
+  request. If the apex host is unreachable (connection error / timeout, seen on
+  tryterrastrike.com) the `www.` variant is tried before giving up.
 - Every request has a connect/read timeout and up to 3 retries with exponential backoff
   on connection errors, timeouts, HTTP 429/430 (Shopify rate limit) and 5xx.
-- 401/403 (password-protected), 404 (not Shopify) and HTML responses fail fast, no retry.
+- 401/403 (password-protected), 406 (WAF), 404 (not Shopify) and HTML responses fail fast, no retry.
 - A failing store is logged in `store_runs.error` and the run continues with the next store.
 - If `/collections/all/products.json` fails but `/products.json` works, the snapshot is still
   written with `collection_position = NULL`.
@@ -94,18 +161,25 @@ whole pipeline can be exercised without network access:
 python -m tests.mock_store --port 8001 --products 320 --seed 1 &
 python -m tests.mock_store --port 8002 --products 40  --seed 2 --fail-first 430 &   # tests retry
 python -m tests.mock_store --port 8003 --products 610 --seed 3 &
+python -m tests.mock_store --port 8004 --products 55  --seed 4 --require-browser &         # 406 unless browser headers
+python -m tests.mock_store --port 8005 --products 1   --seed 5 --redirect-to http://127.0.0.1:8006 &   # apex -> "www"
+python -m tests.mock_store --port 8006 --products 130 --seed 5 &
 python tracker.py run --watchlist tests/watchlist.mock.csv --date 2026-09-05
 # restart the mocks with --mutate for a "day 2" with sold-outs, price cuts and 2 new products
 python tracker.py run --watchlist tests/watchlist.mock.csv
 python tracker.py status
+python tracker.py report
 ```
 
 ## Layout
 
 ```
 tracker.py              CLI entry point
-earlyscale/cli.py       commands: init-db, add-store, run, status
-earlyscale/shopify.py   HTTP fetch (retry/backoff/pagination) + pure normaliser + Meta page discovery
+run_daily.bat           Windows daily runner (logs to logs\run_YYYY-MM-DD.log)
+register_task.ps1       registers run_daily.bat in Task Scheduler (06:00 daily)
+earlyscale/cli.py       commands: init-db, add-store, run, report, product, status
+earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + pure normaliser + Meta page discovery
+earlyscale/deltas.py    pure delta calculations (7d counts, sold-out/price/handle deltas) + DB loaders
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O
 earlyscale/config.py    paths, .env loader, tunables
