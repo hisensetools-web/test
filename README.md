@@ -274,6 +274,12 @@ means the add went through (inventory not enforced), and the orphaned cart is cl
 checkout and never creates an order (the mock store's `/checkout` returns 403 and a test
 asserts it is never hit).
 
+One session (one cart) per store: Shopify throttles an IP that keeps creating carts, so the
+product page is opened once per handle and every probe of that store reuses the session.
+A 429 waits `Retry-After` (else `INVENTORY_THROTTLE_WAIT`, 90 s) and retries once; a second
+429 ends the store for the day and its remaining variants are retried tomorrow. The probe
+pass runs right after the Shopify pass, before the Meta pass fetches landing pages.
+
 **Fallback chain**, recorded per reading in `signal_source`:
 
 | rung | when | what is stored |
@@ -317,7 +323,7 @@ chain, then one row per hero variant with the raw `stock_level` reading for ever
 
 **Rollout:** set `INVENTORY_STORES=neuro-bella.com,tryorgatics.com,metabolae.com` in `.env`
 and the scheduled `python tracker.py run` probes those three after the Shopify pass, before
-the Sheets sync. `INVENTORY=1` (or `run --inventory`) probes every watchlist store; do that
+the Meta pass and the Sheets sync. `INVENTORY=1` (or `run --inventory`) probes every watchlist store; do that
 only after the readings from the first stores look right. `--no-inventory` skips the pass.
 Budget: about 40 probes x 10 s = 7 minutes per store per day.
 

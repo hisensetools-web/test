@@ -136,7 +136,7 @@ def _diag_headers(r: requests.Response) -> str:
 def probe_variant(base_url: str, variant_id: int, handle: str | None = None,
                   session: requests.Session | None = None, warm_up: bool = True) -> dict:
     """One /cart/add.js probe. Returns {status, stock, message, http}.
-    status: count | sold_out | untracked | not_found | blocked | error | unknown"""
+    status: count | sold_out | untracked | not_found | throttled | blocked | error | unknown"""
     s = session or fresh_session(base_url)
     if handle:
         s.headers["Referer"] = f"{base_url}/products/{handle}"
@@ -172,7 +172,11 @@ def probe_variant(base_url: str, variant_id: int, handle: str | None = None,
         return {"status": "unknown", "stock": None, "message": msg, "http": 422}
     if r.status_code == 404:
         return {"status": "not_found", "stock": None, "message": f"HTTP 404 {text[:120]} | {hdr}", "http": 404}
-    if r.status_code in (401, 403, 429, 430, 503) or "captcha" in text.lower() or "challenge" in text.lower():
+    if r.status_code == 429:
+        ra = r.headers.get("Retry-After")
+        return {"status": "throttled", "stock": None, "message": f"HTTP 429 {_squash(text)[:80]} | {hdr}", "http": 429,
+                "retry_after": int(ra) if ra and ra.isdigit() else None}
+    if r.status_code in (401, 403, 430, 503) or "captcha" in text.lower() or "challenge" in text.lower():
         return {"status": "blocked", "stock": None, "message": f"HTTP {r.status_code} {_squash(text)[:120]} | {hdr}", "http": r.status_code}
     if 300 <= r.status_code < 400:
         return {"status": "blocked", "stock": None, "message": f"HTTP {r.status_code} redirect | {hdr}", "http": r.status_code}
@@ -277,9 +281,25 @@ def _resolve(store_domain: str) -> str:
 
 
 def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, today: str,
-                probe=probe_variant, page_fetch=fetch_product_page, pause=_pause, resolve=_resolve) -> dict:
-    """Walk the fallback chain for every hero variant of one store that has not been probed today."""
+                probe=probe_variant, page_fetch=fetch_product_page, pause=_pause, resolve=_resolve,
+                sleep=time.sleep) -> dict:
+    """Walk the fallback chain for every hero variant of one store that has not been probed today.
+
+    One session (one cart) per store: Shopify throttles an IP that keeps creating new carts, which
+    is what a fresh session per variant looked like. The product page is opened once per handle
+    so the session carries storefront cookies. A 429 waits Retry-After (or INVENTORY_THROTTLE_WAIT)
+    and retries that variant once; a second 429 ends the store for today."""
     base = resolve(store_domain)
+    session = fresh_session(base) if probe is probe_variant else None
+    warmed: set[str] = set()
+
+    def do_probe(h):
+        handle = h.get("handle")
+        if session is None:
+            return probe(base, h["variant_id"], handle)
+        first = handle not in warmed
+        warmed.add(handle)
+        return probe(base, h["variant_id"], handle, session=session, warm_up=first)
     heroes = refresh_hero_variants(conn, store_id, today)
     known_vids = {r[0] for r in conn.execute("SELECT DISTINCT variant_id FROM variants_daily WHERE store_id = ?", (store_id,))}
     counts = {"cart_probe": 0, "theme_inventory": 0, "ads_only": 0, "skipped": 0, "blocked": 0, "components": 0}
@@ -308,7 +328,15 @@ def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, toda
             record_reading(conn, store_id, today, vid, h["product_id"], None, "ads_only", "not tracked (previous decision)")
             counts["ads_only"] += 1
             continue
-        res = probe(base, vid, h.get("handle"))
+        res = do_probe(h)
+        if res["status"] == "throttled":
+            wait = min(max(res.get("retry_after") or config.INVENTORY_THROTTLE_WAIT, 30), 300)
+            log.info("%s: cart endpoint throttled (429); waiting %ds and retrying once", store_domain, wait)
+            sleep(wait)
+            res = do_probe(h)
+            if res["status"] == "throttled":
+                res["status"] = "blocked"
+                blocked_run = config.INVENTORY_MAX_BLOCKED   # a second 429: stop for today
         source, stock, tracked = None, None, None
         if res["status"] in ("count", "sold_out"):
             source, stock, tracked = "cart_probe", res["stock"], 1

@@ -105,13 +105,6 @@ def cmd_run(args) -> int:
     ok, failed = run_products_pass(conn, stores, snapshot_date, only)
     console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
     rc = 1 if ok == 0 and failed else 0
-    if (config.META_ADS_ENABLED or args.ads) and not args.no_ads:
-        console.print("Meta Ad Library pass (META_ADS=1) ...")
-        try:
-            a_ok, a_failed = run_ads_pass(conn, stores, snapshot_date, only)
-            console.print(f"ads: [green]{a_ok} ok[/], [red]{a_failed} failed[/]")
-        except Exception as e:  # noqa: BLE001 - never let the ad pass break the daily run
-            console.print(f"[red]ads pass failed:[/] {e}")
     inv_stores = inventory_targets(stores, only, args.inventory)
     if inv_stores and not args.no_inventory:
         console.print(f"inventory probe pass ({len(inv_stores)} store(s), waits={config.INVENTORY_WAIT_MIN:.0f}-{config.INVENTORY_WAIT_MAX:.0f}s) ...")
@@ -119,6 +112,13 @@ def cmd_run(args) -> int:
             run_inventory_pass(conn, inv_stores, snapshot_date)
         except Exception as e:  # noqa: BLE001 - never let the probe break the daily run
             console.print(f"[red]inventory pass failed:[/] {e}")
+    if (config.META_ADS_ENABLED or args.ads) and not args.no_ads:
+        console.print("Meta Ad Library pass (META_ADS=1) ...")
+        try:
+            a_ok, a_failed = run_ads_pass(conn, stores, snapshot_date, only)
+            console.print(f"ads: [green]{a_ok} ok[/], [red]{a_failed} failed[/]")
+        except Exception as e:  # noqa: BLE001 - never let the ad pass break the daily run
+            console.print(f"[red]ads pass failed:[/] {e}")
     if config.SHEETS_WEBHOOK_URL and not args.no_sync:
         if args.watchlist:
             sheets.set_watchlist_path(Path(args.watchlist))

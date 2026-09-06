@@ -77,4 +77,5 @@ INVENTORY_WAIT_MIN = float(os.environ.get("INVENTORY_WAIT_MIN", "5"))
 INVENTORY_WAIT_MAX = float(os.environ.get("INVENTORY_WAIT_MAX", "15"))
 INVENTORY_MAX_VARIANTS = int(os.environ.get("INVENTORY_MAX_VARIANTS", "40"))   # per store per day
 INVENTORY_PROBE_QTY = 9999
+INVENTORY_THROTTLE_WAIT = int(os.environ.get("INVENTORY_THROTTLE_WAIT", "90"))   # seconds to back off after a 429
 INVENTORY_MAX_BLOCKED = int(os.environ.get("INVENTORY_MAX_BLOCKED", "3"))   # consecutive blocks before giving up on a store for the day

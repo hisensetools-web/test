@@ -215,6 +215,25 @@ class ChainTests(unittest.TestCase):
         counts = inventory.probe_store(conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None, resolve=NORES)
         self.assertEqual((counts["cart_probe"], counts["blocked"]), (2, 3))
 
+    def test_throttle_waits_retry_after_then_retries_once(self):
+        ps = [prod(i, f"p-{i}", f"P {i}", days_ago=100, pos=i) for i in range(1, 4)]
+        sid = seed_store(self.conn, ps)
+        script = {10: [{"status": "throttled", "stock": None, "message": "429", "http": 429, "retry_after": 45},
+                       {"status": "count", "stock": 9, "message": "", "http": 422}],
+                  20: [{"status": "count", "stock": 4, "message": "", "http": 422}],
+                  30: [{"status": "throttled", "stock": None, "message": "429", "http": 429, "retry_after": None},
+                       {"status": "throttled", "stock": None, "message": "429", "http": 429, "retry_after": None}]}
+        slept = []
+
+        def probe(base, vid, handle=None):
+            return dict(script[vid].pop(0))
+        counts = inventory.probe_store(self.conn, sid, "shop.example.com", TODAY, probe=probe, page_fetch=lambda b, h: "",
+                                       pause=lambda: None, resolve=NORES, sleep=slept.append)
+        self.assertEqual(slept, [45, config.INVENTORY_THROTTLE_WAIT])
+        self.assertEqual((counts["cart_probe"], counts["blocked"]), (2, 1))
+        r = self.conn.execute("SELECT stock_level FROM inventory_daily WHERE variant_id = 10").fetchone()
+        self.assertEqual(r[0], 9)
+
     def test_bundle_components_are_probed(self):
         ps = [prod(1, "cinnamon", "Ceylon Cinnamon", days_ago=100, pos=1),
               prod(2, "oregano", "Oregano Oil", days_ago=100, pos=2),
@@ -352,6 +371,34 @@ class ProbeHttpTests(unittest.TestCase):
         vid = self._vid("theme")
         html = inventory.fetch_product_page(self.base, self.stock[vid]["handle"])
         self.assertEqual(inventory.theme_inventory_from_html(html, vid), self.stock[vid]["stock"])
+
+    def test_throttled_status_and_one_session_per_store(self):
+        from http.server import HTTPServer
+        import threading
+        from tests import mock_store
+        h = mock_store.make_handler(self.products, self.products, None, stock=self.stock, throttle_after=1)
+        srv = HTTPServer(("127.0.0.1", 0), h)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        try:
+            sess = inventory.fresh_session(base)
+            vid = self._vid("cart")
+            self.assertEqual(inventory.probe_variant(base, vid, session=sess)["status"], "count")
+            r = inventory.probe_variant(base, vid, session=sess)
+            self.assertEqual((r["status"], r["retry_after"]), ("throttled", 1))
+            self.assertIn("title=Throttled", r["message"])
+            # probe_store on a fresh DB: waits Retry-After and retries; the store still gets classified
+            conn = db.connect(":memory:")
+            sid = db.upsert_store(conn, base)
+            from earlyscale import shopify
+            products = shopify.normalise_products(self.products[:3])
+            db.write_product_snapshot(conn, sid, TODAY, products)
+            counts = inventory.probe_store(conn, sid, base, TODAY, pause=lambda: None, resolve=lambda d: base, sleep=lambda s: None)
+            self.assertGreaterEqual(counts["cart_probe"] + counts["theme_inventory"] + counts["ads_only"], 1)
+            st = h.stats()
+            self.assertEqual(st["checkout_hits"], 0)
+        finally:
+            srv.shutdown()
 
     def test_blocked(self):
         from http.server import HTTPServer

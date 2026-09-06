@@ -166,7 +166,7 @@ def mutate(products: list[dict], seed: int, now: datetime) -> list[dict]:
 def make_handler(products: list[dict], collection: list[dict], delay_first_page_status: int | None,
                  require_browser: bool = False, redirect_to: str | None = None,
                  html_unless_json_accept: bool = False, stock: dict[int, dict] | None = None,
-                 cart_status: int | None = None):
+                 cart_status: int | None = None, throttle_after: int | None = None):
     state = {"first_products_call": True, "hits": 0, "cart_posts": 0, "cart_clears": 0, "checkout_hits": 0}
     stock = stock or {}
     by_handle = {p["handle"]: p for p in products}
@@ -309,6 +309,16 @@ def make_handler(products: list[dict], collection: list[dict], delay_first_page_
                 self.end_headers()
                 return
             state["cart_posts"] += 1
+            if throttle_after and state["cart_posts"] > throttle_after and state["cart_posts"] % 3 != 0:
+                # Shopify-style throttle page: HTML 429 with Retry-After; every third post gets through
+                html = b"<!DOCTYPE html><html><head><title>Throttled</title></head><body>Too many requests</body></html>"
+                self.send_response(429)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Retry-After", "1")
+                self.send_header("Content-Length", str(len(html)))
+                self.end_headers()
+                self.wfile.write(html)
+                return
             if cart_status:   # simulate a WAF / bot challenge on the cart endpoint
                 self._send_json(cart_status, {"error": "blocked"})
                 return
@@ -362,6 +372,8 @@ def main(argv=None):
                     help="301 every request to ORIGIN (simulates apex -> www redirect)")
     ap.add_argument("--day", type=int, default=None,
                     help="simulated day number for stock levels (default 1, or 2 with --mutate); stock falls daily")
+    ap.add_argument("--throttle-after", type=int, default=None, metavar="N",
+                    help="after N cart posts answer most of them with an HTML 429 + Retry-After: 1")
     ap.add_argument("--cart-status", type=int, default=None, metavar="STATUS",
                     help="answer every /cart/add.js with this status (e.g. 403) to test the blocked path")
     args = ap.parse_args(argv)
@@ -376,7 +388,8 @@ def main(argv=None):
     stock = stock_model(products, args.seed, day)
     srv = HTTPServer(("127.0.0.1", args.port), make_handler(products, collection, args.fail_first,
                                                              args.require_browser, args.redirect_to,
-                                                             args.html_unless_json_accept, stock, args.cart_status))
+                                                             args.html_unless_json_accept, stock, args.cart_status,
+                                                             args.throttle_after))
     print(f"mock store on http://127.0.0.1:{args.port} products={len(products)} seed={args.seed} mutate={args.mutate} day={day}")
     srv.serve_forever()
 
