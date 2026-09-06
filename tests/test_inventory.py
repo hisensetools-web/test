@@ -28,6 +28,9 @@ def prod(pid, handle, title, days_ago=100, pos=None, price=39.95, ptype=None, ta
                  "price": price, "compare_at_price": None, "available": available} for i in range(variants)]}
 
 
+NORES = lambda domain: "https://" + domain   # noqa: E731 - no network in unit tests
+
+
 def d(days_ago):
     return (date.fromisoformat(TODAY) - timedelta(days=days_ago)).isoformat()
 
@@ -161,7 +164,7 @@ class ChainTests(unittest.TestCase):
                           20: {"status": "sold_out", "stock": 0, "message": "sold out", "http": 422},
                           50: {"status": "blocked", "stock": None, "message": "HTTP 403", "http": 403}},
                          pages={"hero-c": '{"id": 30, "inventory_quantity": 12}', "hero-d": "<html>nothing</html>"})
-        counts = inventory.probe_store(self.conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None)
+        counts = inventory.probe_store(self.conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None, resolve=NORES)
         self.assertEqual({k: counts[k] for k in ("cart_probe", "theme_inventory", "ads_only", "blocked")},
                          {"cart_probe": 2, "theme_inventory": 1, "ads_only": 1, "blocked": 1})
         self.assertEqual(fake.page_calls, ["hero-c", "hero-d"])   # page only fetched when the cart probe was inconclusive
@@ -177,7 +180,7 @@ class ChainTests(unittest.TestCase):
         self.assertEqual(hv[50]["consecutive_failures"], 1)
         # same day again: nothing re-probed
         fake.calls.clear()
-        counts = inventory.probe_store(self.conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None)
+        counts = inventory.probe_store(self.conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None, resolve=NORES)
         self.assertEqual(fake.calls, [50])   # only the blocked one is retried
         self.assertEqual(counts["skipped"], 4)
         # next day: ads_only variant is not probed again, others are
@@ -185,12 +188,32 @@ class ChainTests(unittest.TestCase):
         db.write_product_snapshot(self.conn, sid, tomorrow, ps)
         fake.calls.clear()
         fake.answers[10]["stock"] = 40
-        inventory.probe_store(self.conn, sid, "shop.example.com", tomorrow, probe=fake.probe, page_fetch=fake.page, pause=lambda: None)
+        inventory.probe_store(self.conn, sid, "shop.example.com", tomorrow, probe=fake.probe, page_fetch=fake.page, pause=lambda: None, resolve=NORES)
         self.assertEqual(sorted(fake.calls), [10, 20, 30, 50])
         r = self.conn.execute("SELECT * FROM inventory_daily WHERE variant_id = 10 AND snapshot_date = ?", (tomorrow,)).fetchone()
         self.assertEqual((r["units_sold_1d"], r["prev_reading_date"]), (3, TODAY))
         r = self.conn.execute("SELECT signal_source FROM inventory_daily WHERE variant_id = 40 AND snapshot_date = ?", (tomorrow,)).fetchone()
         self.assertEqual(r["signal_source"], "ads_only")
+
+    def test_store_gives_up_after_consecutive_blocks(self):
+        ps = [prod(i, f"p-{i}", f"P {i}", days_ago=100, pos=i) for i in range(1, 11)]
+        sid = seed_store(self.conn, ps)
+        fake = FakeProbe({i * 10: {"status": "blocked", "stock": None, "message": "HTTP 430", "http": 430} for i in range(1, 11)})
+        counts = inventory.probe_store(self.conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None, resolve=NORES)
+        self.assertEqual(counts["blocked"], 10)
+        self.assertEqual(len(fake.calls), config.INVENTORY_MAX_BLOCKED)   # the rest were recorded without a request
+        msgs = [r[0] for r in self.conn.execute("SELECT raw_message FROM inventory_daily WHERE signal_source = 'blocked'")]
+        self.assertEqual(sum("not probed" in m for m in msgs), 10 - config.INVENTORY_MAX_BLOCKED)
+        # a success in between resets the streak
+        fake = FakeProbe({10: {"status": "blocked", "stock": None, "message": "x", "http": 430},
+                          20: {"status": "count", "stock": 5, "message": "", "http": 422},
+                          30: {"status": "blocked", "stock": None, "message": "x", "http": 430},
+                          40: {"status": "blocked", "stock": None, "message": "x", "http": 430},
+                          50: {"status": "count", "stock": 7, "message": "", "http": 422}})
+        conn = db.connect(":memory:")
+        sid = seed_store(conn, ps[:5])
+        counts = inventory.probe_store(conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None, resolve=NORES)
+        self.assertEqual((counts["cart_probe"], counts["blocked"]), (2, 3))
 
     def test_bundle_components_are_probed(self):
         ps = [prod(1, "cinnamon", "Ceylon Cinnamon", days_ago=100, pos=1),
@@ -200,7 +223,7 @@ class ChainTests(unittest.TestCase):
         fake = FakeProbe({10: {"status": "count", "stock": 50, "message": "", "http": 422},
                           20: {"status": "count", "stock": 60, "message": "", "http": 422}},
                          pages={"starter-bundle": '<div data-variant-id="10"></div><script>[{"variant_id": 20}]</script>'})
-        counts = inventory.probe_store(self.conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None)
+        counts = inventory.probe_store(self.conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None, resolve=NORES)
         self.assertEqual(counts["components"], 0)   # both components were already heroes (ranked 1 and 2)
         # bundle whose components are NOT heroes themselves
         ps2 = [prod(i, f"filler-{i}", f"Filler {i}", days_ago=100, pos=i) for i in range(1, 16)] + \
@@ -210,7 +233,7 @@ class ChainTests(unittest.TestCase):
         sid = seed_store(conn, ps2)
         fake = FakeProbe({310: {"status": "count", "stock": 77, "message": "", "http": 422}},
                          pages={"starter-bundle": '<div data-variant-id="310"></div>'})
-        counts = inventory.probe_store(conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None)
+        counts = inventory.probe_store(conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None, resolve=NORES)
         self.assertEqual(counts["components"], 1)
         self.assertIn(310, fake.calls)
         r = conn.execute("SELECT role, signal_source FROM hero_variants WHERE variant_id = 310").fetchone()

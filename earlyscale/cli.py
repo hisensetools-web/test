@@ -318,6 +318,68 @@ def _short(domain: str) -> str:
     return re.sub(r"^https?://", "", domain or "")
 
 
+def cmd_inventory_probe(args) -> int:
+    """One live probe with everything printed: the thing to paste when readings come back blocked."""
+    import requests as _rq
+    conn = db.connect(args.db)
+    domain = args.store
+    base = shopify.base_url(domain)
+    try:
+        base = shopify.resolve_base_url(shopify.make_session(), domain)
+    except shopify.StoreFetchError as e:
+        console.print(f"[yellow]host resolution failed:[/] {e}")
+    console.print(f"base url: {base}")
+    vid, handle = args.variant, args.handle
+    if not vid:
+        sid = db.upsert_store(conn, domain)
+        row = conn.execute("""SELECT variant_id, handle FROM hero_variants WHERE store_id = ? ORDER BY role = 'rank', handle LIMIT 1""",
+                           (sid,)).fetchone()
+        if row is None:
+            _, products = inventory.latest_products(conn, sid)
+            heroes = inventory.select_heroes(products, date.today())
+            if not heroes:
+                console.print("[red]no hero variant known for this store[/] - run `python tracker.py run --only <store>` first, or pass --variant ID")
+                return 2
+            vid, handle = heroes[0]["variant_id"], heroes[0]["handle"]
+        else:
+            vid, handle = row["variant_id"], row["handle"]
+    if not handle:
+        r = conn.execute("SELECT p.handle FROM variants_daily v JOIN products_daily p ON p.store_id = v.store_id AND p.snapshot_date = v.snapshot_date "
+                         "AND p.product_id = v.product_id WHERE v.variant_id = ? ORDER BY v.snapshot_date DESC LIMIT 1", (vid,)).fetchone()
+        handle = r["handle"] if r else None
+    console.print(f"variant: {vid}  handle: {handle}")
+    sess = inventory.fresh_session(base)
+    if handle:
+        try:
+            r0 = sess.get(f"{base}/products/{handle}", timeout=config.REQUEST_TIMEOUT,
+                          headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "X-Requested-With": None})
+            console.print(f"GET /products/{handle} -> HTTP {r0.status_code}, {len(r0.text)} bytes, cookies now: {sorted(sess.cookies.keys())[:8]}")
+            q = inventory.theme_inventory_from_html(r0.text, vid)
+            console.print(f"theme inventory_quantity for {vid}: {q}")
+        except _rq.RequestException as e:
+            console.print(f"[red]product page failed:[/] {e}")
+    payload = {"items": [{"id": int(vid), "quantity": config.INVENTORY_PROBE_QTY}]}
+    try:
+        r = sess.post(f"{base}/cart/add.js", json=payload, timeout=config.REQUEST_TIMEOUT, allow_redirects=False)
+    except _rq.RequestException as e:
+        console.print(f"[red]POST /cart/add.js failed:[/] {type(e).__name__}: {e}")
+        return 1
+    console.print(f"POST /cart/add.js -> HTTP {r.status_code}")
+    for k in ("server", "content-type", "location", "cf-mitigated", "cf-ray", "x-shopify-stage", "x-sorting-hat-shopid",
+              "x-request-id", "retry-after", "set-cookie"):
+        if r.headers.get(k):
+            console.print(f"  {k}: {r.headers[k][:160]}")
+    body = r.text or ""
+    console.print(f"body ({len(body)} bytes): {inventory._squash(body)[:600]}")
+    console.print(f"classified as: {inventory.probe_variant(base, vid, handle, session=sess, warm_up=False)['status']}")
+    if r.status_code == 200:
+        try:
+            sess.post(f"{base}/cart/clear.js", timeout=config.REQUEST_TIMEOUT)
+        except _rq.RequestException:
+            pass
+    return 0
+
+
 def cmd_inventory_report(args) -> int:
     conn = db.connect(args.db)
     as_of = _parse_date(args.date) if args.date else conn.execute("SELECT MAX(snapshot_date) FROM inventory_daily").fetchone()[0]
@@ -810,6 +872,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="probe these store domains (overrides INVENTORY_STORES)")
     s.add_argument("--all", action="store_true", help="probe every watchlist store")
     s.set_defaults(fn=cmd_inventory)
+
+    s = sub.add_parser("inventory-probe", help="one live /cart/add.js probe with status, headers and body printed (diagnostics)")
+    s.add_argument("store", help="store domain")
+    s.add_argument("--variant", type=int, help="variant id (default: first hero variant of the store)")
+    s.add_argument("--handle", help="product handle for the Referer / product page")
+    s.set_defaults(fn=cmd_inventory_probe)
 
     s = sub.add_parser("inventory-report", help="raw stock_level readings per hero variant and per-store fallback-rung counts")
     s.add_argument("--date", help="as of this snapshot date (default: latest)")

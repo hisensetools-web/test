@@ -305,6 +305,12 @@ python tracker.py inventory --only a.com b.com   # probe specific stores regardl
 python tracker.py inventory-report [--store a.com] [--days 14] [--raw]
 ```
 
+`inventory-probe <store>` does one live probe and prints the HTTP status, the response
+headers that identify a bot wall (`cf-mitigated`, `x-shopify-stage`, redirects) and the body,
+so a store whose readings come back `blocked` can be diagnosed from one paste. After
+`INVENTORY_MAX_BLOCKED` (3) consecutive blocks the rest of that store's variants are recorded
+as blocked without another request, and the store is retried the next day.
+
 `inventory-report` shows, per store, how many hero variants landed on each rung of the
 chain, then one row per hero variant with the raw `stock_level` reading for every day
 (`ads` = not tracked, `blk` = blocked, `-` = no reading), and the inventory alerts.

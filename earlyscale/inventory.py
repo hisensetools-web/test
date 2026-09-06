@@ -128,13 +128,25 @@ def fresh_session(base_url: str) -> requests.Session:
     return s
 
 
+def _diag_headers(r: requests.Response) -> str:
+    keys = ("server", "cf-mitigated", "cf-ray", "x-shopify-stage", "x-sorting-hat-shopid", "location", "content-type", "retry-after")
+    return " ".join(f"{k}={r.headers[k][:60]}" for k in keys if r.headers.get(k))
+
+
 def probe_variant(base_url: str, variant_id: int, handle: str | None = None,
-                  session: requests.Session | None = None) -> dict:
+                  session: requests.Session | None = None, warm_up: bool = True) -> dict:
     """One /cart/add.js probe. Returns {status, stock, message, http}.
     status: count | sold_out | untracked | not_found | blocked | error | unknown"""
     s = session or fresh_session(base_url)
     if handle:
         s.headers["Referer"] = f"{base_url}/products/{handle}"
+        if warm_up:
+            # behave like a shopper: open the product page first so the session carries the storefront cookies
+            try:
+                s.get(f"{base_url}/products/{handle}", timeout=config.REQUEST_TIMEOUT,
+                      headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "X-Requested-With": None})
+            except requests.RequestException:
+                pass
     url = f"{base_url}/cart/add.js"
     try:
         r = s.post(url, json={"items": [{"id": int(variant_id), "quantity": config.INVENTORY_PROBE_QTY}]},
@@ -142,6 +154,7 @@ def probe_variant(base_url: str, variant_id: int, handle: str | None = None,
     except requests.RequestException as e:
         return {"status": "error", "stock": None, "message": f"{type(e).__name__}: {e}"[:200], "http": None}
     text = r.text or ""
+    hdr = _diag_headers(r)
     if r.status_code == 200:
         # add succeeded: inventory is not tracked (or "continue selling when out of stock"); drop the cart
         try:
@@ -158,12 +171,21 @@ def probe_variant(base_url: str, variant_id: int, handle: str | None = None,
             return {"status": "sold_out", "stock": 0, "message": msg, "http": 422}
         return {"status": "unknown", "stock": None, "message": msg, "http": 422}
     if r.status_code == 404:
-        return {"status": "not_found", "stock": None, "message": text[:200], "http": 404}
-    if r.status_code in (401, 403, 429, 430, 503) or "captcha" in text.lower():
-        return {"status": "blocked", "stock": None, "message": f"HTTP {r.status_code} {text[:120]}", "http": r.status_code}
+        return {"status": "not_found", "stock": None, "message": f"HTTP 404 {text[:120]} | {hdr}", "http": 404}
+    if r.status_code in (401, 403, 429, 430, 503) or "captcha" in text.lower() or "challenge" in text.lower():
+        return {"status": "blocked", "stock": None, "message": f"HTTP {r.status_code} {_squash(text)[:120]} | {hdr}", "http": r.status_code}
     if 300 <= r.status_code < 400:
-        return {"status": "blocked", "stock": None, "message": f"redirect to {r.headers.get('Location', '')[:120]}", "http": r.status_code}
-    return {"status": "error", "stock": None, "message": f"HTTP {r.status_code} {text[:120]}", "http": r.status_code}
+        return {"status": "blocked", "stock": None, "message": f"HTTP {r.status_code} redirect | {hdr}", "http": r.status_code}
+    return {"status": "error", "stock": None, "message": f"HTTP {r.status_code} {_squash(text)[:120]} | {hdr}", "http": r.status_code}
+
+
+def _squash(text: str) -> str:
+    """HTML body -> its title/first words, so a raw_message stays readable."""
+    if "<" in text[:200]:
+        m = re.search(r"<title[^>]*>(.*?)</title>", text, re.S | re.I)
+        body = re.sub(r"<[^>]+>", " ", text)
+        return ("title=" + m.group(1).strip() + " " if m else "") + re.sub(r"\s+", " ", body).strip()
+    return re.sub(r"\s+", " ", text).strip()
 
 
 INV_NEAR_ID_RE_TMPL = r'"id"\s*:\s*{vid}\b.{{0,2500}}?"inventory_quantity"\s*:\s*(-?\d+)'
@@ -244,16 +266,27 @@ def record_reading(conn: sqlite3.Connection, store_id: int, today: str, variant_
         (today, store_id, variant_id, product_id, stock, source, (message or "")[:300], _utcnow()))
 
 
+def _resolve(store_domain: str) -> str:
+    """Origin that actually serves the store (apex -> www etc.), falling back to the literal domain."""
+    try:
+        return shopify.resolve_base_url(shopify.make_session(), store_domain)
+    except shopify.StoreFetchError as e:
+        base = shopify.base_url(store_domain)
+        log.warning("%s: could not resolve host (%s); probing %s", store_domain, e, base)
+        return base
+
+
 def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, today: str,
-                probe=probe_variant, page_fetch=fetch_product_page, pause=_pause) -> dict:
+                probe=probe_variant, page_fetch=fetch_product_page, pause=_pause, resolve=_resolve) -> dict:
     """Walk the fallback chain for every hero variant of one store that has not been probed today."""
-    base = shopify.base_url(store_domain)
+    base = resolve(store_domain)
     heroes = refresh_hero_variants(conn, store_id, today)
     known_vids = {r[0] for r in conn.execute("SELECT DISTINCT variant_id FROM variants_daily WHERE store_id = ?", (store_id,))}
     counts = {"cart_probe": 0, "theme_inventory": 0, "ads_only": 0, "skipped": 0, "blocked": 0, "components": 0}
     state = {r["variant_id"]: dict(r) for r in conn.execute("SELECT * FROM hero_variants WHERE store_id = ?", (store_id,))}
     todo = [h for h in heroes]
     seen = set()
+    blocked_run = 0
     while todo:
         h = todo.pop(0)
         vid = h["variant_id"]
@@ -263,6 +296,12 @@ def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, toda
         st = state.get(vid, {})
         if st.get("last_probe_date") == today:
             counts["skipped"] += 1
+            continue
+        if blocked_run >= config.INVENTORY_MAX_BLOCKED:
+            # the store is refusing cart probes today; do not hammer it, record the rest as blocked
+            record_reading(conn, store_id, today, vid, h["product_id"], None, "blocked",
+                           f"not probed: {blocked_run} consecutive blocks on this store today")
+            counts["blocked"] += 1
             continue
         if st.get("inventory_tracked") == 0:
             # ads_only: decided earlier, do not probe again
@@ -275,6 +314,7 @@ def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, toda
             source, stock, tracked = "cart_probe", res["stock"], 1
         elif res["status"] == "blocked":
             counts["blocked"] += 1
+            blocked_run += 1
             conn.execute("UPDATE hero_variants SET consecutive_failures = COALESCE(consecutive_failures, 0) + 1, note = ? WHERE store_id = ? AND variant_id = ?",
                          (res["message"], store_id, vid))
             record_reading(conn, store_id, today, vid, h["product_id"], None, "blocked", res["message"])
@@ -306,6 +346,7 @@ def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, toda
                                             VALUES (?,?,?,?,?,?,?,0,?)""", (store_id, cvid, row["product_id"], row["handle"], row["title"], row["price"], "bundle_component", today))
                             todo.append({"variant_id": cvid, "product_id": row["product_id"], "handle": row["handle"], "bundle_like": False})
                             counts["components"] += 1
+        blocked_run = 0
         record_reading(conn, store_id, today, vid, h["product_id"], stock, source, res["message"])
         conn.execute("""UPDATE hero_variants SET signal_source = ?, inventory_tracked = ?, last_probe_date = ?, consecutive_failures = 0,
                         note = ? WHERE store_id = ? AND variant_id = ?""",

@@ -398,7 +398,7 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
                      _short(url), len(nodes), int(config.META_WAIT_MIN), int(config.META_WAIT_MAX), max_scrolls)
             for i in range(max_scrolls):
                 before = len(nodes)
-                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                page.evaluate("() => window.scrollTo(0, (document.scrollingElement || document.body || document.documentElement || {scrollHeight: 100000}).scrollHeight)")
                 result.scrolls += 1
                 _wait()
                 if (i + 1) % 5 == 0:
