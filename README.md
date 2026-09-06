@@ -54,6 +54,73 @@ a missed day doesn't break the comparison. With one day of history the 2-day col
 sold-out / restocked products (with `(ALL)` when every variant is gone), price changes and
 removed handles, ordered by store score.
 
+## Google Sheets sync
+
+Pushes the latest snapshot and the report numbers into a Google Sheet through a Google
+Apps Script **web app**. No Google Cloud project, no service account, no API keys: you paste
+one file into the Apps Script editor and copy one URL back. The code you paste is
+[`sheets/Code.gs`](sheets/Code.gs).
+
+### One-time setup (about 5 minutes)
+
+1. **Create the spreadsheet.** Go to <https://sheets.new>, name it e.g. *Shopify Tracker*.
+2. **Open the script editor from inside that sheet.** Menu *Extensions* > *Apps Script*.
+   A new tab opens with a file called `Code.gs` containing an empty `myFunction`.
+3. **Replace its contents.** Select everything in the editor (Ctrl+A), delete it, then
+   paste the entire contents of `sheets/Code.gs` from this repo. Click the disk icon
+   (or Ctrl+S) to save. Don't run anything.
+4. **Deploy it as a web app.** Click the blue **Deploy** button (top right) > **New
+   deployment**. Click the gear next to *Select type* and choose **Web app**. Fill in:
+   - Description: anything, e.g. `tracker`
+   - **Execute as: Me**
+   - **Who has access: Anyone**  (this is what lets the tracker POST without logging in)
+
+   Click **Deploy**. Google asks you to authorise: pick your account, click *Advanced* >
+   *Go to ... (unsafe)* if it warns the app is unverified (it is your own script), then *Allow*.
+5. **Copy the Web app URL.** It ends in `/exec`. Click *Copy*, then *Done*.
+6. **Put the URL in `.env`.** In the project folder copy `.env.example` to `.env` if you
+   have not already, and set:
+
+   ```
+   SHEETS_WEBHOOK_URL=https://script.google.com/macros/s/AKfy.../exec
+   ```
+
+   `.env` is listed in `.gitignore`, so the URL never reaches GitHub. Anyone who has the
+   URL can write to your sheet, so treat it like a password.
+
+### Test it
+
+```bash
+python tracker.py sync-sheets --dry-run     # shows what would be sent, sends nothing
+python tracker.py sync-sheets               # sends it
+```
+
+Open the /exec URL in a browser: it should show the word `ok`. After a sync the sheet has
+three tabs, each with a bold frozen header row:
+
+| tab | rows | behaviour |
+|---|---|---|
+| **Stores** | one per store | fully overwritten every sync, sorted by change score |
+| **Products** | one per product per snapshot date | appended; duplicates (same date + store + handle) are skipped, so syncing twice is safe |
+| **Alerts** | one per alert (build step 5) | appended; duplicates (date + store + handle + rule) skipped |
+
+From then on `python tracker.py run` syncs automatically at the end whenever
+`SHEETS_WEBHOOK_URL` is set (use `--no-sync` to skip). `run_daily.bat` needs no change: the
+tracker reads `.env` itself. Exit code 3 means the run succeeded but the sync failed.
+
+### If something goes wrong
+
+- **"Apps Script returned a web page instead of JSON"** - the deployment is not set to
+  *Anyone*, or you pasted the wrong URL (it must be the `/exec` one).
+- **You edited Code.gs and nothing changed** - a web app serves the *deployed version*.
+  Deploy > *Manage deployments* > pencil icon > Version: *New version* > Deploy.
+- **"unknown tab"** or another Apps Script error - the message comes straight from the
+  script; check the paste was complete.
+- **Sheet getting big** - Products grows by (products across all stores) rows per day.
+  Google Sheets caps a file at 10 million cells (about 1 million Products rows). Delete
+  old rows from the Products tab when needed; the SQLite database keeps full history.
+- Advanced: `SHEETS_CHUNK_BYTES` (default 40000) sets the payload size per POST.
+
 ## Scheduling (Windows)
 
 `run_daily.bat` probes, in order, `.venv\Scripts\python.exe`, `py -3`, `python` and `python3`,
@@ -97,6 +164,7 @@ Linux/macOS cron equivalent (06:00 daily):
 ```bash
 python tracker.py add-store somestore.com            # tries to find facebook.com/<page> in the storefront HTML
 python tracker.py add-store somestore.com --meta-page SomeStore --notes "found via ad"
+python tracker.py remove-store bad1.com bad2.com     # drops them from watchlist.csv, keeps DB history
 ```
 
 ## What gets stored (`data/tracker.db`)
@@ -187,11 +255,13 @@ python tracker.py report
 tracker.py              CLI entry point
 run_daily.bat           Windows daily runner (logs to logs\run_YYYY-MM-DD.log)
 register_task.ps1       registers run_daily.bat in Task Scheduler (06:00 daily)
-earlyscale/cli.py       commands: init-db, add-store, run, report, product, status
+earlyscale/cli.py       commands: init-db, add-store, remove-store, run, sync-sheets, report, product, status
+earlyscale/sheets.py    Google Sheets sync client (rows from SQLite, chunking, 302 + retry handling)
+sheets/Code.gs          Apps Script web app to paste into the Sheet's script editor
 earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + pure normaliser + Meta page discovery
 earlyscale/deltas.py    pure delta calculations (7d counts, sold-out/price/handle deltas) + DB loaders
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O
 earlyscale/config.py    paths, .env loader, tunables
-tests/                  unit tests, fixture JSON, mock store server
+tests/                  unit tests, fixture JSON, mock store server, fake Apps Script runtime (Node)
 ```

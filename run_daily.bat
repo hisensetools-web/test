@@ -1,6 +1,8 @@
 @echo off
 REM Daily tracker run. Registered in Task Scheduler by register_task.ps1.
 REM Appends stdout+stderr to logs\run_YYYY-MM-DD.log.
+REM tracker.py reads .env itself, so if SHEETS_WEBHOOK_URL is set there the run ends with a
+REM Google Sheets sync automatically (exit code 3 = run fine, sync failed).
 setlocal
 cd /d "%~dp0"
 if not exist logs mkdir logs

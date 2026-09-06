@@ -47,3 +47,20 @@ def append_to_watchlist(entry: dict, path: Path | None = None) -> bool:
             w.writeheader()
         w.writerow(entry)
     return True
+
+
+def remove_from_watchlist(domains: list[str], path: Path | None = None) -> tuple[list[str], list[str]]:
+    """Drop the given domains from watchlist.csv. Returns (removed, not_found)."""
+    path = path or config.WATCHLIST_PATH
+    targets = {normalise_domain(d) for d in domains}
+    rows = read_watchlist(path)
+    keep = [r for r in rows if r["store_domain"] not in targets]
+    present = {r["store_domain"] for r in rows}
+    removed = sorted(t for t in targets if t in present)
+    missing = sorted(t for t in targets if t not in present)
+    if removed:
+        with path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=COLUMNS)
+            w.writeheader()
+            w.writerows(keep)
+    return removed, missing

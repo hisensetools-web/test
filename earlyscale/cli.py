@@ -11,8 +11,8 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import config, db, deltas, shopify
-from .watchlist import append_to_watchlist, read_watchlist
+from . import config, db, deltas, sheets, shopify
+from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist
 
 console = Console()
 log = logging.getLogger("earlyscale")
@@ -103,7 +103,53 @@ def cmd_run(args) -> int:
     t0 = time.monotonic()
     ok, failed = run_products_pass(conn, stores, snapshot_date, only)
     console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
-    return 1 if ok == 0 and failed else 0
+    rc = 1 if ok == 0 and failed else 0
+    if config.SHEETS_WEBHOOK_URL and not args.no_sync:
+        console.print("syncing to Google Sheets (SHEETS_WEBHOOK_URL is set) ...")
+        if _do_sheets_sync(conn, as_of=snapshot_date) != 0:
+            rc = rc or 3
+    return rc
+
+
+def _do_sheets_sync(conn, tabs=sheets.TAB_ORDER, as_of=None, dry_run=False) -> int:
+    try:
+        summaries = sheets.sync(conn, config.SHEETS_WEBHOOK_URL, tabs=tabs, as_of=as_of, dry_run=dry_run)
+    except sheets.SheetsSyncError as e:
+        console.print(f"[red]sheets sync failed:[/] {e}")
+        return 3
+    t = Table(title="Google Sheets sync" + (" (dry run, nothing sent)" if dry_run else ""))
+    for c in ("tab", "rows", "chunks", "written", "skipped"):
+        t.add_column(c, justify="right" if c != "tab" else "left")
+    for x in summaries:
+        t.add_row(x["tab"], str(x["rows"]), str(x["chunks"]),
+                  "-" if dry_run else str(x["written"]), "-" if dry_run else str(x["skipped"]))
+    console.print(t)
+    return 0
+
+
+def cmd_sync_sheets(args) -> int:
+    if not config.SHEETS_WEBHOOK_URL and not args.dry_run:
+        console.print("[red]SHEETS_WEBHOOK_URL is not set.[/] Put your Apps Script /exec URL in .env "
+                      "(see README > Google Sheets sync), or use --dry-run to preview.")
+        return 2
+    conn = db.connect(args.db)
+    tabs = tuple(t.strip().lower() for t in args.tabs.split(",")) if args.tabs else sheets.TAB_ORDER
+    bad = [t for t in tabs if t not in sheets.TAB_ORDER]
+    if bad:
+        console.print(f"[red]unknown tab(s):[/] {', '.join(bad)} (choose from {', '.join(sheets.TAB_ORDER)})")
+        return 2
+    as_of = _parse_date(args.date) if args.date else None
+    return _do_sheets_sync(conn, tabs=tabs, as_of=as_of, dry_run=args.dry_run)
+
+
+def cmd_remove_store(args) -> int:
+    removed, missing = remove_from_watchlist(args.domains, Path(args.watchlist) if args.watchlist else None)
+    for d in removed:
+        console.print(f"[green]removed[/] {d}")
+    for d in missing:
+        console.print(f"[yellow]not in watchlist[/] {d}")
+    console.print(f"{len(removed)} removed, {len(missing)} not found. Snapshot history in the DB is kept.")
+    return 0 if removed or not missing else 1
 
 
 def cmd_status(args) -> int:
@@ -242,7 +288,19 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today); re-running a date replaces it")
     s.add_argument("--watchlist", help="alternate watchlist.csv path")
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
+    s.add_argument("--no-sync", action="store_true", help="skip the Google Sheets sync even if SHEETS_WEBHOOK_URL is set")
     s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("sync-sheets", help="push latest snapshot + deltas to Google Sheets via Apps Script")
+    s.add_argument("--date", help="sync the snapshot as of this date (default: latest)")
+    s.add_argument("--tabs", help="comma list from stores,products,alerts (default all)")
+    s.add_argument("--dry-run", action="store_true", help="build and size the chunks but send nothing")
+    s.set_defaults(fn=cmd_sync_sheets)
+
+    s = sub.add_parser("remove-store", help="remove one or more domains from watchlist.csv")
+    s.add_argument("domains", nargs="+")
+    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.set_defaults(fn=cmd_remove_store)
 
     s = sub.add_parser("report", help="stores sorted by how much changed, with product-level changes")
     s.add_argument("--date", help="report as of this snapshot date (default: latest)")
