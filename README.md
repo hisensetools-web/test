@@ -3,7 +3,7 @@
 Detects Shopify products in their first weeks of paid-social scaling by snapshotting
 leading signals daily and alerting on week-over-week deltas. Full spec: [CLAUDE.md](CLAUDE.md).
 
-**Status: build steps 1–2 of 6** — `products.json` fetcher, SQLite schema, daily snapshot,
+**Status: build steps 1–2 of 6, Sheets sync, Part B increment 1** — `products.json` fetcher, SQLite schema, daily snapshot,
 delta calculations and the `report` / `product` commands. Meta Ad Library (step 3),
 landing-URL join (4), alerts (5) and the full cron/README pass (6) are not built yet.
 
@@ -130,6 +130,58 @@ exist keep their data; new tabs are created on the next sync.
   Google Sheets caps a file at 10 million cells (about 1 million Products rows). Delete
   old rows from the Products tab when needed; the SQLite database keeps full history.
 - Advanced: `SHEETS_CHUNK_BYTES` (default 40000) sets the payload size per POST.
+
+## Meta Ad Library (Part B, increment 1: raw ads into SQLite)
+
+`python tracker.py ads` opens the public Ad Library in headless Chromium, one browser, one
+page at a time, with random 3-8 s pauses between scrolls and a rotating desktop
+User-Agent. Instead of scraping the obfuscated page markup it captures the GraphQL
+responses the page itself loads while scrolling; those carry structured ad records
+(archive id, page, start date, active flag, primary text, headline, landing URL,
+creative type and asset, EU reach). A recursive extractor finds ad records wherever Meta
+nests them, so wrapper changes don't break it. Expect to maintain this anyway.
+
+**Setup once**
+
+```bash
+pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+**Try one page first** (search is by `meta_page_name` from watchlist.csv when set,
+`meta_page_id` if you have it, else by store domain as a keyword search):
+
+```bash
+python tracker.py ads --only somestore.com          # add --headed to watch the browser
+python tracker.py ads-report --store somestore.com  # per-page status + raw ad rows
+```
+
+`ads-report` shows, per ad: id, page, start date, days running, active Y/N, creative
+type, headline, primary text, landing URL, fingerprint (hash of creative asset + text),
+EU reach. Send that table back before enabling more stores.
+
+**Tables:** `meta_ads` (one row per ad ever seen, first/last seen dates, texts, links,
+fingerprint), `meta_ads_daily` (one row per ad per day; an ad that stops appearing in the
+active search gets an `is_active = 0` row that day, which is how disappearance is
+tracked), `meta_page_runs` (status per page per run: ok / blocked / error).
+
+**Daily run:** the Shopify pass never depends on Meta. Set `META_ADS=1` in `.env` (or pass
+`--ads`) and `python tracker.py run` scrapes after the Shopify pass, before the Sheets
+sync; a blocked or failing page is logged in `meta_page_runs` and the run continues.
+If Meta serves a login wall the pass stops for the day rather than hammering it.
+
+**Known limits**
+
+- Reactions / comments / shares are not exposed by the Ad Library. The columns exist and
+  stay empty unless a payload happens to carry them; the engagement-based metrics in the
+  spec will need another source.
+- The GraphQL payload shape is based on the library's current responses and was verified
+  offline against a local stand-in (`tests/fake_ad_library.py`), not against Meta from the
+  build environment. The first real run is the real test.
+- Landing URL to product join, concepts, lineage, alerts and the Signals Meta columns are
+  increment 2.
+- If Playwright cannot download its browser, point `META_CHROMIUM_PATH` in `.env` at an
+  installed Chromium/Chrome binary.
 
 ## Scheduling (Windows)
 
@@ -270,8 +322,10 @@ earlyscale/sheets.py    Google Sheets sync client (rows from SQLite, chunking, 3
 sheets/Code.gs          Apps Script web app to paste into the Sheet's script editor
 earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + pure normaliser + Meta page discovery
 earlyscale/deltas.py    pure delta calculations (7d counts, sold-out/price/handle deltas) + DB loaders
+earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture), parser, SQLite recording
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O
 earlyscale/config.py    paths, .env loader, tunables
-tests/                  unit tests, fixture JSON, mock store server, fake Apps Script runtime (Node)
+tests/                  unit tests, fixture JSON, mock store server, fake Apps Script runtime (Node),
+                        fake Ad Library page for the browser loop
 ```

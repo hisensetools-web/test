@@ -11,7 +11,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import config, db, deltas, sheets, shopify
+from . import config, db, deltas, meta_ads, sheets, shopify
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist
 
 console = Console()
@@ -104,6 +104,13 @@ def cmd_run(args) -> int:
     ok, failed = run_products_pass(conn, stores, snapshot_date, only)
     console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
     rc = 1 if ok == 0 and failed else 0
+    if (config.META_ADS_ENABLED or args.ads) and not args.no_ads:
+        console.print("Meta Ad Library pass (META_ADS=1) ...")
+        try:
+            a_ok, a_failed = run_ads_pass(conn, stores, snapshot_date, only)
+            console.print(f"ads: [green]{a_ok} ok[/], [red]{a_failed} failed[/]")
+        except Exception as e:  # noqa: BLE001 - never let the ad pass break the daily run
+            console.print(f"[red]ads pass failed:[/] {e}")
     if config.SHEETS_WEBHOOK_URL and not args.no_sync:
         if args.watchlist:
             sheets.set_watchlist_path(Path(args.watchlist))
@@ -154,6 +161,114 @@ def cmd_remove_store(args) -> int:
         console.print(f"[yellow]not in watchlist[/] {d}")
     console.print(f"{len(removed)} removed, {len(missing)} not found. Snapshot history in the DB is kept.")
     return 0 if removed or not missing else 1
+
+
+def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | None = None,
+                 headless: bool = True, max_scrolls: int | None = None) -> tuple[int, int]:
+    """Scrape the Ad Library for every store (one browser, sequential). Returns (ok, failed).
+    A blocked or failing page is logged in meta_page_runs and never aborts the pass."""
+    from playwright.sync_api import sync_playwright
+    if only:
+        stores = [s for s in stores if s["store_domain"] in only]
+    ok = failed = 0
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=headless, **meta_ads.launch_kwargs())
+        try:
+            for i, s in enumerate(stores):
+                domain = s["store_domain"]
+                store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
+                conn.commit()
+                query = s.get("meta_page_name") or domain.split("//")[-1]
+                url = meta_ads.build_search_url(query=None if s.get("meta_page_id") else query,
+                                                page_id=s.get("meta_page_id") or None)
+                t0 = time.monotonic()
+                try:
+                    res = meta_ads.scrape_page(url, headless=headless, max_scrolls=max_scrolls, browser=browser)
+                    counts = meta_ads.record_scrape(conn, store_id, snapshot_date, res.ads, query)
+                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "ok", res.note, len(res.ads),
+                                             res.scrolls, time.monotonic() - t0)
+                    log.info("%-28s ads=%-4d new=%-4d disappeared=%-3d scrolls=%d responses=%d %.0fs  %s",
+                             domain, counts["total"], counts["new"], counts["disappeared"], res.scrolls,
+                             res.responses, time.monotonic() - t0, res.note)
+                    ok += 1
+                except meta_ads.MetaBlocked as e:
+                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "blocked", str(e), 0, 0,
+                                             time.monotonic() - t0)
+                    log.error("%-28s BLOCKED by Meta: %s (stopping this pass; try again later)", domain, e)
+                    failed += 1
+                    break
+                except Exception as e:  # noqa: BLE001 - by design
+                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "error", str(e), 0, 0,
+                                             time.monotonic() - t0)
+                    log.error("%-28s FAILED: %s", domain, e)
+                    failed += 1
+                if i < len(stores) - 1:
+                    meta_ads._wait()
+        finally:
+            browser.close()
+    return ok, failed
+
+
+def cmd_ads(args) -> int:
+    snapshot_date = _parse_date(args.date)
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    if not stores:
+        console.print("[red]watchlist is empty[/]")
+        return 2
+    conn = db.connect(args.db)
+    only = set(args.only) if args.only else None
+    n = len([s for s in stores if not only or s["store_domain"] in only])
+    console.print(f"ads: snapshot_date={snapshot_date} pages={n} waits={config.META_WAIT_MIN}-{config.META_WAIT_MAX}s "
+                  f"headless={not args.headed}")
+    t0 = time.monotonic()
+    ok, failed = run_ads_pass(conn, stores, snapshot_date, only, headless=not args.headed, max_scrolls=args.max_scrolls)
+    console.print(f"done in {time.monotonic() - t0:.0f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
+    return 1 if ok == 0 and failed else 0
+
+
+def cmd_ads_report(args) -> int:
+    conn = db.connect(args.db)
+    as_of = _parse_date(args.date) if args.date else (
+        conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily").fetchone()[0])
+    if not as_of:
+        console.print("[red]no ad snapshots yet[/] - run `python tracker.py ads --only <store>` first")
+        return 2
+    where, params = "", []
+    if args.store:
+        where, params = "AND s.store_domain = ?", [args.store]
+    t = Table(title=f"Ad Library pages (as of {as_of})")
+    for c in ("store", "query", "status", "ads", "active", "new today", "inactive today", "scrolls", "note"):
+        t.add_column(c)
+    for r in conn.execute(f"""
+        SELECT s.store_domain, r.query, r.status, r.ads_found, r.scrolls, r.detail,
+               (SELECT COUNT(*) FROM meta_ads_daily d WHERE d.store_id = s.id AND d.snapshot_date = ? AND d.is_active = 1) active,
+               (SELECT COUNT(*) FROM meta_ads a WHERE a.store_id = s.id AND a.first_seen_date = ?) new_today,
+               (SELECT COUNT(*) FROM meta_ads_daily d WHERE d.store_id = s.id AND d.snapshot_date = ? AND d.is_active = 0) gone
+        FROM meta_page_runs r JOIN stores s ON s.id = r.store_id
+        WHERE r.snapshot_date = ? {where} AND r.id = (SELECT MAX(id) FROM meta_page_runs r2 WHERE r2.store_id = r.store_id AND r2.snapshot_date = r.snapshot_date)
+        ORDER BY s.store_domain""", [as_of, as_of, as_of, as_of] + params):
+        colour = {"ok": "green", "blocked": "red", "error": "red"}.get(r["status"], "yellow")
+        t.add_row(r["store_domain"], r["query"] or "", f"[{colour}]{r['status']}[/]", str(r["ads_found"]),
+                  str(r["active"]), str(r["new_today"]), str(r["gone"]), str(r["scrolls"]), (r["detail"] or "")[:50])
+    console.print(t)
+
+    t = Table(title=f"raw ads (as of {as_of}, newest start first, limit {args.limit})")
+    for c in ("store", "ad id", "page", "start", "days", "act", "type", "headline", "primary text", "landing", "fp", "eu"):
+        t.add_column(c, overflow="fold")
+    rows = conn.execute(f"""
+        SELECT s.store_domain, a.ad_id, a.page_name, a.ad_start_date, a.first_seen_date, d.is_active, a.creative_type,
+               a.headline, a.primary_text, a.landing_url, a.fingerprint, d.eu_total_reach
+        FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id JOIN stores s ON s.id = d.store_id
+        WHERE d.snapshot_date = ? {where}
+        ORDER BY a.ad_start_date DESC, a.ad_id LIMIT ?""", [as_of] + params + [args.limit]).fetchall()
+    for r in rows:
+        dr = meta_ads.days_running(r["ad_start_date"], r["first_seen_date"], as_of)
+        t.add_row(r["store_domain"], r["ad_id"], r["page_name"] or "", r["ad_start_date"] or "?",
+                  "" if dr is None else str(dr), "[green]Y[/]" if r["is_active"] else "[red]N[/]",
+                  r["creative_type"] or "", (r["headline"] or "")[:40], (r["primary_text"] or "")[:70],
+                  (r["landing_url"] or "")[:60], r["fingerprint"] or "", "" if r["eu_total_reach"] is None else str(r["eu_total_reach"]))
+    console.print(t)
+    return 0
 
 
 def cmd_status(args) -> int:
@@ -293,7 +408,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--watchlist", help="alternate watchlist.csv path")
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
     s.add_argument("--no-sync", action="store_true", help="skip the Google Sheets sync even if SHEETS_WEBHOOK_URL is set")
+    s.add_argument("--ads", action="store_true", help="also scrape the Meta Ad Library (same as META_ADS=1 in .env)")
+    s.add_argument("--no-ads", action="store_true", help="skip the Meta pass even if META_ADS=1")
     s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("ads", help="scrape the Meta Ad Library for watchlist stores (Part B)")
+    s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today)")
+    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
+    s.add_argument("--headed", action="store_true", help="show the browser window (debugging)")
+    s.add_argument("--max-scrolls", type=int, help=f"scroll cap per page (default {config.META_MAX_SCROLLS})")
+    s.set_defaults(fn=cmd_ads)
+
+    s = sub.add_parser("ads-report", help="raw ad rows and per-page scrape status")
+    s.add_argument("--date", help="snapshot date (default: latest)")
+    s.add_argument("--store", help="one store domain")
+    s.add_argument("--limit", type=int, default=40)
+    s.set_defaults(fn=cmd_ads_report)
 
     s = sub.add_parser("sync-sheets", help="push latest snapshot + deltas to Google Sheets via Apps Script")
     s.add_argument("--date", help="sync the snapshot as of this date (default: latest)")

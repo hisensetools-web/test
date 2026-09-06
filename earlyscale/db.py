@@ -79,26 +79,61 @@ CREATE TABLE IF NOT EXISTS variants_daily (
     PRIMARY KEY (snapshot_date, store_id, variant_id)
 );
 
--- Populated from build step 3 onwards; created now so the schema is stable.
-CREATE TABLE IF NOT EXISTS ads_daily (
-    snapshot_date           TEXT NOT NULL,
-    store_id                INTEGER NOT NULL REFERENCES stores(id),
-    ad_id                   TEXT NOT NULL,
-    page_name               TEXT,
-    ad_delivery_start_time  TEXT,
-    ad_delivery_stop_time   TEXT,
-    eu_total_reach          INTEGER,
-    spend_lower             REAL,
-    spend_upper             REAL,
-    impressions_lower       INTEGER,
-    impressions_upper       INTEGER,
-    landing_url             TEXT,
-    product_handle          TEXT,           -- filled by the landing-URL join (step 4)
-    ad_snapshot_url         TEXT,
-    source                  TEXT NOT NULL,  -- api | scrape
-    raw_json                TEXT,
-    fetched_at              TEXT NOT NULL,
-    PRIMARY KEY (snapshot_date, store_id, ad_id)
+-- Meta Ad Library (Part B). One row per ad ever seen; texts/links refreshed on each sighting.
+CREATE TABLE IF NOT EXISTS meta_ads (
+    ad_id               TEXT PRIMARY KEY,   -- ad_archive_id
+    store_id            INTEGER NOT NULL REFERENCES stores(id),
+    page_id             TEXT,
+    page_name           TEXT,
+    ad_start_date       TEXT,               -- start date shown in the library (first_seen in the spec)
+    ad_end_date         TEXT,
+    first_seen_date     TEXT NOT NULL,      -- our first snapshot containing it
+    last_seen_date      TEXT NOT NULL,
+    primary_text        TEXT,
+    headline            TEXT,
+    landing_url         TEXT,
+    landing_domain      TEXT,
+    caption             TEXT,
+    cta                 TEXT,
+    creative_type       TEXT,               -- image | video | carousel | ...
+    asset_url           TEXT,
+    platforms           TEXT,
+    fingerprint         TEXT,               -- sha1(asset url sans query + text)[:16]
+    page_handle         TEXT,               -- /pages/<handle> advertorials (increment 2)
+    product_handle      TEXT,               -- resolved product (increment 2)
+    query               TEXT,
+    raw_json            TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_meta_ads_store ON meta_ads(store_id, last_seen_date);
+
+-- One row per ad per snapshot day. is_active=0 rows are written when a previously seen
+-- ad no longer appears in the active search (that is how disappearance is tracked).
+CREATE TABLE IF NOT EXISTS meta_ads_daily (
+    snapshot_date       TEXT NOT NULL,
+    ad_id               TEXT NOT NULL REFERENCES meta_ads(ad_id),
+    store_id            INTEGER NOT NULL REFERENCES stores(id),
+    is_active           INTEGER NOT NULL,
+    position            INTEGER,            -- order in the search results
+    eu_total_reach      INTEGER,
+    reactions           INTEGER,            -- Ad Library does not expose these; NULL unless present
+    comments            INTEGER,
+    shares              INTEGER,
+    collation_count     INTEGER,
+    fetched_at          TEXT NOT NULL,
+    PRIMARY KEY (snapshot_date, ad_id)
+);
+
+CREATE TABLE IF NOT EXISTS meta_page_runs (
+    id              INTEGER PRIMARY KEY,
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    snapshot_date   TEXT NOT NULL,
+    query           TEXT,
+    status          TEXT NOT NULL,          -- ok | blocked | error | skipped
+    detail          TEXT,
+    ads_found       INTEGER,
+    scrolls         INTEGER,
+    duration_s      REAL,
+    ran_at          TEXT NOT NULL
 );
 
 -- Populated from build step 5.
@@ -127,7 +162,17 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Small, idempotent schema fixes for databases created by earlier versions."""
+    # ads_daily was a placeholder from build step 1; Part B replaced it with meta_ads*.
+    if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ads_daily'").fetchone():
+        if conn.execute("SELECT COUNT(*) FROM ads_daily").fetchone()[0] == 0:
+            conn.execute("DROP TABLE ads_daily")
+            conn.commit()
 
 
 # ---------------------------------------------------------------- stores

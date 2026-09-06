@@ -54,3 +54,14 @@ BROWSER_HEADERS = {
 SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "").strip()
 SHEETS_CHUNK_BYTES = int(os.environ.get("SHEETS_CHUNK_BYTES", "40000"))
 SHEETS_TIMEOUT = (10, 90)  # Apps Script can take a while on big appends
+
+# Meta Ad Library scraper (Part B). META_ADS=1 in .env lets `run` call it after the Shopify pass.
+META_ADS_ENABLED = os.environ.get("META_ADS", "").strip() in ("1", "true", "yes")
+META_WAIT_MIN = float(os.environ.get("META_WAIT_MIN", "3"))
+META_WAIT_MAX = float(os.environ.get("META_WAIT_MAX", "8"))
+META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "40"))
+META_MAX_ADS = int(os.environ.get("META_MAX_ADS", "600"))
+META_NAV_TIMEOUT_MS = int(os.environ.get("META_NAV_TIMEOUT_MS", "45000"))
+META_CHROMIUM_PATH = os.environ.get("META_CHROMIUM_PATH", "").strip()  # optional explicit browser binary
+# Override only for offline testing against tests/fake_ad_library.py
+META_AD_LIBRARY_BASE = os.environ.get("META_AD_LIBRARY_BASE", "https://www.facebook.com/ads/library/")
