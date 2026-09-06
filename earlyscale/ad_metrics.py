@@ -103,16 +103,29 @@ def match_handle(candidate: str | None, known: set[str]) -> str | None:
 
 # ---------------------------------------------------------------- landing URL -> product (DB + network)
 
-def _known_handles(conn: sqlite3.Connection, store_id: int) -> tuple[set[str], dict[int, str]]:
-    latest = conn.execute("SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = ?", (store_id,)).fetchone()[0]
-    if not latest:
-        return set(), {}
-    handles = {r[0] for r in conn.execute(
-        "SELECT handle FROM products_daily WHERE store_id = ? AND snapshot_date = ?", (store_id, latest))}
-    v2h = {r["variant_id"]: r["handle"] for r in conn.execute(
-        """SELECT v.variant_id, p.handle FROM variants_daily v JOIN products_daily p
-           ON p.store_id = v.store_id AND p.snapshot_date = v.snapshot_date AND p.product_id = v.product_id
-           WHERE v.store_id = ? AND v.snapshot_date = ?""", (store_id, latest))}
+def _latest_listed_date(conn: sqlite3.Connection, store_id: int) -> str | None:
+    return conn.execute("SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = ? AND COALESCE(unlisted, 0) = 0",
+                        (store_id,)).fetchone()[0]
+
+
+def _known_handles(conn: sqlite3.Connection, store_id: int, today: str | None = None) -> tuple[set[str], dict[int, str]]:
+    """Handles we can resolve ads to: the latest listed catalogue plus any unlisted products
+    already recorded for `today` (or the latest day when today is not given)."""
+    listed_date = _latest_listed_date(conn, store_id)
+    unl_date = today or conn.execute("SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = ? AND unlisted = 1",
+                                     (store_id,)).fetchone()[0]
+    handles: set[str] = set()
+    v2h: dict[int, str] = {}
+    for d, flag in ((listed_date, 0), (unl_date, 1)):
+        if not d:
+            continue
+        handles.update(r[0] for r in conn.execute(
+            "SELECT handle FROM products_daily WHERE store_id = ? AND snapshot_date = ? AND COALESCE(unlisted, 0) = ?",
+            (store_id, d, flag)))
+        v2h.update({r["variant_id"]: r["handle"] for r in conn.execute(
+            """SELECT v.variant_id, p.handle FROM variants_daily v JOIN products_daily p
+               ON p.store_id = v.store_id AND p.snapshot_date = v.snapshot_date AND p.product_id = v.product_id
+               WHERE v.store_id = ? AND v.snapshot_date = ? AND COALESCE(p.unlisted, 0) = ?""", (store_id, d, flag))})
     return handles, v2h
 
 
@@ -384,12 +397,12 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
            WHERE a.store_id = ?""", (today, store_id))]
     if not ads:
         return {"ads": 0}
-    known, v2h = _known_handles(conn, store_id)
+    known, v2h = _known_handles(conn, store_id, today)
     cache: dict[str, dict] = {}
     unlisted = discover_unlisted_products(conn, store_id, store_domain, ads, known, session if fetch_landings else None,
                                           cache, today)
     if unlisted:
-        known, v2h = _known_handles(conn, store_id)
+        known, v2h = _known_handles(conn, store_id, today)
     resolved = 0
     for a in ads:
         r = resolve_landing(conn, store_id, store_domain, a, known, v2h, session if fetch_landings else None, cache, today)
