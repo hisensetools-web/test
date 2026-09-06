@@ -102,3 +102,43 @@ class DbTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListenerTests(unittest.TestCase):
+    def test_observer_posts_are_received_matched_and_not_refetched_without_permalink(self):
+        import tempfile, threading, urllib.request
+        from http.server import HTTPServer
+        tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+        tmp.close()
+        conn = db.connect(tmp.name)
+        sid = db.upsert_store(conn, "biorootlabs.com")
+        conn.execute("""INSERT INTO meta_ads (ad_id, store_id, page_id, page_name, ad_start_date, first_seen_date, last_seen_date, primary_text)
+                        VALUES ('1001', ?, '777', 'BioRoot', ?, ?, ?, 'Ceylon cinnamon softgels that actually work for blood sugar support, try them')""",
+                     (sid, d(20), d(1), TODAY))
+        conn.commit()
+        calls = []
+        srv = HTTPServer(("127.0.0.1", 0), fb_posts.make_listener(lambda: db.connect(tmp.name), lambda: TODAY, lambda *a: calls.append(a)))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        urlopen = opener.open
+        try:
+            body = json.dumps([
+                {"permalink": "https://www.facebook.com/777/posts/900?__cft__[0]=x", "page_name": "BioRoot",
+                 "primary_text": "Ceylon cinnamon softgels that actually work for blood sugar support, try them today", "reactions": "1.2K", "comments": 12},
+                {"post_id": "feed_abc", "page_name": "BioRoot", "primary_text": "no permalink yet", "url": "https://www.facebook.com/"},
+            ]).encode()
+            req = urllib.request.Request(f"http://127.0.0.1:{srv.server_address[1]}/capture", data=body, headers={"Content-Type": "application/json"})
+            with urlopen(req) as r:
+                self.assertEqual(json.loads(r.read()), {"received": 2, "new": 2, "matched": 1})
+            with urlopen(f"http://127.0.0.1:{srv.server_address[1]}/health") as r:
+                self.assertEqual(json.loads(r.read())["posts"], 2)
+        finally:
+            srv.shutdown()
+        self.assertEqual(calls, [(2, 2, 1)])
+        rows = {r["post_id"]: dict(r) for r in conn.execute("SELECT * FROM fb_posts")}
+        self.assertEqual(rows["900"]["ad_id"], "1001")
+        self.assertEqual(rows["feed_abc"]["permalink"], "feed://feed_abc")
+        self.assertEqual(conn.execute("SELECT reactions FROM meta_ads_daily WHERE ad_id = '1001' AND snapshot_date = ?", (TODAY,)).fetchone()[0], 1200)
+        # the daily refresh only opens real permalinks
+        c = fb_posts.refresh_engagement(conn, None, TODAY, fetch=lambda b, u: ({"reactions": 1}, "ok"), wait=lambda: None)
+        self.assertEqual(c["candidates"], 0)   # 900 already has today's counts (capture), feed_abc has no permalink

@@ -312,9 +312,25 @@ logged-in session is exactly what Meta's terms forbid and litigate). Instead:
    The ad row gets `post_id` / `post_permalink`, its `meta_ads_daily` row gets the counts, and
    `engagement_per_day` reaches the Signals tab through the existing product join (rule 5 sees it too).
 
+**Hands-free capture: the browser observer.** `tools/fb_observer/` is a small Chrome extension
+(Load unpacked at `chrome://extensions` with Developer mode on). It never scrolls, clicks or
+navigates: while *you* browse Facebook normally in that browser, it notices every Sponsored post
+Facebook renders, reads it off the page (page, permalink, copy, landing URL, visible counts) and
+sends it to `python tracker.py fb-listen` (a listener on 127.0.0.1:8765). If the listener is not
+running the captures wait in the extension and are sent the next time it is, or you export them
+from the extension popup and run `fb-capture --file captures.json`. From then on the daily run
+counts each permalink logged-out. `python tracker.py fb-bait` opens the watchlist stores' hero
+product pages in your default browser so you can add to cart by hand, which is what makes those
+brands' ads appear in your feed within a day or two.
+
 ```bash
+python tracker.py fb-listen        # leave running while you browse; Ctrl+C when done
+python tracker.py fb-bait          # open hero product pages to seed retargeting (add to cart yourself)
 python tracker.py fb-report        # captured posts, matches, count history
 ```
+
+Facebook's markup changes without notice; the observer's selectors are best-effort. The popup
+shows the last capture it made, which is the thing to paste when a field comes back empty.
 
 **Daily run:** with `META_ADS=1` the scheduled `run` now does: Shopify pass -> stock probe -> Ad
 Library search scrape -> single-ad pages (A) -> boosted-post counts -> captured-post counts (B)

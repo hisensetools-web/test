@@ -74,13 +74,17 @@ def parse_capture(obj: dict | str) -> dict:
     headline, landing_url, image_url, reactions, comments, shares}. Returns a normalised record."""
     if isinstance(obj, str):
         obj = {"permalink": obj}
-    url = obj.get("permalink") or obj.get("url") or ""
-    if not url:
+    url = obj.get("permalink") or ""
+    if not url and not obj.get("post_id"):
+        url = obj.get("url") or ""
+    if not url and not obj.get("post_id"):
         raise ValueError("capture has no permalink")
-    link = clean_permalink(url)
+    link = clean_permalink(url) if url else ""
     pid = obj.get("post_id") or post_id_from_url(link)
     if not pid:
         raise ValueError(f"cannot find a post id in {link}")
+    if not link:
+        link = f"feed://{pid}"   # observer saw the post but Facebook had not filled in its permalink yet
     counts = {}
     for k in ("reactions", "comments", "shares"):
         v = obj.get(k)
@@ -185,7 +189,7 @@ def refresh_engagement(conn: sqlite3.Connection, browser, today: str, max_posts:
     wait = wait or (lambda: meta_ads._wait(3, 7))
     rows = conn.execute(
         """SELECT p.post_id, p.permalink, p.status FROM fb_posts p
-           WHERE COALESCE(p.status, '') NOT IN ('removed', 'gated')
+           WHERE COALESCE(p.status, '') NOT IN ('removed', 'gated') AND p.permalink LIKE 'http%'
              AND NOT EXISTS (SELECT 1 FROM fb_posts_daily d WHERE d.post_id = p.post_id AND d.snapshot_date = ? AND d.status IN ('ok', 'capture'))
            ORDER BY p.captured_at""", (today,)).fetchall()
     counts = {"candidates": len(rows), "fetched": 0, "ok": 0, "gated": 0, "removed": 0, "no_counts": 0, "errors": 0}
@@ -283,3 +287,66 @@ def hash_image(url: str, session=None) -> str | None:
         return ad_detail._hash_url(url, session)["sha256"]
     except Exception:  # noqa: BLE001
         return None
+
+
+# ---------------------------------------------------------------- local listener for the browser observer
+
+def make_listener(conn_or_factory, today_fn, on_capture=None):
+    """HTTP handler: POST /capture with a JSON capture or array of captures (from tools/fb_observer),
+    GET /health. Bound to 127.0.0.1 only. `conn_or_factory` is a connection (single-threaded server)
+    or a zero-arg callable returning one (opened lazily in the serving thread)."""
+    from http.server import BaseHTTPRequestHandler
+    state = {"conn": None if callable(conn_or_factory) else conn_or_factory}
+
+    def get_conn():
+        if state["conn"] is None:
+            state["conn"] = conn_or_factory()
+        return state["conn"]
+
+    class H(BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def _send(self, status, body: dict):
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_OPTIONS(self):
+            self._send(204, {})
+
+        def do_GET(self):
+            n = get_conn().execute("SELECT COUNT(*) FROM fb_posts").fetchone()[0]
+            self._send(200, {"ok": True, "posts": n})
+
+        def do_POST(self):
+            if urlparse(self.path).path != "/capture":
+                return self._send(404, {"error": "not found"})
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n).decode("utf-8", "replace") if n else ""
+            try:
+                caps = parse_captures_text(body)
+            except ValueError as e:
+                return self._send(400, {"error": str(e)})
+            today = today_fn()
+            conn = get_conn()
+            new = 0
+            for c in caps:
+                try:
+                    if record_capture(conn, c, today, source="observer"):
+                        new += 1
+                except Exception as e:  # noqa: BLE001
+                    log.warning("capture %s failed: %s", c.get("post_id"), e)
+            matched = match_posts(conn)
+            propagate_to_ads(conn, today)
+            if on_capture:
+                on_capture(len(caps), new, matched)
+            self._send(200, {"received": len(caps), "new": new, "matched": matched})
+
+    return H

@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Early-Scaling Tracker: Sponsored post observer",
+  "version": "1.0",
+  "description": "Records Sponsored posts that Facebook renders while YOU browse. It never scrolls, clicks or navigates. Captures are sent to the local tracker (python tracker.py fb-listen) or exported as JSON.",
+  "permissions": ["storage", "alarms"],
+  "host_permissions": ["https://www.facebook.com/*", "https://web.facebook.com/*", "http://127.0.0.1:8765/*"],
+  "background": {"service_worker": "background.js"},
+  "content_scripts": [{"matches": ["https://www.facebook.com/*", "https://web.facebook.com/*"], "js": ["content.js"], "run_at": "document_idle"}],
+  "action": {"default_popup": "popup.html", "default_title": "Sponsored post observer"}
+}

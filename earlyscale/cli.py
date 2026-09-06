@@ -768,6 +768,66 @@ def cmd_fb_report(args) -> int:
     return _fb_report(conn, as_of, args.limit)
 
 
+def cmd_fb_listen(args) -> int:
+    """Receive captures from the browser observer extension (tools/fb_observer) on 127.0.0.1:8765."""
+    from http.server import HTTPServer
+    conn = db.connect(args.db)
+    stats = {"received": 0, "new": 0, "matched": 0}
+
+    def on_capture(n, new, matched):
+        stats["received"] += n
+        stats["new"] += new
+        stats["matched"] += matched
+        log.info("captures: +%d (%d new, %d matched) | total received %d, new %d", n, new, matched, stats["received"], stats["new"])
+    srv = HTTPServer(("127.0.0.1", args.port), fb_posts.make_listener(conn, lambda: date.today().isoformat(), on_capture))
+    console.print(f"listening on http://127.0.0.1:{args.port}/capture for the Sponsored post observer (Ctrl+C to stop). "
+                  f"Browse Facebook normally in the browser where the extension is installed.")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    console.print(f"received {stats['received']} capture(s), {stats['new']} new, {stats['matched']} matched to ads. Counts: `python tracker.py fb-engagement`")
+    return 0
+
+
+def cmd_fb_bait(args) -> int:
+    """Open each watchlist store's hero product page in YOUR default browser so you can add to cart by hand
+    (that is what makes the brands' ads appear in your feed). Nothing is automated on the store or on Facebook."""
+    import webbrowser
+    conn = db.connect(args.db)
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    only = set(args.only) if args.only else None
+    urls = []
+    for s in stores:
+        d = s["store_domain"]
+        if only and d not in only:
+            continue
+        sid = db.upsert_store(conn, d)
+        _, products = inventory.latest_products(conn, sid)
+        heroes = inventory.select_heroes(products, date.today(), max_variants=5)
+        base = shopify.base_url(d)
+        handles = []
+        for h in heroes:
+            if h["handle"] not in handles:
+                handles.append(h["handle"])
+        for h in handles[: args.per_store]:
+            urls.append(f"{base}/products/{h}")
+        if not handles:
+            urls.append(base)
+    console.print(f"{len(urls)} product page(s) across {len([u for u in urls])} tab(s):")
+    for u in urls:
+        console.print(f"  {u}")
+    if args.print_only:
+        return 0
+    for i, u in enumerate(urls):
+        webbrowser.open_new_tab(u)
+        if i < len(urls) - 1:
+            time.sleep(1.5)
+    console.print("Opened in your browser. On each page: look around for half a minute, add the product to cart, move on. "
+                  "Do not check out. Their ads usually reach your feed within 1-2 days.")
+    return 0
+
+
 def cmd_ads(args) -> int:
     snapshot_date = _parse_date(args.date)
     stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
@@ -1231,6 +1291,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--headed", action="store_true")
     s.add_argument("--limit", type=int, default=60)
     s.set_defaults(fn=cmd_fb_engagement)
+
+    s = sub.add_parser("fb-listen", help="receive captures from the browser observer extension (tools/fb_observer) on 127.0.0.1:8765")
+    s.add_argument("--port", type=int, default=8765)
+    s.set_defaults(fn=cmd_fb_listen)
+
+    s = sub.add_parser("fb-bait", help="open watchlist stores' hero product pages in your browser so you can add to cart by hand (seeds retargeting)")
+    s.add_argument("--watchlist"); s.add_argument("--only", nargs="+", metavar="DOMAIN")
+    s.add_argument("--per-store", type=int, default=1, help="product pages per store (default 1)")
+    s.add_argument("--print-only", action="store_true", help="list the URLs instead of opening them")
+    s.set_defaults(fn=cmd_fb_bait)
 
     s = sub.add_parser("fb-report", help="captured posts, matches and count history")
     s.add_argument("--date"); s.add_argument("--limit", type=int, default=60)
