@@ -55,7 +55,7 @@ var TABS = {
   },
   Alerts: {
     headers: ["date", "store", "handle", "rule", "detail", "created_at"],
-    keyCols: [0, 1, 2, 3],         // date + store + handle + rule
+    keyCols: [0, 1, 2, 3, 4],      // date + store + handle + rule + detail (several alerts can share a rule)
     textCols: [0, 1, 2, 4, 5],
     position: 5
   }

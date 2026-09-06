@@ -105,7 +105,7 @@ three tabs, each with a bold frozen header row:
 | **Categories** | one per keyword category | overwritten; categories are title unigrams/bigrams shared by 2+ stores (nothing hardcoded), with store/family counts and newest publish date. Families with no shared keyword fall into `(uncategorised)` |
 | **Stores** | one per store in watchlist.csv | fully overwritten every sync, sorted by change score |
 | **Products** | one per product per snapshot date | appended; duplicates (same date + store + handle) are skipped, so syncing twice is safe. Kept at the end of the tab bar with the two variant-count columns hidden |
-| **Alerts** | one per alert (build step 5) | appended; duplicates (date + store + handle + rule) skipped |
+| **Alerts** | one per alert | appended; duplicates (date + store + handle + rule + detail) skipped |
 
 From then on `python tracker.py run` syncs automatically at the end whenever
 `SHEETS_WEBHOOK_URL` is set (use `--no-sync` to skip). `run_daily.bat` needs no change: the
