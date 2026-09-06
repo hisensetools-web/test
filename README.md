@@ -404,7 +404,7 @@ with only 3.14 and no `py` launcher works, and the Microsoft Store `python` stub
 It then runs `tracker.py run` and appends stdout+stderr to `logs\run_YYYY-MM-DD.log`, with
 the chosen interpreter and version in the start line. If nothing qualifies it logs an error
 and exits with code 9009.
-Register it in Task Scheduler for 06:00 daily from PowerShell in the project folder:
+Register it in Task Scheduler (09:00 daily by default; `-Time HH:MM` for another time, re-run to change it) from PowerShell in the project folder:
 
 ```powershell
 .\register_task.ps1
@@ -413,7 +413,7 @@ Register it in Task Scheduler for 06:00 daily from PowerShell in the project fol
 which runs exactly:
 
 ```
-schtasks /Create /TN "ShopifyTracker Daily" /TR "\"C:\path\to\run_daily.bat\"" /SC DAILY /ST 06:00 /F
+schtasks /Create /TN "ShopifyTracker Daily" /TR "\"C:\path\to\run_daily.bat\"" /SC DAILY /ST 09:00 /F
 ```
 
 Verify / test / remove:
@@ -428,7 +428,7 @@ Without `/RU` and `/RP` the task only fires while you are logged on. To run when
 open the task's Properties in Task Scheduler and pick "Run whether user is logged on or not"
 (or re-register with `/RU <user> /RP <password>`).
 
-Linux/macOS cron equivalent (06:00 daily):
+Linux/macOS cron equivalent (09:00 daily):
 
 ```
 0 6 * * * cd /path/to/tracker && .venv/bin/python tracker.py run >> logs/run_$(date +\%F).log 2>&1
@@ -533,7 +533,7 @@ python tracker.py report
 ```
 tracker.py              CLI entry point
 run_daily.bat           Windows daily runner (logs to logs\run_YYYY-MM-DD.log)
-register_task.ps1       registers run_daily.bat in Task Scheduler (06:00 daily)
+register_task.ps1       registers run_daily.bat in Task Scheduler (09:00 daily, -Time to change)
 earlyscale/cli.py       commands: init-db, add-store, remove-store, run, sync-sheets, report, product, status
 earlyscale/sheets.py    Google Sheets sync client (rows from SQLite, chunking, 302 + retry handling)
 sheets/Code.gs          Apps Script web app to paste into the Sheet's script editor
