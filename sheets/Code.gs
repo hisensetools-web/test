@@ -50,9 +50,10 @@ var TABS = {
   },
   "Store Age": {
     headers: ["store", "shop_id", "myshopify", "store_created_est", "store_age_days", "method",
-              "lower calibration", "upper calibration", "products", "first snapshot", "id source", "error"],
+              "lower calibration", "upper calibration", "first_product_created", "products", "first snapshot",
+              "id source", "error"],
     keyCols: null,                 // newest store first; fully overwritten each sync
-    textCols: [0, 2, 3, 5, 6, 7, 9, 10, 11],
+    textCols: [0, 2, 3, 5, 6, 7, 8, 10, 11, 12],
     position: 5
   },
   Products: {

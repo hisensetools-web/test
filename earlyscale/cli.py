@@ -111,9 +111,9 @@ def _warn_missing_shop_ids(conn, stores: list[dict]) -> None:
     if missing:
         console.print(f"[yellow]{len(missing)} store(s) have no Shopify shop ID in their HTML - check by hand:[/] "
                       + ", ".join(f"{m['store_domain']} ({m['shop_id_error'] or '?'})" for m in missing))
-    cal = store_age.load_calibration()
+    cal = store_age.build_calibration(conn)
     if not cal.ok:
-        console.print(f"[yellow]store age needs calibration:[/] add at least 2 rows (shop_id,created_date) to {store_age.CALIBRATION_PATH}")
+        console.print("[yellow]store age needs at least 2 stores with a shop id and a product snapshot[/] (or rows in calibration/shop_ids.csv)")
 
 
 def cmd_run(args) -> int:
@@ -946,7 +946,7 @@ def cmd_shop_ids(args) -> int:
 def _store_age_table(conn, domains: set[str] | None, as_of: str | None = None) -> int:
     rows = store_age.store_age_rows(conn, as_of, store_domains=domains)
     t = Table(title="store age (newest first; created dates interpolated from calibration/shop_ids.csv)")
-    for c in ("store", "shop_id", "myshopify", "created (est)", "age days", "method", "lower calibration", "upper calibration", "products", "first snapshot", "id source", "error"):
+    for c in ("store", "shop_id", "myshopify", "created (est)", "age days", "method", "lower calibration", "upper calibration", "first product", "products", "first snapshot", "id source", "error"):
         t.add_column(c, justify="right" if c in ("shop_id", "age days", "products") else "left")
     for r in rows:
         t.add_row(*[str(x) for x in r])

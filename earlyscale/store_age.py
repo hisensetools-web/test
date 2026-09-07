@@ -102,10 +102,19 @@ def fetch_identity(store_domain: str, session: requests.Session | None = None) -
 class Calibration:
     points: list[tuple[int, date]]   # sorted by shop_id
     path: Path | None = None
+    manual_ids: set = None           # shop ids with a verified CSV row
+    auto_ids: set = None             # shop ids whose point came from a first product date
 
     @property
     def ok(self) -> bool:
         return len(self.points) >= 2
+
+    def kind(self, shop_id: int) -> str:
+        if self.manual_ids and shop_id in self.manual_ids:
+            return "verified"
+        if self.auto_ids and shop_id in self.auto_ids:
+            return "first product"
+        return ""
 
 
 def load_calibration(path: Path | None = None) -> Calibration:
@@ -125,6 +134,48 @@ def load_calibration(path: Path | None = None) -> Calibration:
     return Calibration(sorted(pts.items()), path)
 
 
+def first_product_dates(conn: sqlite3.Connection) -> dict[int, date]:
+    """{shop_id: earliest product created_at seen for that store}. A store exists before its first
+    product, so this is a 'no later than' date for the shop id."""
+    out: dict[int, date] = {}
+    for r in conn.execute("""SELECT s.shop_id, MIN(p.created_at) AS first FROM stores s JOIN products_daily p ON p.store_id = s.id
+                             WHERE s.shop_id IS NOT NULL AND p.created_at IS NOT NULL GROUP BY s.shop_id"""):
+        try:
+            out[int(r["shop_id"])] = date.fromisoformat(str(r["first"])[:10])
+        except ValueError:
+            continue
+    return out
+
+
+def lower_envelope(observations: dict[int, date]) -> list[tuple[int, date]]:
+    """Shop ids grow with creation date, so a store cannot be younger than any higher-id store.
+    Walking ids from high to low and keeping the running minimum date turns 'no later than'
+    observations (first product dates) into a monotone curve."""
+    pts = sorted(observations.items())
+    out: list[tuple[int, date]] = []
+    best: date | None = None
+    for sid, d in reversed(pts):
+        best = d if best is None or d < best else best
+        out.append((sid, best))
+    out.reverse()
+    return out
+
+
+def build_calibration(conn: sqlite3.Connection | None, path: Path | None = None) -> Calibration:
+    """Verified rows from the CSV plus automatic points from every store's first product date,
+    combined through the lower envelope. CSV rows are true dates, so they are exact for their own
+    store and bound everything below them."""
+    manual = load_calibration(path)
+    obs: dict[int, date] = {}
+    if conn is not None:
+        obs.update(first_product_dates(conn))
+    obs.update(dict(manual.points))     # verified rows win over the observation for the same id
+    cal = Calibration(lower_envelope(obs), manual.path)
+    cal.manual_ids = {sid for sid, _ in manual.points}
+    cal.auto_ids = set(obs) - cal.manual_ids
+    return cal
+
+
 def estimate_created(shop_id: int | None, cal: Calibration) -> dict:
     """{created: date|None, method, lower: (id, date)|None, upper: (id, date)|None}."""
     out = {"created": None, "method": None, "lower": None, "upper": None}
@@ -134,7 +185,9 @@ def estimate_created(shop_id: int | None, cal: Calibration) -> dict:
     pts = cal.points
     for sid, d in pts:
         if sid == shop_id:
-            return {"created": d, "method": "exact", "lower": (sid, d), "upper": (sid, d)}
+            k = cal.kind(sid)
+            method = {"verified": "verified row", "first product": "own first product (no later than)"}.get(k, "exact")
+            return {"created": d, "method": method, "lower": (sid, d), "upper": (sid, d)}
     if shop_id < pts[0][0]:
         (a_id, a_d), (b_id, b_d) = pts[0], pts[1]
         method = "extrapolated (below range)"
@@ -178,8 +231,8 @@ def ensure_identity(conn: sqlite3.Connection, store_id: int, store_domain: str, 
 
 
 def refresh_estimates(conn: sqlite3.Connection, cal: Calibration | None = None) -> dict:
-    """Recompute store_created_est for every store from the calibration table. Returns counts."""
-    cal = cal or load_calibration()
+    """Recompute store_created_est for every store from the calibration (CSV + first product dates)."""
+    cal = cal or build_calibration(conn)
     n = est = 0
     for r in conn.execute("SELECT id, shop_id FROM stores").fetchall():
         n += 1
@@ -211,21 +264,25 @@ def missing_ids(conn: sqlite3.Connection, store_domains: set[str] | None = None)
 def store_age_rows(conn: sqlite3.Connection, as_of: str | None = None, cal: Calibration | None = None,
                    store_domains: set[str] | None = None) -> list[list]:
     """Store Age tab: newest first. Columns match sheets.STORE_AGE_HEADERS."""
-    cal = cal or load_calibration()
+    cal = cal or build_calibration(conn)
+    firsts = first_product_dates(conn)
     rows = []
     for s in conn.execute("SELECT * FROM stores ORDER BY store_domain"):
         if store_domains is not None and s["store_domain"] not in store_domains:
             continue
         e = estimate_created(s["shop_id"], cal)
-        created = s["store_created_est"] or (e["created"].isoformat() if e["created"] else "")
+        created = e["created"].isoformat() if e["created"] else (s["store_created_est"] or "")
+        first = firsts.get(s["shop_id"]) if s["shop_id"] else None
         prods = conn.execute("SELECT COUNT(*) FROM products_daily WHERE store_id = ? AND snapshot_date = (SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = ?)",
                              (s["id"], s["id"])).fetchone()[0]
-        first = conn.execute("SELECT MIN(snapshot_date) FROM products_daily WHERE store_id = ?", (s["id"],)).fetchone()[0] or ""
+        first_snap = conn.execute("SELECT MIN(snapshot_date) FROM products_daily WHERE store_id = ?", (s["id"],)).fetchone()[0] or ""
+        def pt(x):
+            return "" if not x else f"{x[0]} = {x[1]} ({cal.kind(x[0]) or 'envelope'})"
         rows.append([
             s["store_domain"], "" if s["shop_id"] is None else s["shop_id"], s["myshopify"] or "", created,
-            "" if not created else age_days(created, as_of), s["store_created_method"] or e["method"] or "",
-            "" if not e["lower"] else f"{e['lower'][0]} = {e['lower'][1]}", "" if not e["upper"] else f"{e['upper'][0]} = {e['upper'][1]}",
-            prods, first, s["shop_id_source"] or "", s["shop_id_error"] or "",
+            "" if not created else age_days(created, as_of), e["method"] or "",
+            pt(e["lower"]), pt(e["upper"]), first.isoformat() if first else "",
+            prods, first_snap, s["shop_id_source"] or "", s["shop_id_error"] or "",
         ])
     rows.sort(key=lambda r: (0 if r[3] else 1, r[3] and -int(r[3].replace("-", "")) or 0, r[0]))
     return rows

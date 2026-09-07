@@ -26,7 +26,8 @@ STORES_HEADERS = ["store", "meta page", "last status", "products", "sold-out var
                   "shop_id", "myshopify", "store_created_est", "store_age_days",
                   "ads_active", "ads_to_products", "products_with_ads", "ads_not_attached (why)"]
 STORE_AGE_HEADERS = ["store", "shop_id", "myshopify", "store_created_est", "store_age_days", "method",
-                     "lower calibration", "upper calibration", "products", "first snapshot", "id source", "error"]
+                     "lower calibration", "upper calibration", "first_product_created", "products", "first snapshot",
+                     "id source", "error"]
 PRODUCTS_HEADERS = ["date", "store", "handle", "title", "published_at", "updated_at", "price",
                     "available variants", "total variants", "collection position"]
 ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]

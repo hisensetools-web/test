@@ -134,3 +134,43 @@ class DbTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutoCalibrationTests(unittest.TestCase):
+    def test_envelope_and_build(self):
+        obs = {30_000_000: date(2021, 6, 1), 40_000_000: date(2020, 5, 1),    # 40M store recreated its catalogue: date too late for 30M? no: 30M must be <= 2020-05-01
+               50_000_000: date(2022, 1, 1), 60_000_000: date(2023, 3, 1)}
+        env = store_age.lower_envelope(obs)
+        self.assertEqual(env, [(30_000_000, date(2020, 5, 1)), (40_000_000, date(2020, 5, 1)),
+                               (50_000_000, date(2022, 1, 1)), (60_000_000, date(2023, 3, 1))])
+
+    def test_build_from_db_with_optional_manual_rows(self):
+        conn = db.connect(":memory:")
+        from earlyscale import shopify
+        for dom, sid, first in (("a.com", 30_000_000, "2021-06-01"), ("b.com", 50_000_000, "2022-01-01"), ("c.com", 60_000_000, "2023-03-01")):
+            st = db.upsert_store(conn, dom)
+            conn.execute("UPDATE stores SET shop_id = ? WHERE id = ?", (sid, st))
+            db.write_product_snapshot(conn, st, "2026-09-07", [{"product_id": sid, "handle": "p", "title": "P", "vendor": "", "product_type": None,
+                "tags": [], "created_at": first + "T00:00:00Z", "published_at": first + "T00:00:00Z", "updated_at": first + "T00:00:00Z",
+                "variant_count": 1, "sold_out_variants": 0, "min_price": 1, "max_price": 1, "collection_position": None, "variants": []}])
+        conn.commit()
+        cal = store_age.build_calibration(conn, Path("/nonexistent.csv"))
+        self.assertTrue(cal.ok)
+        self.assertEqual(cal.kind(30_000_000), "first product")
+        e = store_age.estimate_created(40_000_000, cal)          # between a.com and b.com
+        self.assertEqual(e["method"], "interpolated")
+        self.assertLessEqual(abs((e["created"] - date(2021, 9, 15)).days), 2)
+        self.assertEqual(store_age.estimate_created(50_000_000, cal)["method"], "own first product (no later than)")
+        counts = store_age.refresh_estimates(conn)
+        self.assertEqual(counts["estimated"], 3)
+        rows = store_age.store_age_rows(conn, "2026-09-07")
+        self.assertEqual([r[0] for r in rows], ["c.com", "b.com", "a.com"])
+        self.assertEqual(rows[0][8], "2023-03-01")                # first_product_created column
+        # a verified row overrides the observation for its store and is labelled
+        with tempfile.NamedTemporaryFile("w", suffix=".csv", delete=False, newline="", encoding="utf-8") as f:
+            f.write("shop_id,created_date\n50000000,2021-11-15\n")
+            path = Path(f.name)
+        cal = store_age.build_calibration(conn, path)
+        self.assertEqual(cal.kind(50_000_000), "verified")
+        e = store_age.estimate_created(50_000_000, cal)
+        self.assertEqual((e["created"], e["method"]), (date(2021, 11, 15), "verified row"))

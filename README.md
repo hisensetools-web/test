@@ -291,12 +291,16 @@ source it came from, and retries only while the ID is missing. A store with no s
 HTML is named in a warning at the end of the run and in `shop-ids` / `store-age` output so you can
 check it by hand.
 
-**Calibration.** `calibration/shop_ids.csv` (`shop_id,created_date`, other columns ignored) holds
-stores whose creation date you verified, for example in the Koala Inspector extension. Five or
-six rows spread over a few years is enough. Every store's `store_created_est` is interpolated
-linearly between its two nearest calibration rows, or extrapolated with the end segment's slope
-outside the range; `store_age_days` is the distance to the report date. Estimates are recomputed on
-every run, so editing the CSV takes effect on the next run (or `python tracker.py store-age`).
+**Calibration is automatic.** A store exists before its first product, so every store's oldest
+`created_at` is a "no later than" date for its shop ID, and shop IDs grow with creation date. The
+tracker takes those observations from every store it snapshots, keeps the running minimum from
+the highest ID down (a store cannot be younger than a higher-ID store), and interpolates each
+store's `store_created_est` on that curve; `store_age_days` is the distance to the report date.
+Estimates therefore tighten as the watchlist grows. `calibration/shop_ids.csv`
+(`shop_id,created_date`) is optional: a verified row (for example from the Koala Inspector
+extension) is exact for its own store and bounds everything below it. The Store Age tab shows
+the two curve points behind every estimate and whether each came from a verified row or a first
+product date.
 
 ```bash
 python tracker.py shop-ids                # fetch ids for every watchlist store (once), show the table
