@@ -219,14 +219,12 @@ def store_signal_context(conn: sqlite3.Connection, store_id: int, store_domain: 
     rank_7d: dict[int, int | None] = {}
     if week_ago:
         rank_7d = {p["product_id"]: p["collection_position"] for p in load_store_products(conn, store_id, week_ago)}
-    from . import ad_metrics, inventory, store_age
+    from . import ad_metrics, inventory
     meta = ad_metrics.meta_for_signals(conn, store_id, today)
     inv = inventory.inventory_for_signals(conn, store_id, today)
-    srow = conn.execute("SELECT store_created_est FROM stores WHERE id = ?", (store_id,)).fetchone()
-    created = srow["store_created_est"] if srow else None
     return {"store_id": store_id, "store": store_domain, "date": today, "as_of": as_of_d,
             "products": products, "families": fam, "rank_7d": rank_7d, "rank_7d_date": week_ago, "meta": meta,
-            "inventory": inv, "store_created_est": created or "", "store_age_days": _blank(store_age.age_days(created, today))}
+            "inventory": inv}
 
 
 def _blank(v):
@@ -259,11 +257,11 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
             "" if days is None else days, p["published_at"] or "",
             "" if p["min_price"] is None else p["min_price"], sold_out,
             "" if rank is None else rank, rank_delta, fam_new_7d[fam[p["product_id"]]],
-            m.get("ads_pointing_here", ""), _blank(m.get("engagement_per_day")), _blank(m.get("days_running_max")),
+            m.get("ads_pointing_here", ""), m.get("ads_launched_7d", ""), m.get("ads_launched_prev_7d", ""), m.get("ad_velocity_wow", ""),
+            _blank(m.get("engagement_per_day")), _blank(m.get("days_running_max")),
             m.get("concept_status", ""), _blank(m.get("eu_reach_slope_7d")), _blank(m.get("comment_delta_1d")),
             iv.get("signal_source", ""), iv.get("inventory_tracked", ""), _blank(iv.get("stock_level")),
-            _blank(iv.get("units_sold_1d")), _blank(iv.get("units_per_day_7d")), _blank(iv.get("units_per_day_wow")),
-         ctx.get("store_created_est", ""), ctx.get("store_age_days", "")])
+            _blank(iv.get("units_sold_1d")), _blank(iv.get("units_per_day_7d")), _blank(iv.get("units_per_day_wow"))])
     return rows
 
 

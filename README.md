@@ -100,7 +100,7 @@ three tabs, each with a bold frozen header row:
 
 | tab | rows | behaviour |
 |---|---|---|
-| **Signals** | one per product (latest snapshot) | overwritten every sync; products under 30 days old first, by `units_per_day_wow` desc, then everything else by age. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then the Meta columns filled by Part B and the six inventory columns (`signal_source`, `inventory_tracked`, `stock_level`, `units_sold_1d`, `units_per_day_7d`, `units_per_day_wow`) filled by the stock probe |
+| **Signals** | one per product (latest snapshot) | overwritten every sync; sorted by `ads_launched_7d` desc, then `ads_pointing_here` desc, then youngest product first. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then the Meta columns (`ads_pointing_here`, `ads_launched_7d`, `ads_launched_prev_7d`, `ad_velocity_wow` = launches this week / last week, engagement, days running, concept status) and the six inventory columns (`signal_source`, `inventory_tracked`, `stock_level`, `units_sold_1d`, `units_per_day_7d`, `units_per_day_wow`) filled by the stock probe |
 | **Families** | one per product family per store | overwritten; a family = handles sharing a base name or normalised title. Handle count, newest/oldest published_at, launches in 7/14/30 days, best rank, handle list. Sorted by 7-day launches |
 | **Categories** | one per keyword category | overwritten; categories are title unigrams/bigrams shared by 2+ stores (nothing hardcoded), with store/family counts and newest publish date. Families with no shared keyword fall into `(uncategorised)` |
 | **Stores** | one per store in watchlist.csv | fully overwritten every sync, sorted by change score |
@@ -276,41 +276,6 @@ If Meta serves a login wall the pass stops for the day rather than hammering it.
   rule 6 compares against a week earlier, rule 7 needs an ad older than 20 days on record.
 - If Playwright cannot download its browser, point `META_CHROMIUM_PATH` in `.env` at an
   installed Chromium/Chrome binary.
-
-## Store age from the Shopify shop ID
-
-Shopify assigns shop IDs sequentially, so the number orders stores by creation date. Every
-storefront's HTML carries it, and it never changes:
-
-- `<meta name="shopify-digital-wallet" content="/SHOP_ID/digital_wallets/dialog">` (preferred)
-- `"shopId":SHOP_ID` in the analytics / Trekkie config or the `shopify-features` JSON (fallback)
-- `Shopify.shop = "handle.myshopify.com"` for the myshopify handle
-
-The daily run fetches the homepage once per store, stores `shop_id`, `myshopify` and which
-source it came from, and retries only while the ID is missing. A store with no shop ID in its
-HTML is named in a warning at the end of the run and in `shop-ids` / `store-age` output so you can
-check it by hand.
-
-**Calibration is automatic.** A store exists before its first product, so every store's oldest
-`created_at` is a "no later than" date for its shop ID, and shop IDs grow with creation date. The
-tracker takes those observations from every store it snapshots, keeps the running minimum from
-the highest ID down (a store cannot be younger than a higher-ID store), and interpolates each
-store's `store_created_est` on that curve; `store_age_days` is the distance to the report date.
-Estimates therefore tighten as the watchlist grows. `calibration/shop_ids.csv`
-(`shop_id,created_date`) is optional: a verified row (for example from the Koala Inspector
-extension) is exact for its own store and bounds everything below it. The Store Age tab shows
-the two curve points behind every estimate and whether each came from a verified row or a first
-product date.
-
-```bash
-python tracker.py shop-ids                # fetch ids for every watchlist store (once), show the table
-python tracker.py shop-ids --refresh      # re-fetch even if stored
-python tracker.py store-age               # stores newest first with method + calibration neighbours
-```
-
-Sheets: the Stores tab gains `shop_id, myshopify, store_created_est, store_age_days`, the Signals
-tab gains `store_created_est, store_age_days`, and a **Store Age** tab lists stores newest first
-with the method and the two calibration points each estimate came from.
 
 ## Meta layer part 2: delivery, page likes, creatives, and feed-post engagement
 
@@ -539,7 +504,7 @@ python tracker.py remove-store bad1.com bad2.com     # drops them from watchlist
 
 | table | one row per | notes |
 |---|---|---|
-| `stores` | store | domain, Meta page name/id, `shop_id`, `myshopify`, `store_created_est` (+ method) |
+| `stores` | store | domain + Meta page name/id |
 | `products_daily` | (day, store, product) | handle, title, type, tags (JSON), created/published/updated, variant_count, sold_out_variants, min/max price, `collection_position` (index in `/collections/all`, often best-selling order) |
 | `variants_daily` | (day, store, variant) | price, compare_at_price, available |
 | `runs`, `store_runs` | run / (run, store) | status, error text, products seen, pages, duration |
@@ -636,7 +601,6 @@ earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture), parse
 earlyscale/ad_metrics.py landing-URL join, concepts, lineage, daily ad metrics, alert rules 5-8, Signals join
 earlyscale/ad_detail.py  single-ad Ad Library pages: delivery (end_date), page likes, creative fingerprints, rule 12
 earlyscale/fb_posts.py   captured Sponsored posts, logged-out counts, join to ads
-earlyscale/store_age.py  Shopify shop id + myshopify from the storefront HTML, calibration interpolation, Store Age tab
 earlyscale/inventory.py  hero-variant selection, /cart/add.js stock probe + theme fallback, units-sold maths, alert rules 9-11
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O

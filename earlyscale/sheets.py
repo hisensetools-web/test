@@ -16,38 +16,36 @@ from urllib.parse import urljoin
 
 import requests
 
-from . import ad_metrics, config, deltas, signals, store_age
+from . import ad_metrics, config, deltas, signals
 from .watchlist import read_watchlist
 
 log = logging.getLogger("earlyscale.sheets")
 
 STORES_HEADERS = ["store", "meta page", "last status", "products", "sold-out variants", "new products 7d",
                   "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date",
-                  "shop_id", "myshopify", "store_created_est", "store_age_days",
-                  "ads_active", "ads_to_products", "products_with_ads", "ads_not_attached (why)"]
-STORE_AGE_HEADERS = ["store", "shop_id", "myshopify", "store_created_est", "store_age_days", "method",
-                     "lower calibration", "upper calibration", "first_product_created", "products", "first snapshot",
-                     "id source", "error"]
+                  "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow",
+                  "ads_to_products", "products_with_ads", "ads_not_attached (why)"]
 PRODUCTS_HEADERS = ["date", "store", "handle", "title", "published_at", "updated_at", "price",
                     "available variants", "total variants", "collection position"]
 ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 
 SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
                    "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
-                   "variants_of_family_published_7d", "ads_pointing_here", "engagement_per_day",
+                   "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d",
+                   "ad_velocity_wow", "engagement_per_day",
                    "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d",
                    "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d",
-                   "units_per_day_wow", "store_created_est", "store_age_days"]
+                   "units_per_day_wow"]
 FAMILIES_HEADERS = ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
                     "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"]
 CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "families published 7d",
                       "store list", "example families"]
 
-TAB_ORDER = ("signals", "families", "categories", "stores", "store_age", "products", "alerts")
+TAB_ORDER = ("signals", "families", "categories", "stores", "products", "alerts")
 TAB_NAMES = {"signals": "Signals", "families": "Families", "categories": "Categories",
-             "stores": "Stores", "store_age": "Store Age", "products": "Products", "alerts": "Alerts"}
+             "stores": "Stores", "products": "Products", "alerts": "Alerts"}
 TAB_MODES = {"signals": "replace", "families": "replace", "categories": "replace",
-             "stores": "replace", "store_age": "replace", "products": "replace", "alerts": "append"}
+             "stores": "replace", "products": "replace", "alerts": "append"}
 
 
 _watchlist_path = None   # set by set_watchlist_path(); None = default watchlist.csv
@@ -70,7 +68,7 @@ def watched_store_ids(conn: sqlite3.Connection) -> set[int] | None:
 
 def _stores(conn: sqlite3.Connection):
     keep = watched_store_ids(conn)
-    for s in conn.execute("SELECT id, store_domain, meta_page_name, shop_id, myshopify, store_created_est FROM stores ORDER BY store_domain"):
+    for s in conn.execute("SELECT id, store_domain, meta_page_name FROM stores ORDER BY store_domain"):
         if keep is None or s["id"] in keep:
             yield s
 
@@ -99,11 +97,13 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
         else:
             status = "error: " + (last["error"] or "")[:120]
         d = by_id.get(s["id"])
-        age = ["" if s["shop_id"] is None else s["shop_id"], s["myshopify"] or "", s["store_created_est"] or "",
-               _blank(store_age.age_days(s["store_created_est"], as_of))]
         b = ad_metrics.landing_breakdown(conn, s["id"], s["store_domain"], as_of)
-        age += [b["active"] if b["snapshot"] else "", b["to_products"] if b["snapshot"] else "",
-                b["products"] if b["snapshot"] else "", ad_metrics.breakdown_summary(b) if b["snapshot"] else ""]
+        if b["snapshot"]:
+            v = ad_metrics.ad_velocity(conn, s["id"], b["snapshot"])
+            age = [b["active"], v["new_ads_7d"], v["new_ads_prev_7d"], ad_metrics._wow_cell(v["ad_velocity_wow"]),
+                   b["to_products"], b["products"], ad_metrics.breakdown_summary(b)]
+        else:
+            age = ["", "", "", "", "", "", ""]
         if d is None:
             rows.append([s["store_domain"], s["meta_page_name"] or "", status, "", "", "", "", "", "", "", ""] + age)
             continue
@@ -120,10 +120,6 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
 
 def _blank(v):
     return "" if v is None else v
-
-
-def store_age_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
-    return store_age.store_age_rows(conn, as_of, store_domains={s["store_domain"] for s in _stores(conn)})
 
 
 def products_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
@@ -173,12 +169,14 @@ def _contexts(conn: sqlite3.Connection, as_of: str | None):
 
 def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     rows = [r for ctx in _contexts(conn, as_of) for r in signals.signals_rows_for_store(ctx)]
-    # products under 30 days old first, by units_per_day_wow desc (blank last); then everything else by age
+    # what we compare: ads launched this week (desc), then ads pointing here (desc), then youngest product first
+    il, ip, idays = SIGNALS_HEADERS.index("ads_launched_7d"), SIGNALS_HEADERS.index("ads_pointing_here"), SIGNALS_HEADERS.index("days_since_published")
+
     def key(r):
-        days = r[4] if r[4] != "" else 10**6
-        young = days < 30
-        wow = r[22] if r[22] != "" else None
-        return (0 if young else 1, -(wow if wow is not None else -1) if young else 0, days, r[0], r[2])
+        launched = r[il] if isinstance(r[il], int) else -1
+        pointing = r[ip] if isinstance(r[ip], int) else -1
+        days = r[idays] if r[idays] != "" else 10**6
+        return (-launched, -pointing, days, r[0], r[2])
     rows.sort(key=key)
     return rows
 
@@ -321,7 +319,7 @@ def verify(conn: sqlite3.Connection, url: str, as_of: str | None = None,
 
 def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = None) -> list[dict]:
     builders = {"signals": signals_rows, "families": families_rows, "categories": categories_rows,
-                "stores": stores_rows, "store_age": store_age_rows, "products": products_rows, "alerts": alerts_rows}
+                "stores": stores_rows, "products": products_rows, "alerts": alerts_rows}
     plan = []
     for tab in TAB_ORDER:
         if tab not in tabs:

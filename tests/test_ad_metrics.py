@@ -192,7 +192,9 @@ class ProcessStoreTests(unittest.TestCase):
         self.assertIn("2/2 concepts alive", sig["ceylon-cinnamon-google"]["concept_status"])
         self.assertEqual(sig["magnesium-glycinate"]["ads_pointing_here"], 1)      # ad 4 via advertorial
         rows = {r[2]: r for r in sheets.signals_rows(self.conn)}
-        self.assertEqual(rows["ceylon-cinnamon-google"][11:14], [3, "", 27])
+        H = sheets.SIGNALS_HEADERS
+        r = rows["ceylon-cinnamon-google"]
+        self.assertEqual([r[H.index("ads_pointing_here")], r[H.index("engagement_per_day")], r[H.index("days_running_max")]], [3, "", 27])
         self.assertEqual(rows["ceylon-cinnamon"][11], "")
         # markdown
         import tempfile
@@ -575,3 +577,50 @@ class LandingKindTests(unittest.TestCase):
         self.assertEqual(ad_metrics.breakdown_summary(b), "homepage 1, external 1, page-ignored 1")
         empty = ad_metrics.landing_breakdown(conn, db.upsert_store(conn, "none.com"), "none.com", "2026-09-07")
         self.assertIsNone(empty["snapshot"])
+
+
+class AdVelocityTests(unittest.TestCase):
+    """ads launched this week vs last (Meta start date), per store and per product; rule 2."""
+
+    def _seed(self, conn, sid, rows):
+        for aid, start, handle, active in rows:
+            conn.execute("""INSERT INTO meta_ads (ad_id, store_id, page_name, ad_start_date, first_seen_date, last_seen_date, product_handle)
+                            VALUES (?,?,?,?,?,?,?)""", (aid, sid, "P", start, "2026-09-01", "2026-09-07", handle))
+            conn.execute("INSERT INTO meta_ads_daily (snapshot_date, ad_id, store_id, is_active, fetched_at) VALUES ('2026-09-07', ?, ?, ?, 'x')",
+                         (aid, sid, active))
+        conn.commit()
+
+    def test_store_and_product_velocity(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        # this week: 6 launches (4 on handle a, 2 on b); last week: 2 (both on a); older: 1
+        rows = [(f"n{i}", "2026-09-0" + str(3 + i % 4), "a" if i < 4 else "b", 1) for i in range(6)]
+        rows += [("p1", "2026-08-27", "a", 1), ("p2", "2026-08-30", "a", 0), ("o1", "2026-08-01", "b", 1)]
+        self._seed(conn, sid, rows)
+        v = ad_metrics.ad_velocity(conn, sid, "2026-09-07")
+        self.assertEqual((v["new_ads_7d"], v["new_ads_prev_7d"], v["ad_velocity_wow"]), (6, 2, 3.0))
+        self.assertEqual(ad_metrics.ad_velocity(conn, sid, "2026-09-07", "b")["ad_velocity_wow"], float("inf"))   # 2 vs 0
+        m = ad_metrics.meta_for_signals(conn, sid, "2026-09-07")
+        self.assertEqual((m["a"]["ads_launched_7d"], m["a"]["ads_launched_prev_7d"], m["a"]["ad_velocity_wow"]), (4, 2, 2.0))
+        self.assertEqual((m["b"]["ads_launched_7d"], m["b"]["ad_velocity_wow"], m["b"]["ads_pointing_here"]), (2, "new", 3))
+        # rule 2 fires once for the store (6 >= 3 launches, x3.0 >= 2), and not again the same week
+        found = ad_metrics.run_alerts(conn, sid, "x.com", "2026-09-07")
+        self.assertIn(2, [f["rule"] for f in found])
+        self.assertEqual([f["rule"] for f in ad_metrics.run_alerts(conn, sid, "x.com", "2026-09-07")], [])
+
+    def test_signals_sort_by_launches_then_pointing_then_age(self):
+        from earlyscale import sheets, shopify
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        def prod(pid, handle, days):
+            from datetime import datetime, timedelta, timezone
+            ts = (datetime(2026, 9, 7, tzinfo=timezone.utc) - timedelta(days=days)).isoformat()
+            return {"product_id": pid, "handle": handle, "title": handle, "vendor": "", "product_type": None, "tags": [],
+                    "created_at": ts, "published_at": ts, "updated_at": ts, "variant_count": 1, "sold_out_variants": 0,
+                    "min_price": 10, "max_price": 10, "collection_position": None, "variants": []}
+        db.write_product_snapshot(conn, sid, "2026-09-07", [prod(1, "quiet-young", 2), prod(2, "launching", 40), prod(3, "pointed", 20)])
+        self._seed(conn, sid, [("l1", "2026-09-05", "launching", 1), ("l2", "2026-09-06", "launching", 1), ("o1", "2026-07-01", "pointed", 1)])
+        rows = sheets.signals_rows(conn, "2026-09-07")
+        self.assertEqual([r[2] for r in rows], ["launching", "pointed", "quiet-young"])
+        i = sheets.SIGNALS_HEADERS.index("ads_launched_7d")
+        self.assertEqual(rows[0][i:i + 3], [2, 0, "new"])

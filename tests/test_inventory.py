@@ -329,7 +329,11 @@ class AlertTests(unittest.TestCase):
         for vid, pid, rate2 in ((10, 1, 30), (20, 2, 3), (30, 3, 9)):
             self._readings(sid, vid, pid, [(i, 5000 - (2 * (14 - i) if i >= 7 else 14 + rate2 * (7 - i))) for i in range(14, -1, -1)])
         rows = sheets.signals_rows(self.conn, TODAY)
-        self.assertEqual([r[2] for r in rows], ["young-fast", "young-slow", "young-none", "old-fast"])
+        # Signals is sorted by ad launches / ads pointing first; with no ads at all, youngest product first
+        self.assertEqual([r[2] for r in rows], ["young-none", "young-slow", "young-fast", "old-fast"])
+        by = {r[2]: r for r in rows}
+        i = sheets.SIGNALS_HEADERS.index("units_per_day_wow")
+        self.assertGreater(by["young-fast"][i], by["young-slow"][i])
 
 
 class ProbeHttpTests(unittest.TestCase):

@@ -29,6 +29,7 @@ from . import config, db as _db, shopify
 log = logging.getLogger("earlyscale.ad_metrics")
 
 RULES = {
+    2: "store ad velocity: launches this week >= 2x last week (and >= 3)",
     5: "engagement_per_day up 2x week over week on one ad",
     6: "concept fully alive 14+ days while the page's active concepts fell",
     7: "new ad with lineage to an ad running 20+ days",
@@ -731,6 +732,13 @@ def run_alerts(conn: sqlite3.Connection, store_id: int, store_domain: str, today
     found: list[dict] = []
     week_ago = (date.fromisoformat(today) - timedelta(days=7)).isoformat()
 
+    # rule 2 (spec): the store's ad velocity doubled week over week with at least 3 launches this week
+    v = ad_velocity(conn, store_id, today)
+    if v["new_ads_7d"] >= 3 and v["new_ads_prev_7d"] and v["ad_velocity_wow"] >= 2.0:
+        found.append({"rule": 2, "handle": None, "key": "2|store",
+                      "detail": f"{store_domain}: {v['new_ads_7d']} ads launched in 7 days vs {v['new_ads_prev_7d']} the week before "
+                                f"(x{v['ad_velocity_wow']})"})
+
     # rule 5: engagement_per_day >= 2x week over week on a single ad
     for r in conn.execute(
         """SELECT d.ad_id, d.engagement_per_day AS now, p.engagement_per_day AS then_, a.product_handle, a.page_name
@@ -839,14 +847,64 @@ def write_alerts_markdown(conn: sqlite3.Connection, today: str, path: Path | Non
 
 # ---------------------------------------------------------------- Signals join
 
+def _launch_date(a) -> str | None:
+    return a["ad_start_date"] or a["first_seen_date"]
+
+
+def ad_velocity(conn: sqlite3.Connection, store_id: int, today: str, product_handle: str | None = None) -> dict:
+    """Ads launched (Meta start date) in the last 7 days vs the 7 before, for a store or one product.
+    An ad counts once it has ever been seen, whether or not it is still active."""
+    t = date.fromisoformat(today)
+    lo7, lo14 = (t - timedelta(days=7)).isoformat(), (t - timedelta(days=14)).isoformat()
+    sql = "SELECT ad_start_date, first_seen_date FROM meta_ads WHERE store_id = ? AND COALESCE(page_ignored, 0) = 0"
+    args: list = [store_id]
+    if product_handle is not None:
+        sql += " AND product_handle = ?"
+        args.append(product_handle)
+    new7 = prev7 = 0
+    for a in conn.execute(sql, args):
+        d = _launch_date(a)
+        if not d:
+            continue
+        if lo7 < d <= today:
+            new7 += 1
+        elif lo14 < d <= lo7:
+            prev7 += 1
+    wow = round(new7 / prev7, 2) if prev7 else (None if new7 == 0 else float("inf"))
+    return {"new_ads_7d": new7, "new_ads_prev_7d": prev7, "ad_velocity_wow": wow}
+
+
+def _wow_cell(v):
+    if v is None:
+        return ""
+    return "new" if v == float("inf") else v
+
+
 def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dict[str, dict]:
-    """{product_handle: {ads_pointing_here, engagement_per_day, days_running_max, concept_status}}
-    from the latest ad snapshot on/before `today`."""
+    """{product_handle: {ads_pointing_here, ads_launched_7d, ads_launched_prev_7d, ad_velocity_wow,
+    engagement_per_day, days_running_max, concept_status, ...}} from the latest ad snapshot on/before `today`."""
     snap = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ? AND snapshot_date <= ?",
                         (store_id, today)).fetchone()[0]
     if not snap:
         return {}
     out: dict[str, dict] = {}
+    # launches per product over every ad ever seen (an ad launched 5 days ago may already be off)
+    t = date.fromisoformat(snap)
+    lo7, lo14 = (t - timedelta(days=7)).isoformat(), (t - timedelta(days=14)).isoformat()
+    launches: dict[str, list[int]] = {}
+    for a in conn.execute("""SELECT product_handle, ad_start_date, first_seen_date FROM meta_ads
+                             WHERE store_id = ? AND product_handle IS NOT NULL AND COALESCE(page_ignored, 0) = 0""", (store_id,)):
+        d = _launch_date(a)
+        rec = launches.setdefault(a["product_handle"], [0, 0])
+        if d and lo7 < d <= snap:
+            rec[0] += 1
+        elif d and lo14 < d <= lo7:
+            rec[1] += 1
+    for h, (n7, p7) in launches.items():
+        out[h] = {"ads_pointing_here": 0, "ads_launched_7d": n7, "ads_launched_prev_7d": p7,
+                  "ad_velocity_wow": _wow_cell(round(n7 / p7, 2) if p7 else (None if n7 == 0 else float("inf"))),
+                  "days_running_max": None, "engagement_per_day": None, "concept_status": "",
+                  "eu_reach_slope_7d": None, "comment_delta_1d": None}
     for r in conn.execute(
         """SELECT a.product_handle, COUNT(*) AS n, MAX(d.days_running) AS dmax, AVG(d.engagement_per_day) AS epd,
                   SUM(d.reach_slope_7d) AS slope, SUM(d.reach_slope_7d IS NOT NULL) AS slope_n,
@@ -855,11 +913,11 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
            WHERE d.store_id = ? AND d.snapshot_date = ? AND d.is_active = 1 AND a.product_handle IS NOT NULL
              AND COALESCE(a.page_ignored, 0) = 0
            GROUP BY a.product_handle""", (store_id, snap)):
-        out[r["product_handle"]] = {"ads_pointing_here": r["n"], "days_running_max": r["dmax"],
-                                    "engagement_per_day": None if r["epd"] is None else round(r["epd"], 1),
-                                    "concept_status": "",
-                                    "eu_reach_slope_7d": None if not r["slope_n"] else round(r["slope"], 1),
-                                    "comment_delta_1d": None if not r["cdelta_n"] else int(r["cdelta"])}
+        rec = out.setdefault(r["product_handle"], {"ads_launched_7d": 0, "ads_launched_prev_7d": 0, "ad_velocity_wow": "", "concept_status": ""})
+        rec.update({"ads_pointing_here": r["n"], "days_running_max": r["dmax"],
+                    "engagement_per_day": None if r["epd"] is None else round(r["epd"], 1),
+                    "eu_reach_slope_7d": None if not r["slope_n"] else round(r["slope"], 1),
+                    "comment_delta_1d": None if not r["cdelta_n"] else int(r["cdelta"])})
     for r in conn.execute(
         """SELECT product_handle, COUNT(*) AS concepts, SUM(COALESCE(ads_delivering, ads_active) > 0) AS alive, MAX(days_running) AS oldest,
                   MAX(CASE WHEN COALESCE(ads_delivering, ads_active) = ads_ever THEN days_running END) AS oldest_intact

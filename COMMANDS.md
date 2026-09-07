@@ -14,14 +14,13 @@ Then:
 
 1. Open `.env`. Remove the `META_STORES=...` line (or put `#` in front) so the night task covers every store.
 2. Paste `sheets\Code.gs` into your Apps Script project and deploy a new version. Needed whenever a tab gains columns; the sync tells you if the deployed script is stale.
-3. `python tracker.py shop-ids` prints every store's shop ID. Put 5 or 6 verified rows into `calibration\shop_ids.csv` (`shop_id,created_date`), then `python tracker.py store-age`.
-4. Optional, for engagement on ads: in Chrome open `chrome://extensions`, turn on Developer mode, Load unpacked, choose `tools\fb_observer`.
+3. Optional, for engagement on ads: in Chrome open `chrome://extensions`, turn on Developer mode, Load unpacked, choose `tools\fb_observer`.
 
 ## 2. Runs by itself (nothing to do)
 
 | when | task | what you get |
 |---|---|---|
-| 09:00 daily | Shopify snapshot, stock probe, Sheets sync | Signals, Families, Categories, Stores, Store Age, Products tabs refreshed; ~15 min |
+| 09:00 daily | Shopify snapshot, stock probe, Sheets sync | Signals, Families, Categories, Stores, Products tabs refreshed; ~15 min |
 | 22:00 daily | Meta Ad Library, least recently scraped stores first, up to 8 h, then Sheets sync | ad columns on Signals, concepts, lineage, delivery, page likes |
 
 The machine must be on and logged in at those times. Logs: `logs\run_YYYY-MM-DD.log` and `logs\meta_YYYY-MM-DD.log`.
@@ -38,7 +37,6 @@ python tracker.py ads-report                  # per store: ads, where they land,
 python tracker.py ads-report --store x.com    # one store
 python tracker.py ads-detail-report --days 7  # delivery (end_date) per day, page likes, coverage
 python tracker.py inventory-report --raw      # stock readings per hero variant, fallback rung per store
-python tracker.py store-age                   # stores newest first, with the calibration behind each estimate
 python tracker.py fb-report                   # captured Sponsored posts, matches, reactions over time
 ```
 

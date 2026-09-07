@@ -150,7 +150,8 @@ class ReachCurveTests(unittest.TestCase):
         self.assertEqual(conn.execute("SELECT engagement_type FROM meta_ads WHERE ad_id='a'").fetchone()[0], "boosted")
         sig = {r[2]: r for r in sheets.signals_rows(conn)}
         self.assertEqual(len(sig["hero"]), len(sheets.SIGNALS_HEADERS))
-        self.assertEqual(sig["hero"][15:17], [1200.0, 15])
+        H = sheets.SIGNALS_HEADERS
+        self.assertEqual([sig["hero"][H.index("eu_reach_slope_7d")], sig["hero"][H.index("comment_delta_1d")]], [1200.0, 15])
 
     def test_dark_ad_has_blank_engagement(self):
         conn = db.connect(":memory:")
