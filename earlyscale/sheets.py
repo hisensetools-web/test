@@ -16,14 +16,15 @@ from urllib.parse import urljoin
 
 import requests
 
-from . import config, deltas, signals, store_age
+from . import ad_metrics, config, deltas, signals, store_age
 from .watchlist import read_watchlist
 
 log = logging.getLogger("earlyscale.sheets")
 
 STORES_HEADERS = ["store", "meta page", "last status", "products", "sold-out variants", "new products 7d",
                   "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date",
-                  "shop_id", "myshopify", "store_created_est", "store_age_days"]
+                  "shop_id", "myshopify", "store_created_est", "store_age_days",
+                  "ads_active", "ads_to_products", "products_with_ads", "ads_not_attached (why)"]
 STORE_AGE_HEADERS = ["store", "shop_id", "myshopify", "store_created_est", "store_age_days", "method",
                      "lower calibration", "upper calibration", "products", "first snapshot", "id source", "error"]
 PRODUCTS_HEADERS = ["date", "store", "handle", "title", "published_at", "updated_at", "price",
@@ -99,6 +100,9 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
         d = by_id.get(s["id"])
         age = ["" if s["shop_id"] is None else s["shop_id"], s["myshopify"] or "", s["store_created_est"] or "",
                _blank(store_age.age_days(s["store_created_est"], as_of))]
+        b = ad_metrics.landing_breakdown(conn, s["id"], s["store_domain"], as_of)
+        age += [b["active"] if b["snapshot"] else "", b["to_products"] if b["snapshot"] else "",
+                b["products"] if b["snapshot"] else "", ad_metrics.breakdown_summary(b) if b["snapshot"] else ""]
         if d is None:
             rows.append([s["store_domain"], s["meta_page_name"] or "", status, "", "", "", "", "", "", "", ""] + age)
             continue

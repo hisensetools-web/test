@@ -559,6 +559,61 @@ def write_concept_rows(conn: sqlite3.Connection, store_id: int, today: str) -> i
     return len(by_c)
 
 
+LANDING_KINDS = ("product", "unlisted-product", "advertorial", "homepage", "collection", "other-store-path",
+                 "external", "no-url", "page-ignored")
+
+
+def landing_kind(ad: dict, store_domain: str) -> str:
+    """Where an ad lands, as a bucket that explains why it does or does not attach to a product."""
+    if ad.get("page_ignored"):
+        return "page-ignored"
+    if ad.get("product_handle"):
+        return "product"
+    url = ad.get("landing_url")
+    if not url:
+        return "no-url"
+    if not same_store(ad.get("landing_domain") or urlparse(url).netloc, store_domain):
+        return "external"
+    path = urlparse(url).path.rstrip("/").lower()
+    if not path:
+        return "homepage"
+    if PRODUCT_RE.search(url):
+        return "unlisted-product"
+    if PAGE_RE.search(url):
+        return "advertorial"
+    if path.startswith("/collections"):
+        return "collection"
+    return "other-store-path"
+
+
+def landing_breakdown(conn: sqlite3.Connection, store_id: int, store_domain: str, as_of: str | None = None) -> dict:
+    """Counts of today's active ads by landing kind for one store (+ total, to_products)."""
+    snap = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ? AND snapshot_date <= ?",
+                        (store_id, as_of or "9999")).fetchone()[0]
+    out = {k: 0 for k in LANDING_KINDS}
+    out.update({"snapshot": snap, "active": 0, "to_products": 0, "products": 0})
+    if not snap:
+        return out
+    handles = set()
+    for a in conn.execute("""SELECT a.* FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id AND d.snapshot_date = ?
+                             WHERE a.store_id = ? AND d.is_active = 1""", (snap, store_id)):
+        a = dict(a)
+        k = landing_kind(a, store_domain)
+        out[k] += 1
+        out["active"] += 1
+        if k == "product":
+            out["to_products"] += 1
+            handles.add(a["product_handle"])
+    out["products"] = len(handles)
+    return out
+
+
+def breakdown_summary(b: dict) -> str:
+    parts = [(k, b[k]) for k in LANDING_KINDS if k != "product" and b.get(k)]
+    parts.sort(key=lambda kv: -kv[1])
+    return ", ".join(f"{k} {n}" for k, n in parts[:4])
+
+
 def page_relevance(ads: list[dict], store_domain: str) -> dict[str, dict]:
     """{page_name: {ads, with_url, on_store, ignored, page_id}} over one store's ads.
     on_store counts ads whose landing domain is the store's or that resolved to a product."""

@@ -42,9 +42,10 @@ var TABS = {
   Stores: {
     headers: ["store", "meta page", "last status", "products", "sold-out variants",
               "new products 7d", "updated products 7d", "sold-out delta", "price changes",
-              "change score", "last snapshot date", "shop_id", "myshopify", "store_created_est", "store_age_days"],
+              "change score", "last snapshot date", "shop_id", "myshopify", "store_created_est", "store_age_days",
+              "ads_active", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
     keyCols: null,                 // fully overwritten each sync
-    textCols: [0, 1, 2, 10, 12, 13],   // keep dates / domains as text, not auto-parsed
+    textCols: [0, 1, 2, 10, 12, 13, 18],   // keep dates / domains as text, not auto-parsed
     position: 4
   },
   "Store Age": {

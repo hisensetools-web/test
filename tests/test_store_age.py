@@ -121,10 +121,12 @@ class DbTests(unittest.TestCase):
         # Stores tab carries the four new columns
         srows = {r[0]: r for r in sheets.stores_rows(self.conn, "2024-01-11")}
         self.assertEqual(len(srows["a.com"]), len(sheets.STORES_HEADERS))
-        self.assertEqual(srows["a.com"][-4:-2], [30000000, "a.myshopify.com"])
-        self.assertIn(srows["a.com"][-2], ("2019-12-31", "2020-01-01", "2020-01-02"))
-        self.assertIn(srows["a.com"][-1], (1470, 1471, 1472))
-        self.assertEqual(srows["b.com"][-4:], ["", "", "", ""])
+        i = sheets.STORES_HEADERS.index("shop_id")
+        self.assertEqual(srows["a.com"][i:i + 2], [30000000, "a.myshopify.com"])
+        self.assertIn(srows["a.com"][i + 2], ("2019-12-31", "2020-01-01", "2020-01-02"))
+        self.assertIn(srows["a.com"][i + 3], (1470, 1471, 1472))
+        self.assertEqual(srows["b.com"][i:i + 4], ["", "", "", ""])
+        self.assertEqual(srows["a.com"][sheets.STORES_HEADERS.index("ads_active"):], ["", "", "", ""])   # no ads scraped
         self.assertEqual(len(sheets.STORE_AGE_HEADERS), len(rows[0]))
         self.assertIn("store_age", sheets.TAB_ORDER)
         self.assertEqual(sheets.TAB_NAMES["store_age"], "Store Age")

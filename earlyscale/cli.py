@@ -1051,6 +1051,18 @@ def cmd_ads_report(args) -> int:
                   str(r["active"]), str(r["new_today"]), str(r["gone"]), str(r["scrolls"]), (r["detail"] or "")[:50])
     console.print(t)
 
+    t = Table(title=f"where each store's active ads land (as of {as_of}): only 'product' rows reach the Signals tab")
+    for c in ("store", "active ads", "-> products", "distinct products", "unlisted-product", "advertorial", "homepage", "collection",
+              "other path", "external", "no-url", "page-ignored"):
+        t.add_column(c, justify="left" if c == "store" else "right")
+    for st in conn.execute(f"SELECT id, store_domain FROM stores {'WHERE store_domain = ?' if args.store else ''} ORDER BY store_domain",
+                           ([args.store] if args.store else [])).fetchall():
+        b = ad_metrics.landing_breakdown(conn, st["id"], st["store_domain"], as_of)
+        if not b["active"]:
+            continue
+        t.add_row(_short(st["store_domain"]), str(b["active"]), str(b["to_products"]), str(b["products"]),
+                  *[str(b[k]) for k in ("unlisted-product", "advertorial", "homepage", "collection", "other-store-path", "external", "no-url", "page-ignored")])
+    console.print(t)
     t = Table(title=f"products by active ads pointing at them (as of {as_of})")
     for c in ("store", "product handle", "active ads", "pages", "oldest ad (days)", "newest ad (days)", "concepts", "landing kinds"):
         t.add_column(c)

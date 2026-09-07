@@ -539,3 +539,39 @@ class MetaPassPlanningTests(unittest.TestCase):
             config.META_MAX_LANDING_FETCH = old
         self.assertEqual(len(calls), 2)
         self.assertEqual(sum(1 for h in cache.values() if isinstance(h, dict) and h.get("status") is not None), 2)
+
+
+class LandingKindTests(unittest.TestCase):
+    def test_buckets(self):
+        st = "biorootlabs.com"
+        cases = [
+            ({"product_handle": "x", "landing_url": "https://biorootlabs.com/products/x"}, "product"),
+            ({"landing_url": "https://biorootlabs.com/products/x-o2", "landing_domain": "biorootlabs.com"}, "unlisted-product"),
+            ({"landing_url": "https://biorootlabs.com/pages/story", "landing_domain": "biorootlabs.com"}, "advertorial"),
+            ({"landing_url": "https://www.biorootlabs.com/", "landing_domain": "www.biorootlabs.com"}, "homepage"),
+            ({"landing_url": "https://biorootlabs.com/collections/all", "landing_domain": "biorootlabs.com"}, "collection"),
+            ({"landing_url": "https://biorootlabs.com/blogs/news/x", "landing_domain": "biorootlabs.com"}, "other-store-path"),
+            ({"landing_url": "https://healthnews.example/advertorial", "landing_domain": "healthnews.example"}, "external"),
+            ({"landing_url": None}, "no-url"),
+            ({"landing_url": "https://other.example/", "page_ignored": 1}, "page-ignored"),
+        ]
+        for ad, want in cases:
+            with self.subTest(want=want):
+                self.assertEqual(ad_metrics.landing_kind(ad, st), want)
+
+    def test_breakdown_and_summary(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "biorootlabs.com")
+        rows = [("1", "x", "https://biorootlabs.com/products/x", "biorootlabs.com", 0),
+                ("2", None, "https://biorootlabs.com/", "biorootlabs.com", 0),
+                ("3", None, "https://news.example/a", "news.example", 0),
+                ("4", None, "https://news.example/b", "news.example", 1)]
+        for aid, ph, url, dom, ign in rows:
+            conn.execute("""INSERT INTO meta_ads (ad_id, store_id, first_seen_date, last_seen_date, product_handle, landing_url, landing_domain, page_ignored)
+                            VALUES (?,?,?,?,?,?,?,?)""", (aid, sid, "2026-09-07", "2026-09-07", ph, url, dom, ign))
+            conn.execute("INSERT INTO meta_ads_daily (snapshot_date, ad_id, store_id, is_active, fetched_at) VALUES ('2026-09-07', ?, ?, 1, 'x')", (aid, sid))
+        b = ad_metrics.landing_breakdown(conn, sid, "biorootlabs.com", "2026-09-07")
+        self.assertEqual((b["active"], b["to_products"], b["products"], b["homepage"], b["external"], b["page-ignored"]), (4, 1, 1, 1, 1, 1))
+        self.assertEqual(ad_metrics.breakdown_summary(b), "homepage 1, external 1, page-ignored 1")
+        empty = ad_metrics.landing_breakdown(conn, db.upsert_store(conn, "none.com"), "none.com", "2026-09-07")
+        self.assertIsNone(empty["snapshot"])
