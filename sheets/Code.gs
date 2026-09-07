@@ -7,7 +7,7 @@
  * Put the resulting /exec URL in .env as SHEETS_WEBHOOK_URL.
  *
  * Protocol (one POST per chunk, JSON body):
- *   { "tab": "Signals" | "Families" | "Categories" | "Stores" | "Products" | "Alerts",
+ *   { "tab": "Signals" | "Families" | "Categories" | "Stores" | "Store Age" | "Products" | "Alerts",
  *     "mode": "replace" | "append",
  *     "chunk": 1, "chunks": 3,          // 1-based; replace clears the tab on chunk 1
  *     "rows": [[...], [...]] }           // values in header order
@@ -26,8 +26,8 @@ var TABS = {
               "variants_of_family_published_7d", "ads_pointing_here", "engagement_per_day",
               "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d",
               "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d",
-              "units_per_day_wow"],
-    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 14, 15, 16], position: 1
+              "units_per_day_wow", "store_created_est", "store_age_days"],
+    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 14, 15, 16, 23], position: 1
   },
   Families: {
     headers: ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
@@ -42,10 +42,17 @@ var TABS = {
   Stores: {
     headers: ["store", "meta page", "last status", "products", "sold-out variants",
               "new products 7d", "updated products 7d", "sold-out delta", "price changes",
-              "change score", "last snapshot date"],
+              "change score", "last snapshot date", "shop_id", "myshopify", "store_created_est", "store_age_days"],
     keyCols: null,                 // fully overwritten each sync
-    textCols: [0, 1, 2, 10],       // keep dates / domains as text, not auto-parsed
+    textCols: [0, 1, 2, 10, 12, 13],   // keep dates / domains as text, not auto-parsed
     position: 4
+  },
+  "Store Age": {
+    headers: ["store", "shop_id", "myshopify", "store_created_est", "store_age_days", "method",
+              "lower calibration", "upper calibration", "products", "first snapshot", "id source", "error"],
+    keyCols: null,                 // newest store first; fully overwritten each sync
+    textCols: [0, 2, 3, 5, 6, 7, 9, 10, 11],
+    position: 5
   },
   Products: {
     headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price",
@@ -59,7 +66,7 @@ var TABS = {
     headers: ["date", "store", "handle", "rule", "detail", "created_at"],
     keyCols: [0, 1, 2, 3, 4],      // date + store + handle + rule + detail (several alerts can share a rule)
     textCols: [0, 1, 2, 4, 5],
-    position: 5
+    position: 6
   }
 };
 

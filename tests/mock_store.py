@@ -166,7 +166,7 @@ def mutate(products: list[dict], seed: int, now: datetime) -> list[dict]:
 def make_handler(products: list[dict], collection: list[dict], delay_first_page_status: int | None,
                  require_browser: bool = False, redirect_to: str | None = None,
                  html_unless_json_accept: bool = False, stock: dict[int, dict] | None = None,
-                 cart_status: int | None = None, throttle_after: int | None = None):
+                 cart_status: int | None = None, throttle_after: int | None = None, shop_id: int | None = None):
     state = {"first_products_call": True, "hits": 0, "cart_posts": 0, "cart_clears": 0, "checkout_hits": 0}
     stock = stock or {}
     by_handle = {p["handle"]: p for p in products}
@@ -276,8 +276,13 @@ def make_handler(products: list[dict], collection: list[dict], delay_first_page_
                 self.wfile.write(html)
                 return
             elif u.path == "/":
-                html = b'<html><body><footer><a href="https://www.facebook.com/sharer/sharer.php?u=x">share</a>' \
-                       b'<a href="https://www.facebook.com/MockStorePage">fb</a></footer></body></html>'
+                sid = shop_id or 0
+                head = (f'<head><meta name="shopify-digital-wallet" content="/{sid}/digital_wallets/dialog">'
+                        f'<script>window.Shopify = window.Shopify || {{}}; Shopify.shop = "mock-{sid}.myshopify.com";'
+                        f'window.ShopifyAnalytics = {{"meta":{{"page":{{"pageType":"home"}}}}}};'
+                        f'</script></head>') if shop_id else "<head></head>"
+                html = (f'<html>{head}<body><footer><a href="https://www.facebook.com/sharer/sharer.php?u=x">share</a>'
+                        f'<a href="https://www.facebook.com/MockStorePage">fb</a></footer></body></html>').encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html")
                 self.send_header("Content-Length", str(len(html)))
@@ -374,6 +379,8 @@ def main(argv=None):
                     help="simulated day number for stock levels (default 1, or 2 with --mutate); stock falls daily")
     ap.add_argument("--throttle-after", type=int, default=None, metavar="N",
                     help="after N cart posts answer most of them with an HTML 429 + Retry-After: 1")
+    ap.add_argument("--shop-id", type=int, default=None, help="Shopify shop id to embed in the homepage HTML (default: derived from --seed)")
+    ap.add_argument("--no-shop-id", action="store_true", help="omit the shop id markup (tests the warning)")
     ap.add_argument("--cart-status", type=int, default=None, metavar="STATUS",
                     help="answer every /cart/add.js with this status (e.g. 403) to test the blocked path")
     args = ap.parse_args(argv)
@@ -389,7 +396,8 @@ def main(argv=None):
     srv = HTTPServer(("127.0.0.1", args.port), make_handler(products, collection, args.fail_first,
                                                              args.require_browser, args.redirect_to,
                                                              args.html_unless_json_accept, stock, args.cart_status,
-                                                             args.throttle_after))
+                                                             args.throttle_after,
+                                                             None if args.no_shop_id else (args.shop_id or 60_000_000 + args.seed * 1_000_000)))
     print(f"mock store on http://127.0.0.1:{args.port} products={len(products)} seed={args.seed} mutate={args.mutate} day={day}")
     srv.serve_forever()
 

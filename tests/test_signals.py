@@ -135,7 +135,7 @@ class RowBuilderTests(unittest.TestCase):
         self.assertEqual(by["ceylon-cinnamon-tt"][9], "")      # didn't exist a week ago
         self.assertEqual(by["ceylon-cinnamon"][10], 2)         # family launched 2 handles this week
         self.assertEqual(by["oregano-oil"][10], 0)
-        self.assertEqual(by["ceylon-cinnamon"][11:], [""] * 12)  # Meta + inventory columns empty
+        self.assertEqual(by["ceylon-cinnamon"][11:], [""] * 14)  # Meta + inventory + store-age columns empty
 
     def test_families_and_categories_rows(self):
         fams = sheets.families_rows(self.conn)

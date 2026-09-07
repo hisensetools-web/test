@@ -340,6 +340,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
                      ("post_id", "TEXT"), ("post_permalink", "TEXT")],
         "meta_concepts_daily": [("ads_delivering", "INTEGER"), ("survival_source", "TEXT")],
         "alerts": [("dedupe_key", "TEXT")],
+        "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
+                   ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT")],
         "products_daily": [("unlisted", "INTEGER DEFAULT 0")],   # 1 = live product page not in products.json (found via ads)
         "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
                            ("engagement_per_day", "REAL"),

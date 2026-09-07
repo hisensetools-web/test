@@ -13,7 +13,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, sheets, shopify
+from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, sheets, shopify, store_age
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist
 
 console = Console()
@@ -84,13 +84,36 @@ def run_products_pass(conn, stores: list[dict], snapshot_date: str, only: set[st
             log.info("%-28s ok  products=%-5d variants=%-5d sold_out_variants=%-4d pages=%d  %.1fs",
                      domain, n, sum(p["variant_count"] for p in products), sold_out, pages, dur)
             ok += 1
+            try:   # shop id: fetched once, retried daily only while missing
+                ident = store_age.ensure_identity(conn, store_id, domain, session)
+                if not ident.get("cached"):
+                    if ident.get("shop_id"):
+                        log.info("%-28s shop_id=%s myshopify=%s (%s)", domain, ident["shop_id"], ident.get("myshopify") or "?", ident.get("source"))
+                    else:
+                        log.warning("%-28s NO SHOP ID in HTML (%s) - check this store by hand", domain, ident.get("error"))
+            except Exception as e:  # noqa: BLE001
+                log.warning("%-28s shop id lookup failed: %s", domain, e)
         except Exception as e:  # noqa: BLE001 - by design: log and continue
             dur = time.monotonic() - t0
             db.record_store_run(conn, run_id, store_id, snapshot_date, "error", str(e)[:500], 0, 0, dur)
             log.error("%-28s FAILED: %s", domain, e)
             failed += 1
     db.finish_run(conn, run_id, ok, failed)
+    try:
+        store_age.refresh_estimates(conn)
+    except Exception as e:  # noqa: BLE001
+        log.warning("store age estimates failed: %s", e)
     return ok, failed
+
+
+def _warn_missing_shop_ids(conn, stores: list[dict]) -> None:
+    missing = store_age.missing_ids(conn, {s["store_domain"] for s in stores})
+    if missing:
+        console.print(f"[yellow]{len(missing)} store(s) have no Shopify shop ID in their HTML - check by hand:[/] "
+                      + ", ".join(f"{m['store_domain']} ({m['shop_id_error'] or '?'})" for m in missing))
+    cal = store_age.load_calibration()
+    if not cal.ok:
+        console.print(f"[yellow]store age needs calibration:[/] add at least 2 rows (shop_id,created_date) to {store_age.CALIBRATION_PATH}")
 
 
 def cmd_run(args) -> int:
@@ -105,6 +128,7 @@ def cmd_run(args) -> int:
     t0 = time.monotonic()
     ok, failed = run_products_pass(conn, stores, snapshot_date, only)
     console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
+    _warn_missing_shop_ids(conn, [s for s in stores if not only or s["store_domain"] in only])
     rc = 1 if ok == 0 and failed else 0
     if not args.no_ads and conn.execute("SELECT 1 FROM fb_posts LIMIT 1").fetchone():
         console.print("feed-post engagement pass (captured permalinks, logged-out) ...")
@@ -828,6 +852,52 @@ def cmd_fb_bait(args) -> int:
     return 0
 
 
+def cmd_shop_ids(args) -> int:
+    """Fetch (or show) every watchlist store's Shopify shop ID and myshopify handle; estimate creation dates."""
+    conn = db.connect(args.db)
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    only = set(args.only) if args.only else None
+    targets = [s for s in stores if not only or s["store_domain"] in only]
+    session = shopify.make_session()
+    fetched = 0
+    for s in targets:
+        sid = db.upsert_store(conn, s["store_domain"])
+        conn.commit()
+        row = conn.execute("SELECT shop_id FROM stores WHERE id = ?", (sid,)).fetchone()
+        if row["shop_id"] and not args.refresh:
+            continue
+        ident = store_age.ensure_identity(conn, sid, s["store_domain"], session, refresh=args.refresh)
+        fetched += 1
+        if ident.get("shop_id"):
+            log.info("%-28s shop_id=%s myshopify=%s (%s)", s["store_domain"], ident["shop_id"], ident.get("myshopify") or "?", ident.get("source"))
+        else:
+            log.warning("%-28s NO SHOP ID (%s)", s["store_domain"], ident.get("error"))
+        if fetched < len(targets):
+            time.sleep(0.6)
+    counts = store_age.refresh_estimates(conn)
+    console.print(f"fetched {fetched} store(s); calibration rows: {counts['calibration_rows']}; estimated: {counts['estimated']}/{counts['stores']}")
+    return _store_age_table(conn, {s["store_domain"] for s in targets}, args.date if hasattr(args, "date") else None)
+
+
+def _store_age_table(conn, domains: set[str] | None, as_of: str | None = None) -> int:
+    rows = store_age.store_age_rows(conn, as_of, store_domains=domains)
+    t = Table(title="store age (newest first; created dates interpolated from calibration/shop_ids.csv)")
+    for c in ("store", "shop_id", "myshopify", "created (est)", "age days", "method", "lower calibration", "upper calibration", "products", "first snapshot", "id source", "error"):
+        t.add_column(c, justify="right" if c in ("shop_id", "age days", "products") else "left")
+    for r in rows:
+        t.add_row(*[str(x) for x in r])
+    console.print(t)
+    _warn_missing_shop_ids(conn, [{"store_domain": r[0]} for r in rows])
+    return 0
+
+
+def cmd_store_age(args) -> int:
+    conn = db.connect(args.db)
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    store_age.refresh_estimates(conn)
+    return _store_age_table(conn, {s["store_domain"] for s in stores} if stores and not args.all else None, args.date)
+
+
 def cmd_ads(args) -> int:
     snapshot_date = _parse_date(args.date)
     stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
@@ -1336,6 +1406,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("domains", nargs="+")
     s.add_argument("--watchlist", help="alternate watchlist.csv path")
     s.set_defaults(fn=cmd_remove_store)
+
+    s = sub.add_parser("shop-ids", help="fetch each store's Shopify shop ID + myshopify handle (once) and estimate creation dates")
+    s.add_argument("--watchlist"); s.add_argument("--only", nargs="+", metavar="DOMAIN")
+    s.add_argument("--refresh", action="store_true", help="re-fetch even if a shop id is already stored")
+    s.add_argument("--date", help="age as of this date (default today)")
+    s.set_defaults(fn=cmd_shop_ids)
+
+    s = sub.add_parser("store-age", help="stores by estimated creation date, newest first (needs calibration/shop_ids.csv)")
+    s.add_argument("--watchlist"); s.add_argument("--all", action="store_true", help="every store in the DB, not just the watchlist")
+    s.add_argument("--date", help="age as of this date (default today)")
+    s.set_defaults(fn=cmd_store_age)
 
     s = sub.add_parser("report", help="stores sorted by how much changed, with product-level changes")
     s.add_argument("--date", help="report as of this snapshot date (default: latest)")

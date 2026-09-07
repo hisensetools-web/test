@@ -252,6 +252,37 @@ If Meta serves a login wall the pass stops for the day rather than hammering it.
 - If Playwright cannot download its browser, point `META_CHROMIUM_PATH` in `.env` at an
   installed Chromium/Chrome binary.
 
+## Store age from the Shopify shop ID
+
+Shopify assigns shop IDs sequentially, so the number orders stores by creation date. Every
+storefront's HTML carries it, and it never changes:
+
+- `<meta name="shopify-digital-wallet" content="/SHOP_ID/digital_wallets/dialog">` (preferred)
+- `"shopId":SHOP_ID` in the analytics / Trekkie config or the `shopify-features` JSON (fallback)
+- `Shopify.shop = "handle.myshopify.com"` for the myshopify handle
+
+The daily run fetches the homepage once per store, stores `shop_id`, `myshopify` and which
+source it came from, and retries only while the ID is missing. A store with no shop ID in its
+HTML is named in a warning at the end of the run and in `shop-ids` / `store-age` output so you can
+check it by hand.
+
+**Calibration.** `calibration/shop_ids.csv` (`shop_id,created_date`, other columns ignored) holds
+stores whose creation date you verified, for example in the Koala Inspector extension. Five or
+six rows spread over a few years is enough. Every store's `store_created_est` is interpolated
+linearly between its two nearest calibration rows, or extrapolated with the end segment's slope
+outside the range; `store_age_days` is the distance to the report date. Estimates are recomputed on
+every run, so editing the CSV takes effect on the next run (or `python tracker.py store-age`).
+
+```bash
+python tracker.py shop-ids                # fetch ids for every watchlist store (once), show the table
+python tracker.py shop-ids --refresh      # re-fetch even if stored
+python tracker.py store-age               # stores newest first with method + calibration neighbours
+```
+
+Sheets: the Stores tab gains `shop_id, myshopify, store_created_est, store_age_days`, the Signals
+tab gains `store_created_est, store_age_days`, and a **Store Age** tab lists stores newest first
+with the method and the two calibration points each estimate came from.
+
 ## Meta layer part 2: delivery, page likes, creatives, and feed-post engagement
 
 ### A. Single-ad Ad Library pages (public, no login)
@@ -471,7 +502,7 @@ python tracker.py remove-store bad1.com bad2.com     # drops them from watchlist
 
 | table | one row per | notes |
 |---|---|---|
-| `stores` | store | domain + Meta page name/id |
+| `stores` | store | domain, Meta page name/id, `shop_id`, `myshopify`, `store_created_est` (+ method) |
 | `products_daily` | (day, store, product) | handle, title, type, tags (JSON), created/published/updated, variant_count, sold_out_variants, min/max price, `collection_position` (index in `/collections/all`, often best-selling order) |
 | `variants_daily` | (day, store, variant) | price, compare_at_price, available |
 | `runs`, `store_runs` | run / (run, store) | status, error text, products seen, pages, duration |
@@ -568,6 +599,7 @@ earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture), parse
 earlyscale/ad_metrics.py landing-URL join, concepts, lineage, daily ad metrics, alert rules 5-8, Signals join
 earlyscale/ad_detail.py  single-ad Ad Library pages: delivery (end_date), page likes, creative fingerprints, rule 12
 earlyscale/fb_posts.py   captured Sponsored posts, logged-out counts, join to ads
+earlyscale/store_age.py  Shopify shop id + myshopify from the storefront HTML, calibration interpolation, Store Age tab
 earlyscale/inventory.py  hero-variant selection, /cart/add.js stock probe + theme fallback, units-sold maths, alert rules 9-11
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O
