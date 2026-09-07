@@ -974,8 +974,11 @@ def cmd_ads(args) -> int:
     console.print(f"ads: snapshot_date={snapshot_date} pages={n} waits={config.META_WAIT_MIN}-{config.META_WAIT_MAX}s "
                   f"headless={not args.headed}")
     t0 = time.monotonic()
+    planned = plan_meta_stores(conn, stores, only)
+    console.print(f"plan: {len(planned)} store(s), least recently scraped first, budget {args.max_minutes or config.META_MAX_MINUTES:.0f} min "
+                  f"(about {config.META_MAX_SCROLLS * 5.5 / 60 + 1 + config.META_DETAIL_MAX * 4.5 / 60:.0f} min per store at current settings)")
     ok, failed = run_ads_pass(conn, stores, snapshot_date, only, headless=not args.headed, max_scrolls=args.max_scrolls,
-                              detail=not args.no_detail, detail_cap=args.detail_max)
+                              detail=not args.no_detail, detail_cap=args.detail_max, max_minutes=args.max_minutes)
     md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
     console.print(f"done in {time.monotonic() - t0:.0f}s: [green]{ok} ok[/], [red]{failed} failed[/]"
                   + (f"; alerts written to {md}" if md else ""))
@@ -1398,6 +1401,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
     s.add_argument("--headed", action="store_true", help="show the browser window (debugging)")
     s.add_argument("--max-scrolls", type=int, help=f"scroll cap per page (default {config.META_MAX_SCROLLS})")
+    s.add_argument("--max-minutes", type=float, help=f"wall-clock budget for this pass (default META_MAX_MINUTES={config.META_MAX_MINUTES:.0f})")
     s.add_argument("--no-detail", action="store_true", help="skip the single-ad page pass")
     s.add_argument("--detail-max", type=int, help=f"single-ad pages per store (default {config.META_DETAIL_MAX})")
     s.set_defaults(fn=cmd_ads)

@@ -1,15 +1,21 @@
 @echo off
-REM Daily tracker run. Registered in Task Scheduler by register_task.ps1.
-REM Appends stdout+stderr to logs\run_YYYY-MM-DD.log.
-REM tracker.py reads .env itself, so if SHEETS_WEBHOOK_URL is set there the run ends with a
-REM Google Sheets sync automatically (exit code 3 = run fine, sync failed).
-setlocal
+REM Daily tracker run. Registered in Task Scheduler by register_task.ps1 (two tasks):
+REM   run_daily.bat        morning: Shopify snapshot + stock probe + Sheets sync (about 15 min)
+REM   run_daily.bat meta   night:   Meta Ad Library pass for the whole watchlist within
+REM                                 META_NIGHT_MINUTES (default 480), then a Sheets sync
+REM Appends stdout+stderr to logs\run_YYYY-MM-DD.log (or logs\meta_YYYY-MM-DD.log).
+REM tracker.py reads .env itself (SHEETS_WEBHOOK_URL, META_STORES, ...).
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 if not exist logs mkdir logs
+set MODE=%~1
+if not defined MODE set MODE=day
+if not defined META_NIGHT_MINUTES set META_NIGHT_MINUTES=480
 
 REM Locale-independent date via PowerShell (%DATE% format varies by region).
 for /f %%i in ('powershell -NoProfile -Command "Get-Date -Format yyyy-MM-dd"') do set TODAY=%%i
 set LOG=logs\run_%TODAY%.log
+if /i "%MODE%"=="meta" set LOG=logs\meta_%TODAY%.log
 
 REM Pick a Python that actually runs and is 3.11 or newer. Each candidate is probed by
 REM executing it; a missing launcher, a missing 3.x version, or the Microsoft Store
@@ -28,9 +34,15 @@ if not defined PY (
 )
 for /f %%v in ('%PY% -c "import sys; print(sys.version.split()[0])"') do set PYVER=%%v
 
-echo ==== %DATE% %TIME% start (%PY% = Python %PYVER%) >> "%LOG%"
-%PY% tracker.py run >> "%LOG%" 2>&1
-set RC=%ERRORLEVEL%
+echo ==== %DATE% %TIME% start %MODE% (%PY% = Python %PYVER%) >> "%LOG%"
+if /i "%MODE%"=="meta" (
+  %PY% tracker.py ads --max-minutes %META_NIGHT_MINUTES% >> "%LOG%" 2>&1
+  set RC=!ERRORLEVEL!
+  %PY% tracker.py sync-sheets >> "%LOG%" 2>&1
+) else (
+  %PY% tracker.py run --no-ads >> "%LOG%" 2>&1
+  set RC=!ERRORLEVEL!
+)
 echo ==== %DATE% %TIME% exit code %RC% >> "%LOG%"
 endlocal & exit /b %RC%
 

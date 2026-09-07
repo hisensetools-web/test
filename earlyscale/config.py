@@ -59,7 +59,7 @@ SHEETS_TIMEOUT = (10, 90)  # Apps Script can take a while on big appends
 META_ADS_ENABLED = os.environ.get("META_ADS", "").strip() in ("1", "true", "yes")
 META_WAIT_MIN = float(os.environ.get("META_WAIT_MIN", "3"))
 META_WAIT_MAX = float(os.environ.get("META_WAIT_MAX", "8"))
-META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "80"))
+META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "40"))   # ~700 ads, ~4 min; the newest ads come first
 # Which stores the Meta pass covers and how long it may run. META_STORES empty = every watchlist
 # store; META_MAX_MINUTES caps the whole pass (scrape + single-ad pages) per day, and stores are
 # taken least-recently-scraped first so a big watchlist rotates through over several days.
@@ -74,7 +74,7 @@ META_CHROMIUM_PATH = os.environ.get("META_CHROMIUM_PATH", "").strip()  # optiona
 META_AD_LIBRARY_BASE = os.environ.get("META_AD_LIBRARY_BASE", "https://www.facebook.com/ads/library/")
 LANDING_REFRESH_DAYS = int(os.environ.get("LANDING_REFRESH_DAYS", "7"))  # re-fetch advertorial pages this often
 META_MAX_POSTS = int(os.environ.get("META_MAX_POSTS", "25"))     # boosted posts to fetch per store per run
-META_DETAIL_MAX = int(os.environ.get("META_DETAIL_MAX", "60"))       # single-ad pages per store per day
+META_DETAIL_MAX = int(os.environ.get("META_DETAIL_MAX", "30"))       # single-ad pages per store per day (~2.5 min)
 META_DETAIL_LIGHT = os.environ.get("META_DETAIL_LIGHT", "1").strip() not in ("0", "false", "no")   # block images/media/fonts/css/external js on single-ad pages
 META_DETAIL_CONTEXT_PAGES = int(os.environ.get("META_DETAIL_CONTEXT_PAGES", "20"))   # new browser context every N single-ad pages
 META_CREATIVE_MAX_BYTES = int(os.environ.get("META_CREATIVE_MAX_BYTES", str(2 * 1024 * 1024)))   # hash at most this much of a video

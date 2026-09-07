@@ -479,6 +479,14 @@ Budget: about 40 probes x 10 s = 7 minutes per store per day.
 
 ## Scheduling (Windows)
 
+Two tasks, so the morning numbers are ready quickly and the slow Meta pass runs overnight:
+
+| task | when | what | takes |
+|---|---|---|---|
+| ShopifyTracker Daily | 09:00 | `run_daily.bat`: Shopify snapshot of every store, stock probe, Sheets sync | about 15 min for 100 stores |
+| ShopifyTracker Meta | 22:00 | `run_daily.bat meta`: Meta Ad Library for the watchlist (least recently scraped first) until `META_NIGHT_MINUTES` (480) is spent, then a Sheets sync | about 6 min per store at the defaults, so ~80 stores a night |
+
+
 `run_daily.bat` probes, in order, `.venv\Scripts\python.exe`, `py -3`, `python` and `python3`,
 and uses the first one that actually runs and reports Python 3.11 or newer (so a machine
 with only 3.14 and no `py` launcher works, and the Microsoft Store `python` stub is skipped).
