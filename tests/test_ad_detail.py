@@ -236,3 +236,19 @@ class DbTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ListReadingTests(unittest.TestCase):
+    def test_list_readings_from_normalised_ads(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        conn.execute("INSERT INTO meta_ads (ad_id, store_id, first_seen_date, last_seen_date) VALUES ('1', ?, ?, ?)", (sid, TODAY, TODAY))
+        ads = [{"ad_id": "1", "start_date": d(3), "end_date": TODAY, "is_active_flag": True, "page_id": "777", "page_name": "P", "page_like_count": 4321},
+               {"ad_id": "2", "start_date": None, "end_date": None, "is_active_flag": None, "page_id": None, "page_name": None, "page_like_count": None}]
+        self.assertEqual(ad_detail.record_list_readings(conn, sid, TODAY, ads), 1)   # the empty one is skipped
+        r = conn.execute("SELECT source, end_date, page_like_count FROM meta_ad_detail_daily WHERE ad_id = '1'").fetchone()
+        self.assertEqual(tuple(r), ("list", TODAY, 4321))
+        # a raw payload node still works
+        n = {"ad_archive_id": "1", "end_date": epoch(TODAY), "page_like_count": 5000, "snapshot": {}}
+        ad_detail.record_list_readings(conn, sid, TODAY, [n])
+        self.assertEqual(conn.execute("SELECT page_like_count FROM meta_ad_detail_daily WHERE ad_id = '1'").fetchone()[0], 5000)

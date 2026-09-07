@@ -310,6 +310,8 @@ def normalise_ad(node: dict) -> dict:
         "reach_source": reach["source"],
         "reach_keys": reach["keys"],
         "post_url": extract_post_url(node),
+        "page_like_count": (lambda v: int(v) if isinstance(v, (int, float)) else None)(node.get("page_like_count", snap.get("page_like_count"))),
+        "is_active_flag": node.get("is_active"),
         "reactions": social.get("reactions"),
         "comments": social.get("comments"),
         "shares": social.get("shares"),

@@ -213,9 +213,11 @@ def _resolve_url(conn: sqlite3.Connection, url: str, store_domain: str, known: s
                     break
         cache[key] = hit
         return hit
-    if session is None:
+    if session is None or cache.get("__fetched__", 0) >= config.META_MAX_LANDING_FETCH:
+        # no session, or this run's fetch budget for the store is spent: leave it for another day
         cache[key] = dict(row) if row else {"product_handle": None, "page_handle": handle_from_url(url)[1]}
         return cache[key]
+    cache["__fetched__"] = cache.get("__fetched__", 0) + 1
     hit = {"url": key, "fetched_at": today, "status": None, "final_url": None, "product_handle": None,
            "page_handle": handle_from_url(url)[1], "candidates": ""}
     cache[key] = hit
@@ -512,7 +514,7 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
     conn.commit()
     return {"ads": len(all_ads), "ignored": len(all_ads) - len(ads), "resolved": resolved, "concepts": n_concepts,
             "unlisted": unlisted,
-            "lineage": len(lineage), "pages_fetched": sum(1 for h in cache.values() if h.get("status") is not None)}
+            "lineage": len(lineage), "pages_fetched": sum(1 for h in cache.values() if isinstance(h, dict) and h.get("status") is not None)}
 
 
 def delivering(ad: dict) -> bool:

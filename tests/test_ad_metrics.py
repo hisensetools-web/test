@@ -499,3 +499,43 @@ class EncodedHandleTests(unittest.TestCase):
         self.assertEqual(shape["reach_estimate"], (1, 1))
         self.assertEqual(shape["snapshot.link_url"], (1, 1))
         self.assertIn("aaa_info.eu_total_reach=null", a["reach_keys"])
+
+
+class MetaPassPlanningTests(unittest.TestCase):
+    """Which stores the Meta pass takes, in what order, and the per-run landing-fetch cap."""
+
+    def test_scope_and_rotation(self):
+        from earlyscale import cli, db, meta_ads
+        conn = db.connect(":memory:")
+        stores = [{"store_domain": d} for d in ("a.com", "b.com", "c.com", "https://d.com")]
+        ids = {d: db.upsert_store(conn, d) for d in ("a.com", "b.com", "c.com", "https://d.com")}
+        meta_ads.record_page_run(conn, ids["a.com"], "2026-09-06", "a", "ok", "", 5, 1, 1.0)
+        meta_ads.record_page_run(conn, ids["b.com"], "2026-09-04", "b", "ok", "", 5, 1, 1.0)
+        meta_ads.record_page_run(conn, ids["c.com"], "2026-09-05", "c", "blocked", "", 0, 0, 1.0)   # not a success
+        order = [s["store_domain"] for s in cli.plan_meta_stores(conn, stores, scope=[])]
+        self.assertEqual(order, ["c.com", "https://d.com", "b.com", "a.com"])     # never scraped first, then oldest
+        self.assertEqual([s["store_domain"] for s in cli.plan_meta_stores(conn, stores, scope=["d.com", "A.com"])],
+                         ["https://d.com", "a.com"])
+        self.assertEqual([s["store_domain"] for s in cli.plan_meta_stores(conn, stores, only={"b.com"}, scope=["a.com"])], ["b.com"])
+
+    def test_landing_fetch_budget_per_store(self):
+        from earlyscale import config, db
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        calls = []
+
+        class S:
+            def get(self, url, **kw):
+                calls.append(url)
+                r = requests.Response(); r.status_code = 200; r.url = url; r._content = b"<html></html>"
+                return r
+        old = config.META_MAX_LANDING_FETCH
+        config.META_MAX_LANDING_FETCH = 2
+        try:
+            cache = {}
+            for i in range(5):
+                ad_metrics._resolve_url(conn, f"https://adv.example/{i}", "x.com", set(), {}, S(), cache, "2026-09-07", 0)
+        finally:
+            config.META_MAX_LANDING_FETCH = old
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(sum(1 for h in cache.values() if isinstance(h, dict) and h.get("status") is not None), 2)

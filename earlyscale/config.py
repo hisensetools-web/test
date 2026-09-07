@@ -60,6 +60,13 @@ META_ADS_ENABLED = os.environ.get("META_ADS", "").strip() in ("1", "true", "yes"
 META_WAIT_MIN = float(os.environ.get("META_WAIT_MIN", "3"))
 META_WAIT_MAX = float(os.environ.get("META_WAIT_MAX", "8"))
 META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "80"))
+# Which stores the Meta pass covers and how long it may run. META_STORES empty = every watchlist
+# store; META_MAX_MINUTES caps the whole pass (scrape + single-ad pages) per day, and stores are
+# taken least-recently-scraped first so a big watchlist rotates through over several days.
+META_STORES = [d.strip().lower() for d in os.environ.get("META_STORES", "").split(",") if d.strip()]
+META_MAX_MINUTES = float(os.environ.get("META_MAX_MINUTES", "90"))
+META_MAX_LANDING_FETCH = int(os.environ.get("META_MAX_LANDING_FETCH", "40"))   # advertorial / redirect pages fetched per store per run
+META_CREATIVES_PER_AD = int(os.environ.get("META_CREATIVES_PER_AD", "4"))     # images/videos hashed per ad
 META_MAX_ADS = int(os.environ.get("META_MAX_ADS", "3000"))
 META_NAV_TIMEOUT_MS = int(os.environ.get("META_NAV_TIMEOUT_MS", "45000"))
 META_CHROMIUM_PATH = os.environ.get("META_CHROMIUM_PATH", "").strip()  # optional explicit browser binary

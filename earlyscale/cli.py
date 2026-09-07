@@ -151,7 +151,10 @@ def cmd_run(args) -> int:
         except Exception as e:  # noqa: BLE001 - never let the probe break the daily run
             console.print(f"[red]inventory pass failed:[/] {e}")
     if (config.META_ADS_ENABLED or args.ads) and not args.no_ads:
-        console.print("Meta Ad Library pass (META_ADS=1) ...")
+        planned = plan_meta_stores(conn, stores, only)
+        console.print(f"Meta Ad Library pass (META_ADS=1): {len(planned)} store(s)"
+                      + (f" from META_STORES" if config.META_STORES else " (all; set META_STORES=a.com,b.com to narrow)")
+                      + f", budget {config.META_MAX_MINUTES:.0f} min, least recently scraped first ...")
         try:
             a_ok, a_failed = run_ads_pass(conn, stores, snapshot_date, only)
             console.print(f"ads: [green]{a_ok} ok[/], [red]{a_failed} failed[/]")
@@ -246,20 +249,44 @@ def cmd_remove_store(args) -> int:
     return 0 if removed or not missing else 1
 
 
-def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | None = None,
-                 headless: bool = True, max_scrolls: int | None = None, detail: bool = True,
-                 detail_cap: int | None = None) -> tuple[int, int]:
-    """Scrape the Ad Library for every store (one browser, sequential). Returns (ok, failed).
-    A blocked or failing page is logged in meta_page_runs and never aborts the pass."""
-    from playwright.sync_api import sync_playwright
+def plan_meta_stores(conn, stores: list[dict], only: set[str] | None = None, scope: list[str] | None = None) -> list[dict]:
+    """Stores for today's Meta pass: --only, else META_STORES if set, else all; least recently
+    scraped first (never scraped first) so a watchlist bigger than the daily budget rotates."""
     if only:
         stores = [s for s in stores if s["store_domain"] in only]
+    else:
+        scope = config.META_STORES if scope is None else scope
+        if scope:
+            want = {x.lower() for x in scope}
+            stores = [s for s in stores if s["store_domain"].lower() in want
+                      or re.sub(r"^https?://", "", s["store_domain"].lower()) in want]
+    last: dict[str, str] = {}
+    for r in conn.execute("""SELECT s.store_domain, MAX(r.snapshot_date) AS d FROM meta_page_runs r JOIN stores s ON s.id = r.store_id
+                             WHERE r.status = 'ok' GROUP BY s.store_domain"""):
+        last[r["store_domain"]] = r["d"]
+    return sorted(stores, key=lambda s: (last.get(s["store_domain"]) or "", s["store_domain"]))
+
+
+def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | None = None,
+                 headless: bool = True, max_scrolls: int | None = None, detail: bool = True,
+                 detail_cap: int | None = None, max_minutes: float | None = None) -> tuple[int, int]:
+    """Scrape the Ad Library for the planned stores (one browser, sequential) within a time budget.
+    Returns (ok, failed). A blocked or failing page is logged in meta_page_runs and never aborts the pass."""
+    from playwright.sync_api import sync_playwright
+    stores = plan_meta_stores(conn, stores, only)
+    budget = (config.META_MAX_MINUTES if max_minutes is None else max_minutes) * 60
+    deadline = time.monotonic() + budget
     ok = failed = 0
     session = shopify.make_session()   # for landing-page fetches
     with sync_playwright() as p:
         handle = meta_ads.BrowserHandle(p, headless=headless)
         try:
             for i, s in enumerate(stores):
+                if time.monotonic() > deadline:
+                    left = [x["store_domain"] for x in stores[i:]]
+                    log.warning("Meta pass budget of %.0f min spent: %d store(s) deferred to the next run (%s%s)",
+                                budget / 60, len(left), ", ".join(left[:5]), ", ..." if len(left) > 5 else "")
+                    break
                 browser = handle.get()   # relaunched if the previous store killed it
                 domain = s["store_domain"]
                 store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
@@ -278,7 +305,7 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                              res.responses, time.monotonic() - t0, res.note)
                     ok += 1
                     try:
-                        ad_detail.record_list_readings(conn, store_id, snapshot_date, [json.loads(a["raw_json"]) for a in res.ads if a.get("raw_json")])
+                        ad_detail.record_list_readings(conn, store_id, snapshot_date, res.ads)
                     except Exception as e:  # noqa: BLE001
                         log.warning("%-28s list readings failed: %s", domain, e)
                     _post_process_store(conn, store_id, domain, snapshot_date, session)

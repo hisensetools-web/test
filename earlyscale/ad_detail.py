@@ -239,7 +239,7 @@ def fingerprint_creatives(conn: sqlite3.Connection, ad_id: str, detail: dict, fe
                           session: requests.Session | None = None) -> dict:
     """Hash every creative of the ad not hashed before. Returns {hashed, cached, failed, first_hash}."""
     now = _utcnow()
-    urls = [("image", u) for u in detail.get("images") or []] + [("video", u) for u in detail.get("videos") or []]
+    urls = ([("image", u) for u in detail.get("images") or []] + [("video", u) for u in detail.get("videos") or []])[:config.META_CREATIVES_PER_AD]
     pos = {"image": 0, "video": 0}
     hashed = cached = failed = 0
     first_hash = None
@@ -568,12 +568,21 @@ def _fetch_loop(conn, browser, holder, fresh_page, store_id, today, todo, counts
             wait()
 
 
-def record_list_readings(conn: sqlite3.Connection, store_id: int, today: str, nodes: list[dict]) -> int:
-    """end_date / page_like_count from the search-results payload, for every ad scraped today."""
+def detail_from_ad(a: dict) -> dict:
+    """The reading shape from a normalised ad (meta_ads.normalise_ad), no raw payload needed."""
+    return {"ad_id": str(a["ad_id"]), "start_date": a.get("start_date"), "end_date": a.get("end_date"),
+            "is_active": None if a.get("is_active_flag") is None else (1 if a.get("is_active_flag") else 0),
+            "page_id": a.get("page_id"), "page_name": a.get("page_name"), "page_like_count": a.get("page_like_count"),
+            "page_profile_uri": None, "page_profile_id": None, "page_categories": [], "images": [], "videos": []}
+
+
+def record_list_readings(conn: sqlite3.Connection, store_id: int, today: str, ads: list[dict]) -> int:
+    """end_date / page_like_count from the search-results payload, for every ad scraped today.
+    `ads` are normalised ads (preferred: the stored raw_json is truncated) or raw payload nodes."""
     n = 0
-    for node in nodes:
+    for a in ads:
         try:
-            d = detail_from_list_node(node)
+            d = detail_from_ad(a) if "ad_id" in a else detail_from_list_node(a)
         except Exception:  # noqa: BLE001
             continue
         if d["ad_id"] and (d["end_date"] or d["page_like_count"] is not None):

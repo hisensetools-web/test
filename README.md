@@ -251,6 +251,14 @@ ad per day; an ad that stops appearing in the active search gets an `is_active =
 that day, which is how disappearance is tracked), `meta_concepts_daily`, `landing_pages`,
 `meta_page_runs` (status per page per run: ok / blocked / error).
 
+**Sizing.** A store costs about 12 minutes (up to 80 scrolls, landing pages, 60 single-ad pages),
+so the pass cannot cover a 100-store watchlist daily. Two controls in `.env`: `META_STORES=a.com,b.com`
+limits the pass to those stores (default: every watchlist store), and `META_MAX_MINUTES` (90) is a
+wall-clock budget for the whole pass; stores are taken least-recently-scraped first, so a watchlist
+larger than the budget rotates through over several days and the run prints which stores were
+deferred. Per store, at most `META_MAX_LANDING_FETCH` (40) advertorial / redirect pages are fetched
+per run and `META_CREATIVES_PER_AD` (4) creatives are hashed per ad.
+
 **Daily run:** the Shopify pass never depends on Meta. Set `META_ADS=1` in `.env` (or pass
 `--ads`) and `python tracker.py run` scrapes after the Shopify pass, before the Sheets
 sync; a blocked or failing page is logged in `meta_page_runs` and the run continues.
