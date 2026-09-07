@@ -26,6 +26,7 @@ class Sheet {
   getLastRow() { let last = 0; this.cells.forEach((row, i) => { if (row && row.some(v => v !== "" && v !== null && v !== undefined)) last = i + 1; }); return last; }
   getMaxRows() { return Math.max(this.maxRows, this.cells.length); }
   getMaxColumns() { return this.maxCols || 26; }
+  getLastColumn() { let w = 0; this.cells.forEach(r => { if (r) w = Math.max(w, r.length); }); return w; }
   setFrozenRows(n) { this.frozenRows = n; }
   autoResizeColumns(c, n) { this.autoResized = n; }
   getRange(r, c, nr = 1, nc = 1) {
@@ -90,7 +91,11 @@ const sandbox = {
   console,
 };
 vm.createContext(sandbox);
-vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "sheets", "Code.gs"), "utf8"), sandbox, { filename: "Code.gs" });
+let code = fs.readFileSync(path.join(__dirname, "..", "sheets", "Code.gs"), "utf8");
+// print the stack of any Apps Script error to this process's stderr (the script itself only reports the message)
+code = code.replace("return json_({ ok: false, error: String(err && err.message ? err.message : err) });",
+                    "console.error('[Code.gs] ' + (err && err.stack ? err.stack : err)); return json_({ ok: false, error: String(err && err.message ? err.message : err) });");
+vm.runInContext(code, sandbox, { filename: "Code.gs" });
 
 // ------------------------------------------------ web-app-like HTTP front
 const responses = {}; let seq = 0;

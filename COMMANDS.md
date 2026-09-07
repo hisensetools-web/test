@@ -21,7 +21,7 @@ Then:
 | when | task | what you get |
 |---|---|---|
 | 09:00 daily | Shopify snapshot, stock probe, Sheets sync | Signals, Families, Categories, Stores, Products tabs refreshed; ~15 min |
-| 22:00 daily | Meta Ad Library, least recently scraped stores first, up to 8 h, then Sheets sync | ad columns on Signals, concepts, lineage, delivery, page likes |
+| 22:00 daily | Meta Ad Library, least recently scraped stores first, up to 8 h, then Radar (triage; sweeps on Sundays, up to 4 h), then Sheets sync | ad columns on Signals, concepts, lineage, delivery, page likes, Pages tab, Candidates tab, new stores on the watchlist |
 
 The machine must be on and logged in at those times (the tracker keeps Windows awake while a pass runs; a closed lid still sleeps it). Logs: `logs\run_YYYY-MM-DD.log` and `logs\meta_YYYY-MM-DD.log`.
 
@@ -50,6 +50,7 @@ python tracker.py ads-report --store x.com    # one store
 python tracker.py ads-detail-report --days 7  # delivery (end_date) per day, page likes, coverage
 python tracker.py inventory-report --raw      # stock readings per hero variant, fallback rung per store
 python tracker.py fb-report                   # captured Sponsored posts, matches, reactions over time
+python tracker.py radar-report                # hook phrases by yield, radar totals, recent searches, Candidates
 ```
 
 Alerts also land in `alerts\YYYY-MM-DD.md` and the Alerts tab.
@@ -73,6 +74,8 @@ python tracker.py run                                  # morning pass now (~15 m
 python tracker.py ads --only x.com y.com               # Meta for specific stores (~6 min each)
 python tracker.py ads --max-minutes 60                 # Meta for the watchlist, capped at an hour
 python tracker.py inventory --only x.com               # stock probe for specific stores
+python tracker.py radar --sweep                        # weekly discovery sweeps now (~3-4 h), then triage
+python tracker.py radar                                # triage new / parked domains only (~30 min)
 ```
 
 ## 6. Watchlist
@@ -83,6 +86,14 @@ python tracker.py remove-store x.com y.com             # drop stores (history in
 ```
 
 The 17 domains that fail with 404 every run are not Shopify storefronts; removing them saves time.
+
+Stores found by Radar are added automatically with the note `radar: <source> <date>` and show `store_badge=NEW` on Signals for 14 days. To add stores from an ad-spy export or by hand without triage:
+
+```powershell
+python tracker.py radar-add x.com https://y.com/products/z   # straight onto the watchlist (source=manual)
+```
+
+or drop a `.txt` / `.csv` into `radar\imports\` (one domain per line, or a CSV with a domain/website/url column); the night run imports it and moves the file to `radar\imports\done\`.
 
 ## 7. Engagement on ads (optional, only if you installed the extension)
 
@@ -103,3 +114,19 @@ Captured posts are re-counted by the morning run automatically.
 | `META_STORES=a.com,b.com` | limit the Meta pass to these stores (default: all, rotating) |
 | `INVENTORY_STORES=a.com,b.com` | which stores get the stock probe (`INVENTORY=1` = all) |
 | `META_MAX_SCROLLS=40` / `META_DETAIL_MAX=30` | how deep each store's Meta scrape goes (~6 min per store at these) |
+| `RADAR_MAX_MINUTES=240` | cap for one radar run (sweeps + triage); leftovers continue next time |
+| `RADAR_MAX_AGE_DAYS=180` / `RADAR_MIN_ACTIVE_ADS=10` | promotion thresholds: (age <= 180 d OR a product <= 30 d old with >= 3 ads) AND >= 10 active ads |
+| `RADAR_MAX_ADS_PER_QUERY=500` / `RADAR_COUNTRY=US` | how deep each hook / copycat search goes |
+| `RADAR_SWEEP_WEEKDAY=6` | which weekday the sweeps run (6 = Sunday) |
+
+## 9. Radar (finding new stores)
+
+Runs on its own inside the 22:00 task. What you do:
+
+- **Sunday night / Monday morning:** open the Candidates tab and `python tracker.py radar-report`.
+  The hook table says per phrase how many domains it found and how many were promoted; delete phrases
+  with a `delete` verdict from `radar\hooks.txt` after two sweeps, add siblings of the top producers.
+- **Any day:** type `Y` in the `promote` column of a Candidates row to force it onto the watchlist
+  (picked up by the next sync + radar run). Rows are re-checked daily and promote themselves the day
+  they cross the thresholds; `type=funnel` rows are non-Shopify landers whose ads are tracked anyway.
+- **Signals tab:** `store_badge=NEW` marks stores Radar added in the last 14 days.

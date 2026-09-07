@@ -13,7 +13,7 @@ import sqlite3
 from collections import Counter, defaultdict
 from datetime import date, timedelta
 
-from . import deltas
+from . import config, deltas
 
 # ---------------------------------------------------------------- channel tags
 
@@ -219,12 +219,41 @@ def store_signal_context(conn: sqlite3.Connection, store_id: int, store_domain: 
     rank_7d: dict[int, int | None] = {}
     if week_ago:
         rank_7d = {p["product_id"]: p["collection_position"] for p in load_store_products(conn, store_id, week_ago)}
-    from . import ad_metrics, inventory
+    from . import ad_metrics, inventory, scaling
     meta = ad_metrics.meta_for_signals(conn, store_id, today)
     inv = inventory.inventory_for_signals(conn, store_id, today)
+    pm = scaling.product_metrics(conn, store_id, store_domain, today)
     return {"store_id": store_id, "store": store_domain, "date": today, "as_of": as_of_d,
             "products": products, "families": fam, "rank_7d": rank_7d, "rank_7d_date": week_ago, "meta": meta,
-            "inventory": inv}
+            "inventory": inv, "pages": pm, "badge": store_badge(conn, store_id, store_domain, today)}
+
+
+def store_badge(conn: sqlite3.Connection, store_id: int, store_domain: str, today: str) -> str:
+    """NEW for RADAR_NEW_BADGE_DAYS after Radar added the store (watchlist note 'radar: <source> <date>')."""
+    import re as _re
+    from .watchlist import read_watchlist
+    note = ""
+    try:
+        for s in read_watchlist():
+            if s["store_domain"] == store_domain:
+                note = s.get("notes") or ""
+                break
+    except Exception:  # noqa: BLE001
+        pass
+    m = _re.search(r"radar:.*?(\d{4}-\d{2}-\d{2})", note)
+    if not m:
+        r = conn.execute("SELECT promoted_at FROM radar_domains WHERE domain = ? AND promoted_at IS NOT NULL",
+                         (_re.sub(r"^https?://", "", store_domain).replace("www.", "", 1),)).fetchone()
+        if not r:
+            return ""
+        when = r[0]
+    else:
+        when = m.group(1)
+    try:
+        age = (date.fromisoformat(today) - date.fromisoformat(when)).days
+    except ValueError:
+        return ""
+    return "NEW" if 0 <= age <= config.RADAR_NEW_BADGE_DAYS else ""
 
 
 def _blank(v):
@@ -241,9 +270,11 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
     rows = []
     meta = ctx.get("meta") or {}
     inv = ctx.get("inventory") or {}
+    pages = ctx.get("pages") or {}
     for p in ctx["products"]:
         m = meta.get(p["handle"], {})
         iv = inv.get(p["handle"], {})
+        pg = pages.get(p["handle"], {})
         days = _days_between(p["published_at"], as_of)
         rank = None if p["collection_position"] is None else p["collection_position"] + 1
         old = ctx["rank_7d"].get(p["product_id"]) if ctx["rank_7d_date"] else None
@@ -258,11 +289,13 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
             "" if p["min_price"] is None else p["min_price"], sold_out,
             "" if rank is None else rank, rank_delta, fam_new_7d[fam[p["product_id"]]],
             m.get("ads_pointing_here", ""), m.get("ads_launched_7d", ""), m.get("ads_launched_prev_7d", ""), m.get("ad_velocity_wow", ""),
-            m.get("ads_as_of", ""),
+            m.get("ads_as_of", ""), pg.get("pages_pointing_here", ""), pg.get("pages_new_7d", ""),
+            pg.get("landing_paths", ""), pg.get("landing_paths_new_7d", ""),
             _blank(m.get("engagement_per_day")), _blank(m.get("days_running_max")),
             m.get("concept_status", ""), _blank(m.get("eu_reach_slope_7d")), _blank(m.get("comment_delta_1d")),
             iv.get("signal_source", ""), iv.get("inventory_tracked", ""), _blank(iv.get("stock_level")),
-            _blank(iv.get("units_sold_1d")), _blank(iv.get("units_per_day_7d")), _blank(iv.get("units_per_day_wow"))])
+            _blank(iv.get("units_sold_1d")), _blank(iv.get("units_per_day_7d")), _blank(iv.get("units_per_day_wow")),
+            ctx.get("badge", "")])
     return rows
 
 

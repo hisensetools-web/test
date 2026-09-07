@@ -13,7 +13,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, sheets, shopify
+from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, radar, scaling, sheets, shopify, store_age
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist
 
 console = Console()
@@ -84,6 +84,10 @@ def run_products_pass(conn, stores: list[dict], snapshot_date: str, only: set[st
             log.info("%-28s ok  products=%-5d variants=%-5d sold_out_variants=%-4d pages=%d  %.1fs",
                      domain, n, sum(p["variant_count"] for p in products), sold_out, pages, dur)
             ok += 1
+            try:   # shop id, once per store, quietly: Radar's store-age calibration uses it
+                store_age.ensure_identity(conn, store_id, domain, session)
+            except Exception as e:  # noqa: BLE001
+                log.debug("%s shop id lookup failed: %s", domain, e)
         except Exception as e:  # noqa: BLE001 - by design: log and continue
             dur = time.monotonic() - t0
             db.record_store_run(conn, run_id, store_id, snapshot_date, "error", str(e)[:500], 0, 0, dur)
@@ -330,6 +334,7 @@ def _post_process_store(conn, store_id: int, domain: str, snapshot_date: str, se
     try:
         m = ad_metrics.process_store(conn, store_id, domain, snapshot_date, session, fetch_landings)
         alerts = ad_metrics.run_alerts(conn, store_id, domain, snapshot_date)
+        alerts += scaling.run_alerts(conn, store_id, domain, snapshot_date)
         log.info("%-28s metrics: resolved=%s/%s unlisted_products=%s concepts=%s lineage=%s pages_fetched=%s alerts=%d",
                  domain, m.get("resolved", 0), m.get("ads", 0), m.get("unlisted", 0), m.get("concepts", 0),
                  m.get("lineage", 0), m.get("pages_fetched", 0), len(alerts))
@@ -902,6 +907,93 @@ def cmd_fb_bait(args) -> int:
     return 0
 
 
+def _radar_summary(conn, out: dict) -> None:
+    c = radar.summary_counts(conn)
+    if out.get("imports") and out["imports"]["files"]:
+        console.print(f"imports: {out['imports']['files']} file(s): {len(out['imports']['added'])} added, {len(out['imports']['existing'])} already listed, {len(out['imports']['bad'])} unreadable")
+    if out.get("sweep"):
+        console.print(f"hook sweep: {out['sweep']['queries']} phrases, {out['sweep']['ads']} ads, {len(out['sweep']['domains'])} landing domains")
+    if out.get("copycat"):
+        console.print(f"copycat: {out['copycat']['queries']} product queries, {out['copycat']['ads']} ads, {len(out['copycat']['domains'])} landing domains")
+    if out.get("web"):
+        console.print(f"web search: {out['web']['queries']} queries, {out['web']['domains']} domains")
+    console.print(f"triage: {out['found']} new domain(s) checked -> promoted {out['promoted']}, parked {out['parked']} "
+                  f"(of which funnels / non-Shopify {out['funnels']}); re-triaged {out['retriaged']} candidate(s), promoted {out['promoted_later']}")
+    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']}, promoted {c['promoted']}, manual {c['watchlist']}, funnels {c['funnel']}")
+
+
+def cmd_radar(args) -> int:
+    from playwright.sync_api import sync_playwright
+    conn = db.connect(args.db)
+    today = _parse_date(args.date)
+    do_sweep = True if args.sweep else (False if args.no_sweep else None)
+    console.print(f"radar: {'sweep + ' if do_sweep or (do_sweep is None and date.fromisoformat(today).weekday() == config.RADAR_SWEEP_WEEKDAY) else ''}triage, "
+                  f"hooks={len(radar.load_hooks())}, country={config.RADAR_COUNTRY}, up to {config.RADAR_MAX_ADS_PER_QUERY} ads/query")
+    with sync_playwright() as pw, meta_ads.KeepAwake():
+        handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
+        try:
+            out = radar.run_radar(conn, handle, today, do_sweep=do_sweep, watchlist_path=Path(args.watchlist) if args.watchlist else None,
+                                  max_minutes=args.max_minutes)
+        finally:
+            handle.close()
+    _radar_summary(conn, out)
+    if out.get("sweep"):
+        _hook_table(conn)
+    return _radar_table(conn, args.limit)
+
+
+def _radar_table(conn, limit: int = 40) -> int:
+    rows = radar.candidates_rows(conn)
+    t = Table(title="Candidates (what the Candidates tab shows; set promote=Y in the sheet to force one)")
+    for c in ("domain", "type", "status", "age d", "created est", "first product", "products", "ads", "pages", "top page", "hot new product", "source", "lander"):
+        t.add_column(c, justify="right" if c in ("age d", "products", "ads", "pages") else "left")
+    for r in rows[:limit]:
+        t.add_row(r[0], r[1], r[2], str(r[4]), r[5], r[6], str(r[7]), str(r[8]), str(r[9]), (r[10] or "")[:22], r[12], (r[13] or "")[:28], r[14])
+    console.print(t)
+    return 0
+
+
+def cmd_radar_add(args) -> int:
+    conn = db.connect(args.db)
+    r = radar.manual_add(conn, args.items, _parse_date(None), watchlist_path=Path(args.watchlist) if args.watchlist else None)
+    for d in r["added"]:
+        console.print(f"[green]added[/] {d}")
+    for d in r["existing"]:
+        console.print(f"already listed: {d}")
+    for d in r["bad"]:
+        console.print(f"[red]not a domain or URL:[/] {d}")
+    console.print(f"{len(r['added'])} added to the watchlist (source=manual). They get their first snapshot on the next run.")
+    return 0 if r["added"] or not r["bad"] else 1
+
+
+def _hook_table(conn) -> None:
+    rows = radar.hook_yield(conn)
+    if not rows or not any(r["sweeps"] for r in rows):
+        return
+    t = Table(title="hook phrases by yield (delete a phrase with 0 promotable stores over 2 sweeps; add siblings to the top ones)")
+    for c in ("hook", "sweeps", "ads", "domains", "promoted", "candidates", "funnels", "verdict"):
+        t.add_column(c, justify="left" if c in ("hook", "verdict") else "right")
+    for r in rows:
+        t.add_row(r["hook"], str(r["sweeps"]), str(r["ads"]), str(r["domains"]), str(r["promoted"]), str(r["candidates"]), str(r["funnels"]), r["verdict"])
+    console.print(t)
+
+
+def cmd_radar_report(args) -> int:
+    conn = db.connect(args.db)
+    _hook_table(conn)
+    c = radar.summary_counts(conn)
+    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']}, promoted {c['promoted']}, manual {c['watchlist']}, funnels {c['funnel']}")
+    runs = conn.execute("SELECT kind, query, started_at, ads_found, domains_found, note FROM radar_runs ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
+    if runs:
+        t = Table(title="recent radar runs")
+        for col in ("kind", "query", "started", "ads", "domains", "note"):
+            t.add_column(col)
+        for r in runs:
+            t.add_row(r["kind"], (r["query"] or "")[:40], (r["started_at"] or "")[:16], str(r["ads_found"] or ""), str(r["domains_found"] or ""), (r["note"] or "")[:40])
+        console.print(t)
+    return _radar_table(conn, args.limit)
+
+
 def cmd_ads(args) -> int:
     snapshot_date = _parse_date(args.date)
     stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
@@ -1417,7 +1509,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("sync-sheets", help="push latest snapshot + deltas to Google Sheets via Apps Script")
     s.add_argument("--date", help="sync the snapshot as of this date (default: latest)")
-    s.add_argument("--tabs", help="comma list from signals,families,categories,stores,products,alerts (default all)")
+    s.add_argument("--tabs", help="comma list from signals,families,categories,stores,pages,candidates,products,alerts (default all)")
     s.add_argument("--dry-run", action="store_true", help="build and size the chunks but send nothing")
     s.add_argument("--watchlist", help="alternate watchlist.csv (only its stores are synced)")
     s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")
@@ -1428,6 +1520,23 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("domains", nargs="+")
     s.add_argument("--watchlist", help="alternate watchlist.csv path")
     s.set_defaults(fn=cmd_remove_store)
+
+    s = sub.add_parser("radar", help="store discovery: hook + copycat sweeps (Sundays, or --sweep), then triage new landing domains")
+    s.add_argument("--date"); s.add_argument("--watchlist")
+    s.add_argument("--sweep", action="store_true", help="run the weekly sweeps now")
+    s.add_argument("--no-sweep", action="store_true", help="triage only, even on a Sunday")
+    s.add_argument("--max-minutes", type=float, help=f"budget for this run (default RADAR_MAX_MINUTES={config.RADAR_MAX_MINUTES:.0f})")
+    s.add_argument("--headed", action="store_true")
+    s.add_argument("--limit", type=int, default=40)
+    s.set_defaults(fn=cmd_radar)
+
+    s = sub.add_parser("radar-add", help="add domains/URLs straight to the watchlist (source=manual), no triage")
+    s.add_argument("items", nargs="+"); s.add_argument("--watchlist")
+    s.set_defaults(fn=cmd_radar_add)
+
+    s = sub.add_parser("radar-report", help="radar totals, recent runs, the Candidates table")
+    s.add_argument("--limit", type=int, default=40)
+    s.set_defaults(fn=cmd_radar_report)
 
     s = sub.add_parser("report", help="stores sorted by how much changed, with product-level changes")
     s.add_argument("--date", help="report as of this snapshot date (default: latest)")

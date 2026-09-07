@@ -50,16 +50,17 @@ class MetaScrapeError(Exception):
 
 # ---------------------------------------------------------------- pure parsing
 
-def build_search_url(query: str | None = None, page_id: str | None = None, active_only: bool = True) -> str:
+def build_search_url(query: str | None = None, page_id: str | None = None, active_only: bool = True,
+                     country: str = "ALL", search_type: str | None = None) -> str:
     status = "active" if active_only else "all"
-    base = f"{config.META_AD_LIBRARY_BASE}?active_status={status}&ad_type=all&country=ALL&media_type=all"
+    base = f"{config.META_AD_LIBRARY_BASE}?active_status={status}&ad_type=all&country={quote(country)}&media_type=all"
     if page_id:
         return f"{base}&view_all_page_id={quote(str(page_id))}&search_type=page"
     if not query:
         raise ValueError("query or page_id required")
-    if "." in query and " " not in query:   # looks like a domain -> keyword search
-        return f"{base}&q={quote(query)}&search_type=keyword_unordered"
-    return f"{base}&q={quote(query)}&search_type=page"
+    if search_type is None:
+        search_type = "keyword_unordered" if ("." in query and " " not in query) else "page"
+    return f"{base}&q={quote(query)}&search_type={search_type}"
 
 
 def _walk(obj, seen: list):

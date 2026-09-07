@@ -38,6 +38,7 @@ echo ==== %DATE% %TIME% start %MODE% (%PY% = Python %PYVER%) >> "%LOG%"
 if /i "%MODE%"=="meta" (
   %PY% tracker.py ads --max-minutes %META_NIGHT_MINUTES% >> "%LOG%" 2>&1
   set RC=!ERRORLEVEL!
+  %PY% tracker.py radar >> "%LOG%" 2>&1
   %PY% tracker.py sync-sheets >> "%LOG%" 2>&1
 ) else (
   %PY% tracker.py run --no-ads >> "%LOG%" 2>&1

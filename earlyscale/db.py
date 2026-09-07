@@ -241,6 +241,57 @@ CREATE TABLE IF NOT EXISTS fb_posts_daily (
     PRIMARY KEY (snapshot_date, post_id)
 );
 
+-- Radar: store discovery. One row per landing domain ever seen by a sweep or import.
+CREATE TABLE IF NOT EXISTS radar_domains (
+    domain              TEXT PRIMARY KEY,
+    type                TEXT,               -- shopify | funnel | not-shopify
+    status              TEXT NOT NULL,      -- candidate | promoted | discarded | watchlist
+    source              TEXT,               -- hook:<phrase> | copycat:<handle> | web:<query> | manual
+    first_seen          TEXT NOT NULL,
+    last_checked        TEXT,
+    lander_domain       TEXT,               -- the non-Shopify domain the ads land on, when the store was found via its checkout link
+    shop_id             INTEGER,
+    store_created_est   TEXT,
+    store_first_created TEXT,
+    store_age_days      INTEGER,
+    products            INTEGER,
+    active_ads          INTEGER,
+    pages               INTEGER,
+    top_page            TEXT,
+    hot_new_product     TEXT,               -- handle of a product published <= 30 days ago with >= 3 ads
+    example_text        TEXT,
+    promote_flag        TEXT,               -- Y from the Candidates tab
+    promoted_at         TEXT,
+    note                TEXT
+);
+-- Ads seen by Radar searches (hook phrases, copycat queries, domain checks).
+CREATE TABLE IF NOT EXISTS radar_ads (
+    ad_id           TEXT PRIMARY KEY,
+    query           TEXT,
+    source          TEXT,
+    page_id         TEXT,
+    page_name       TEXT,
+    landing_url     TEXT,
+    landing_domain  TEXT,
+    body_len        INTEGER,
+    body_snippet    TEXT,
+    start_date      TEXT,
+    first_seen      TEXT NOT NULL,
+    last_seen       TEXT NOT NULL,
+    is_active       INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_radar_ads_domain ON radar_ads(landing_domain);
+CREATE TABLE IF NOT EXISTS radar_runs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind        TEXT NOT NULL,      -- sweep | copycat | web | triage | import
+    query       TEXT,
+    started_at  TEXT NOT NULL,
+    ended_at    TEXT,
+    ads_found   INTEGER,
+    domains_found INTEGER,
+    note        TEXT
+);
+
 CREATE TABLE IF NOT EXISTS hero_variants (
     store_id            INTEGER NOT NULL REFERENCES stores(id),
     variant_id          INTEGER NOT NULL,

@@ -7,7 +7,7 @@
  * Put the resulting /exec URL in .env as SHEETS_WEBHOOK_URL.
  *
  * Protocol (one POST per chunk, JSON body):
- *   { "tab": "Signals" | "Families" | "Categories" | "Stores" | "Products" | "Alerts",
+ *   { "tab": "Signals" | "Families" | "Categories" | "Stores" | "Pages" | "Candidates" | "Products" | "Alerts",
  *     "mode": "replace" | "append",
  *     "chunk": 1, "chunks": 3,          // 1-based; replace clears the tab on chunk 1
  *     "rows": [[...], [...]] }           // values in header order
@@ -21,37 +21,34 @@
 
 var TABS = {
   Signals: {
-    headers: ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
-              "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
-              "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d",
-              "ad_velocity_wow", "ads_as_of", "engagement_per_day",
-              "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d",
-              "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d",
-              "units_per_day_wow"],
-    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 14, 15, 18, 19, 20, 21], position: 1
+    headers: ["store", "product family", "handle", "channel tag", "days_since_published", "published_at", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"],
+    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 14, 15, 22, 25, 26, 31], position: 1
   },
   Families: {
-    headers: ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
-              "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"],
-    keyCols: null, textCols: [0, 1, 2, 4, 5, 10], position: 2
+    headers: ["store", "family", "title", "handles", "newest published_at", "oldest published_at", "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"],
+    keyCols: null, textCols: [0, 1, 2, 3, 4, 5, 10], position: 2
   },
   Categories: {
-    headers: ["category", "stores", "families", "newest published_at", "families published 7d",
-              "store list", "example families"],
+    headers: ["category", "stores", "families", "newest published_at", "families published 7d", "store list", "example families"],
     keyCols: null, textCols: [0, 3, 5, 6], position: 3
   },
   Stores: {
-    headers: ["store", "meta page", "last status", "products", "sold-out variants",
-              "new products 7d", "updated products 7d", "sold-out delta", "price changes",
-              "change score", "last snapshot date", "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d",
-              "ad_velocity_wow", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
+    headers: ["store", "meta page", "last status", "products", "sold-out variants", "new products 7d", "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date", "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow", "pages_per_domain", "pages_new_7d", "page_likes_slope_max", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
     keyCols: null,                 // fully overwritten each sync
-    textCols: [0, 1, 2, 10, 11, 15, 18],   // keep dates / domains as text, not auto-parsed
+    textCols: [0, 1, 2, 10, 11, 15, 21],   // keep dates / domains as text, not auto-parsed
     position: 4
   },
+  Pages: {
+    headers: ["store", "page name", "page_id", "first_seen", "active_ads", "last_delivered", "page_likes", "page_likes_7d_slope", "ads_as_of"],
+    keyCols: null, textCols: [0, 1, 2, 3, 5, 8], position: 5
+  },
+  Candidates: {
+    headers: ["domain", "type", "status", "first_seen", "store_age_days", "store_created_est", "store_first_created", "products", "active_ads", "pages", "top page", "example ad text", "hot new product", "source", "lander_domain", "last_checked", "promote"],
+    keyCols: null,                 // rewritten each sync AFTER the tracker has read the promote column back
+    textCols: [0, 1, 2, 3, 5, 6, 10, 11, 12, 13, 14, 15, 16], position: 6
+  },
   Products: {
-    headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price",
-              "available variants", "total variants", "collection position"],
+    headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price", "available variants", "total variants", "collection position"],
     keyCols: null,                 // the full latest catalogue of every store, rewritten each sync
     textCols: [0, 1, 2, 3, 4, 5],  // (history stays in data/tracker.db: `python tracker.py product <handle>`)
     moveToEnd: true,               // raw data lives at the end of the tab bar
@@ -60,15 +57,16 @@ var TABS = {
   Alerts: {
     headers: ["date", "store", "handle", "rule", "detail", "created_at"],
     keyCols: [0, 1, 2, 3, 4],      // date + store + handle + rule + detail (several alerts can share a rule)
-    textCols: [0, 1, 2, 4, 5],
-    position: 5
+    textCols: [0, 1, 2, 3, 4, 5],
+    position: 7
   }
 };
 
 /** Health check: open the /exec URL in a browser and you should see "ok".
  *  ?tabs=1            -> JSON {tab: rows} for every tab the script knows (rows exclude the header)
  *  ?tab=Products      -> JSON {tab, rows, maxRows}
- *  ?tab=Products&group=1 -> also {byValue: {value in column 1 (0-based): count}}, e.g. rows per store */
+ *  ?tab=Products&group=1 -> also {byValue: {value in column 1 (0-based): count}}, e.g. rows per store
+ *  ?tab=Candidates&rows=1 -> also {rows: [[...]]} (the tracker reads the promote column back before rewriting) */
 function doGet(e) {
   var p = (e && e.parameter) || {};
   if (p.tabs) {
@@ -85,6 +83,12 @@ function doGet(e) {
     if (!sheet) return json_({ ok: true, tab: p.tab, rows: null, maxRows: null });
     var last = sheet.getLastRow();
     var res = { ok: true, tab: p.tab, rows: Math.max(0, last - 1), maxRows: sheet.getMaxRows() };
+    if (p.rows !== undefined && last > 1) {
+      var n = Math.min(last - 1, 2000);
+      var w = Math.min(sheet.getLastColumn(), 40);
+      var vals2 = sheet.getRange(2, 1, n, w).getValues();
+      res.rows = vals2.map(function (r) { return r.map(function (v) { return v instanceof Date ? Utilities.formatDate(v, "UTC", "yyyy-MM-dd") : v; }); });
+    }
     if (p.group !== undefined && last > 1) {
       var col = parseInt(p.group, 10) + 1;
       var vals = sheet.getRange(2, col, last - 1, 1).getValues();
@@ -132,15 +136,8 @@ function getOrCreateSheet_(name, spec) {
     sheet = ss.insertSheet(name);
     isNew = true;
   }
-  if (isNew || sheet.getLastRow() === 0) {
-    sheet.getRange(1, 1, 1, spec.headers.length).setValues([spec.headers]).setFontWeight("bold");
-    sheet.setFrozenRows(1);
-    for (var i = 0; i < spec.textCols.length; i++) {
-      sheet.getRange(1, spec.textCols[i] + 1, sheet.getMaxRows(), 1).setNumberFormat("@");
-    }
-    sheet.autoResizeColumns(1, spec.headers.length);
-    if (spec.position) moveSheet_(ss, sheet, spec.position);
-  }
+  ensureHeader_(sheet, spec);
+  if (isNew && spec.position) moveSheet_(ss, sheet, spec.position);
   if (spec.moveToEnd) moveSheet_(ss, sheet, ss.getNumSheets());
   if (spec.hideCols) {
     for (var h = 0; h < spec.hideCols.length; h++) sheet.hideColumns(spec.hideCols[h] + 1);
@@ -184,6 +181,23 @@ function appendRows_(sheet, spec, rows) {
   }
   writeRows_(sheet, spec, fresh);
   return { received: rows.length, written: fresh.length, skipped: rows.length - fresh.length };
+}
+
+/** Header row = the spec's headers, always: tabs gain columns over time and a stale header is worse
+ *  than none. Grows the grid first (a new sheet has 26 columns; Signals has more). */
+function ensureHeader_(sheet, spec) {
+  var width = spec.headers.length;
+  if (sheet.getMaxColumns() < width) sheet.insertColumnsAfter(sheet.getMaxColumns(), width - sheet.getMaxColumns());
+  var cur = sheet.getLastRow() >= 1 ? sheet.getRange(1, 1, 1, width).getValues()[0] : [];
+  var same = cur.length === width;
+  for (var i = 0; same && i < width; i++) if (String(cur[i]) !== String(spec.headers[i])) same = false;
+  if (same) return;
+  sheet.getRange(1, 1, 1, width).setValues([spec.headers]).setFontWeight("bold");
+  sheet.setFrozenRows(1);
+  for (var j = 0; j < spec.textCols.length; j++) {
+    sheet.getRange(1, spec.textCols[j] + 1, sheet.getMaxRows(), 1).setNumberFormat("@");
+  }
+  sheet.autoResizeColumns(1, width);
 }
 
 function writeRows_(sheet, spec, rows) {

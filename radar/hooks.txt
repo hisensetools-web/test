@@ -1,0 +1,102 @@
+# hooks.txt — one phrase per line. Lines starting with # are ignored.
+# Ad Library keyword search matches ad text. Keep phrases short (2–5 words):
+# long phrases return almost nothing, generic single words return junk.
+# Add or remove freely; the sweep re-reads this file every run.
+
+## Authority / persona openers (advertorial signature)
+I'm a doctor
+I've been a doctor for
+as a nurse
+I'm a pharmacist
+I'm a vet
+as a veterinarian
+my patients
+years in practice
+retired doctor
+
+## Age anchors
+after 50
+after 60
+over 60
+at 62
+at 67
+in my 70s
+for seniors
+turning 50
+my grandmother
+my mother is
+
+## Confession / story arcs
+refused to take
+stopped taking
+I tried everything
+here's what finally
+what finally worked
+I was skeptical
+I wish I found this sooner
+changed my life
+finally slept through
+gave up on
+
+## Contrarian / villain framing
+doctors are begging
+big pharma
+what doctors won't tell you
+your doctor won't
+the real reason
+they don't want you to know
+stop wasting money on
+
+## Listicle / numbered
+3 reasons
+5 reasons
+7 reasons
+reason #3
+3 signs
+5 mistakes
+the #1 mistake
+
+## Symptom-first (broad, not ingredient-specific)
+if you struggle with
+if you have trouble
+can't sleep
+joint pain
+bloating
+brain fog
+blood sugar
+blood pressure
+eyesight
+tinnitus
+neuropathy
+restless legs
+nail fungus
+hot flashes
+low energy
+gut health
+
+## Pet owner hooks
+my dog was
+my vet recommended
+vet recommended
+senior dog
+my cat stopped
+for dogs over
+
+## Offer / urgency signals (catch the scaling phase)
+buy 2 get 1
+buy 3 get 2
+bogo
+limited time only
+selling out fast
+almost sold out
+try it risk free
+90 day guarantee
+one time purchase
+
+## Discovery / social proof
+went viral
+tiktok made me buy
+thousands of women
+over 100,000
+5 star reviews
+as seen on

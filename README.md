@@ -446,6 +446,108 @@ the Meta pass and the Sheets sync. `INVENTORY=1` (or `run --inventory`) probes e
 only after the readings from the first stores look right. `--no-inventory` skips the pass.
 Budget: about 40 probes x 10 s = 7 minutes per store per day.
 
+## Scaling columns: pages per domain, landing paths, page-likes slope
+
+Three "is this store scaling" measurements, all derived from ads already in the database (no
+extra scraping). They land on the Signals and Stores tabs and on a new **Pages** tab.
+
+| column | tab | meaning |
+|---|---|---|
+| `pages_per_domain` | Stores | distinct Facebook pages with an active ad landing on this store. Scaling stores spread spend across several pages |
+| `pages_new_7d` | Stores / Signals | of those pages, how many were first seen in the last 7 days (Signals: pages pointing at *this product*) |
+| `pages_pointing_here` | Signals | distinct pages whose ads land on this product |
+| `landing_paths` | Signals | distinct landing URL paths (query string stripped) used by this product's ads: `/products/x`, `/pages/x-offer`, `/collections/x`... |
+| `landing_paths_new_7d` | Signals | how many of those paths first appeared in the last 7 days. New paths = new advertorials / offer pages = testing angles |
+| `page_likes_slope_max` | Stores | the fastest likes/day slope among the store's pages (from `meta_page_likes_daily`) |
+
+**Pages tab:** one row per (store, page): page name, `page_id`, `first_seen`, `active_ads`,
+`last_delivered`, `page_likes`, `page_likes_7d_slope`, `ads_as_of`. A page can appear under several
+stores if its ads land on several domains.
+
+Alerts (written to `alerts/YYYY-MM-DD.md` and the Alerts tab, at most once a week per target):
+
+- **rule 13** store gained 2 or more new advertising pages in 7 days
+- **rule 14** product gained 3 or more new landing paths in 7 days
+- **rule 12** (page likes slope doubled week over week) is the third one from the spec; it was already in place
+
+These columns only move on days the store was scraped (`ads_as_of` says which day), like every other ad number.
+
+## Radar: finding stores before they are on the watchlist
+
+`python tracker.py radar` discovers new Shopify stores from the Ad Library and decides, per store,
+whether it goes straight onto the watchlist or waits on a **Candidates** tab. The night task runs it
+after the Meta pass; on Sundays (`RADAR_SWEEP_WEEKDAY=6`) it also runs the weekly sweeps.
+
+### Sources
+
+1. **Hook sweeps** (`radar/hooks.txt`, one phrase per line, `#` comments). Each phrase is searched
+   in the Ad Library (US, active ads, unordered keyword match, up to `RADAR_MAX_ADS_PER_QUERY=500`
+   ads per phrase). Every ad is stored in `radar_ads` with its page name, page id, landing domain,
+   body length and start date; the landing domain is what gets triaged.
+2. **Copycat search**: for every watchlist store's hero products (top 3 by collection rank plus
+   anything published in the last 30 days) the distinctive words of the title, minus the store's
+   own brand words, become an Ad Library query, so stores selling the same product show up. The
+   same words go to a web search (DuckDuckGo HTML, `RADAR_WEB_SEARCH=1`, `RADAR_MAX_WEB_QUERIES`)
+   and every result domain is kept for triage. Copycat queries rotate: `RADAR_MAX_COPYCAT_QUERIES`
+   least-recently-searched ones per sweep.
+3. **Manual import**: `python tracker.py radar-add <domain or url> ...`, or drop a `.txt`/`.csv`
+   into `radar/imports/` (one domain per line, or any CSV with a domain / website / url / landing / link
+   column, e.g. an ad-spy export). These skip triage and go straight onto the watchlist with
+   `source=manual`; processed files move to `radar/imports/done/`.
+
+### Triage (every new landing domain, then every Candidates row again daily)
+
+1. Is it a Shopify storefront? (`/products.json` answers with products.) If not, the lander's
+   outbound links (buy buttons, checkout, "shop now") are followed one hop; if one of them is a
+   Shopify store, that store is the candidate and the lander is remembered in `lander_domain`.
+   Still nothing: the domain is parked as `type=funnel` and its ads, pages and landing URLs are
+   tracked anyway (it stays on the Candidates tab and is re-checked daily).
+2. Store age: `store_age_days` from the earliest product `created_at` (or the shop-id calibration
+   when one exists; it is optional). `store_first_created` and `store_created_est` are both shown.
+3. Ad Library search for the domain: `active_ads`, distinct `pages`, `top page`, an example ad text,
+   and `hot new product` = a product published in the last 30 days with 3 or more ads pointing at it.
+4. **Promote** when `(store_age_days <= RADAR_MAX_AGE_DAYS (180) OR hot new product) AND active_ads >= RADAR_MIN_ACTIVE_ADS (10)`.
+   Promotion appends the store to `watchlist.csv` with the note `radar: <source> <date>` (plus
+   `via <lander>` when it was reached through a funnel page) and it gets its first Shopify snapshot on
+   the next morning run. On the Signals tab its rows carry `store_badge=NEW` for
+   `RADAR_NEW_BADGE_DAYS` (14) days.
+   Everything else is a **candidate**: re-triaged every day and promoted the day it crosses the
+   thresholds. To force one, type `Y` in the `promote` column of the Candidates tab; the next
+   `sync-sheets` reads the marks back and the next radar run promotes those domains.
+
+There is no copy-length filter anywhere.
+
+### Candidates tab
+
+`domain, type (shopify / funnel), status (candidate / promoted), first_seen, store_age_days,
+store_created_est, store_first_created, products, active_ads, pages, top page, example ad text (200 chars),
+hot new product, source (hook:<phrase> / copycat:<store>/<handle> / web:<store>/<handle> / manual),
+lander_domain, last_checked, promote`. Candidates first (most active ads first), then promoted rows.
+
+### Budget and schedule
+
+One radar run is capped at `RADAR_MAX_MINUTES` (240). Sweeps stop when the budget is spent and the
+remaining phrases run next Sunday; triage handles up to `RADAR_MAX_TRIAGE` (40) new domains per run and
+defers the rest to the next night. Every search waits the same random 3-8 s as the Meta scraper and uses
+one browser. A full first sweep (80 hooks x up to 500 ads plus up to 60 copycat queries) takes most of the
+budget; if it keeps running out, halve the symptom group in `hooks.txt` first.
+
+```powershell
+python tracker.py radar --sweep                # run the weekly sweeps now (and triage), ~3-4 h
+python tracker.py radar                        # triage only (unless it is Sunday), ~30 min
+python tracker.py radar --no-sweep             # triage only, even on Sunday
+python tracker.py radar --max-minutes 60       # smaller budget for a test
+python tracker.py radar-report                 # hook yield table, totals, recent runs, Candidates
+python tracker.py radar-add x.com https://y.com/products/z   # straight onto the watchlist (source=manual)
+```
+
+### Hook yield (keeping `hooks.txt` honest)
+
+`radar-report` (and the end of every sweep) prints one row per phrase: sweeps run, ads seen, distinct
+landing domains, how many of those were promoted, how many are parked candidates, how many funnels,
+and a verdict. `delete` = zero promotable stores across two or more sweeps; `add siblings` = the top
+producers. Edit `radar/hooks.txt` accordingly; the next sweep picks up the new list.
+
 ## Scheduling (Windows)
 
 Two tasks, so the morning numbers are ready quickly and the slow Meta pass runs overnight:
@@ -453,7 +555,7 @@ Two tasks, so the morning numbers are ready quickly and the slow Meta pass runs 
 | task | when | what | takes |
 |---|---|---|---|
 | ShopifyTracker Daily | 09:00 | `run_daily.bat`: Shopify snapshot of every store, stock probe, Sheets sync | about 15 min for 100 stores |
-| ShopifyTracker Meta | 22:00 | `run_daily.bat meta`: Meta Ad Library for the watchlist (least recently scraped first) until `META_NIGHT_MINUTES` (480) is spent, then a Sheets sync | about 6 min per store at the defaults, so ~80 stores a night |
+| ShopifyTracker Meta | 22:00 | `run_daily.bat meta`: Meta Ad Library for the watchlist (least recently scraped first) until `META_NIGHT_MINUTES` (480) is spent, then `radar` (triage daily, sweeps on Sundays, `RADAR_MAX_MINUTES`), then a Sheets sync | about 6 min per store at the defaults, so ~80 stores a night, plus up to 4 h of radar |
 
 
 `run_daily.bat` probes, in order, `.venv\Scripts\python.exe`, `py -3`, `python` and `python3`,
@@ -512,7 +614,8 @@ python tracker.py remove-store bad1.com bad2.com     # drops them from watchlist
 | `inventory_daily` | (day, variant) | `stock_level`, `signal_source`, raw probe message, `units_sold_1d`, `restock_units`, `units_per_day_7d`, `units_per_day_prev_7d`, `units_per_day_wow` |
 | `meta_ad_detail_daily`, `meta_page_likes_daily`, `meta_creatives` | (day, ad) / (day, page) / (ad, creative) | single-ad page readings, page likes with slopes, creative hashes |
 | `fb_posts`, `fb_posts_daily` | post / (day, post) | captured Sponsored posts, their match to an ad, daily public counts |
-| `alerts` | alert | rules 1-4 (deltas), 5-8 (Meta), 9-11 (inventory), 12 (page likes) |
+| `radar_domains`, `radar_ads`, `radar_runs` | domain / ad / search | triage result per discovered domain (type, status, age, ads, pages, promote flag), every ad a sweep saw (page, landing domain, start date), one row per search with counts |
+| `alerts` | alert | rules 1-4 (deltas), 5-8 (Meta), 9-11 (inventory), 12 (page likes), 13-14 (new pages / landing paths) |
 
 History is append-only across days. Re-running the same `--date` replaces only that day
 for that store, so a crashed or partial run can be repeated safely.
@@ -592,7 +695,7 @@ python tracker.py report
 tracker.py              CLI entry point
 run_daily.bat           Windows daily runner (logs to logs\run_YYYY-MM-DD.log)
 register_task.ps1       registers run_daily.bat in Task Scheduler (09:00 daily, -Time to change)
-earlyscale/cli.py       commands: init-db, add-store, remove-store, run, sync-sheets, report, product, status
+earlyscale/cli.py       commands: init-db, add-store, remove-store, run, ads, inventory, radar, sync-sheets, report, product, status
 earlyscale/sheets.py    Google Sheets sync client (rows from SQLite, chunking, 302 + retry handling)
 sheets/Code.gs          Apps Script web app to paste into the Sheet's script editor
 earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + pure normaliser + Meta page discovery
@@ -602,6 +705,10 @@ earlyscale/ad_metrics.py landing-URL join, concepts, lineage, daily ad metrics, 
 earlyscale/ad_detail.py  single-ad Ad Library pages: delivery (end_date), page likes, creative fingerprints, rule 12
 earlyscale/fb_posts.py   captured Sponsored posts, logged-out counts, join to ads
 earlyscale/inventory.py  hero-variant selection, /cart/add.js stock probe + theme fallback, units-sold maths, alert rules 9-11
+earlyscale/scaling.py    pages per domain, landing paths per product, Pages tab rows, alert rules 13-14
+earlyscale/radar.py      store discovery: hook/copycat/web sweeps, triage, Candidates tab, watchlist promotion, hook yield
+earlyscale/store_age.py  store age estimate for radar triage (earliest product, optional shop-id calibration)
+radar/hooks.txt          hook phrases for the weekly sweep; radar/imports/ for manual domain lists
 earlyscale/db.py        schema + snapshot writers
 earlyscale/watchlist.py watchlist.csv I/O
 earlyscale/config.py    paths, .env loader, tunables

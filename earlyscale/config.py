@@ -80,6 +80,18 @@ META_DETAIL_CONTEXT_PAGES = int(os.environ.get("META_DETAIL_CONTEXT_PAGES", "20"
 META_CREATIVE_MAX_BYTES = int(os.environ.get("META_CREATIVE_MAX_BYTES", str(2 * 1024 * 1024)))   # hash at most this much of a video
 META_LIKES_MIN_SLOPE = float(os.environ.get("META_LIKES_MIN_SLOPE", "5"))   # likes/day before a doubling counts
 FB_POSTS_MAX = int(os.environ.get("FB_POSTS_MAX", "60"))             # permalinks to re-fetch per day
+# Radar (store discovery)
+RADAR_MAX_ADS_PER_QUERY = int(os.environ.get("RADAR_MAX_ADS_PER_QUERY", "500"))
+RADAR_COUNTRY = os.environ.get("RADAR_COUNTRY", "US")
+RADAR_WEB_SEARCH = os.environ.get("RADAR_WEB_SEARCH", "1").strip() not in ("0", "false", "no")
+RADAR_MAX_WEB_QUERIES = int(os.environ.get("RADAR_MAX_WEB_QUERIES", "40"))
+RADAR_MAX_TRIAGE = int(os.environ.get("RADAR_MAX_TRIAGE", "40"))            # new domains checked per run
+RADAR_MAX_AGE_DAYS = int(os.environ.get("RADAR_MAX_AGE_DAYS", "180"))
+RADAR_MIN_ACTIVE_ADS = int(os.environ.get("RADAR_MIN_ACTIVE_ADS", "10"))
+RADAR_SWEEP_WEEKDAY = int(os.environ.get("RADAR_SWEEP_WEEKDAY", "6"))        # 6 = Sunday
+RADAR_NEW_BADGE_DAYS = 14
+RADAR_MAX_MINUTES = float(os.environ.get("RADAR_MAX_MINUTES", "240"))       # budget for one radar run (sweeps + triage)
+RADAR_MAX_COPYCAT_QUERIES = int(os.environ.get("RADAR_MAX_COPYCAT_QUERIES", "60"))   # per sweep, least recently searched first
 META_REACH_MIN = int(os.environ.get("META_REACH_MIN", "1000"))    # ignore reach-slope alerts below this reach
 
 # Inventory-delta sales tracking. INVENTORY_STORES = comma list of domains to probe daily (rollout gate);

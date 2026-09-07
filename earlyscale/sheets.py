@@ -16,7 +16,7 @@ from urllib.parse import urljoin
 
 import requests
 
-from . import ad_metrics, config, deltas, signals
+from . import ad_metrics, config, deltas, radar, scaling, signals
 from .watchlist import read_watchlist
 
 log = logging.getLogger("earlyscale.sheets")
@@ -24,7 +24,10 @@ log = logging.getLogger("earlyscale.sheets")
 STORES_HEADERS = ["store", "meta page", "last status", "products", "sold-out variants", "new products 7d",
                   "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date",
                   "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow",
+                  "pages_per_domain", "pages_new_7d", "page_likes_slope_max",
                   "ads_to_products", "products_with_ads", "ads_not_attached (why)"]
+PAGES_HEADERS = ["store", "page name", "page_id", "first_seen", "active_ads", "last_delivered", "page_likes",
+                 "page_likes_7d_slope", "ads_as_of"]
 PRODUCTS_HEADERS = ["date", "store", "handle", "title", "published_at", "updated_at", "price",
                     "available variants", "total variants", "collection position"]
 ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
@@ -32,20 +35,21 @@ ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
                    "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
                    "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d",
-                   "ad_velocity_wow", "ads_as_of", "engagement_per_day",
+                   "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d",
+                   "engagement_per_day",
                    "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d",
                    "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d",
-                   "units_per_day_wow"]
+                   "units_per_day_wow", "store_badge"]
 FAMILIES_HEADERS = ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
                     "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"]
 CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "families published 7d",
                       "store list", "example families"]
 
-TAB_ORDER = ("signals", "families", "categories", "stores", "products", "alerts")
+TAB_ORDER = ("signals", "families", "categories", "stores", "pages", "candidates", "products", "alerts")
 TAB_NAMES = {"signals": "Signals", "families": "Families", "categories": "Categories",
-             "stores": "Stores", "products": "Products", "alerts": "Alerts"}
+             "stores": "Stores", "pages": "Pages", "candidates": "Candidates", "products": "Products", "alerts": "Alerts"}
 TAB_MODES = {"signals": "replace", "families": "replace", "categories": "replace",
-             "stores": "replace", "products": "replace", "alerts": "append"}
+             "stores": "replace", "pages": "replace", "candidates": "replace", "products": "replace", "alerts": "append"}
 
 
 _watchlist_path = None   # set by set_watchlist_path(); None = default watchlist.csv
@@ -100,10 +104,12 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
         b = ad_metrics.landing_breakdown(conn, s["id"], s["store_domain"], as_of)
         if b["snapshot"]:
             v = ad_metrics.ad_velocity(conn, s["id"], b["snapshot"])
+            pm = scaling.store_page_metrics(conn, s["id"], s["store_domain"], b["snapshot"])
             age = [b["snapshot"], b["active"], v["new_ads_7d"], v["new_ads_prev_7d"], ad_metrics._wow_cell(v["ad_velocity_wow"]),
+                   _blank(pm["pages_per_domain"]), _blank(pm["pages_new_7d"]), _blank(pm["page_likes_slope_max"]),
                    b["to_products"], b["products"], ad_metrics.breakdown_summary(b)]
         else:
-            age = ["never", "", "", "", "", "", "", ""]
+            age = ["never", "", "", "", "", "", "", "", "", "", ""]
         if d is None:
             rows.append([s["store_domain"], s["meta_page_name"] or "", status, "", "", "", "", "", "", "", ""] + age)
             continue
@@ -120,6 +126,25 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
 
 def _blank(v):
     return "" if v is None else v
+
+
+def candidates_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
+    return radar.candidates_rows(conn)
+
+
+def read_promote_marks(conn: sqlite3.Connection, url: str, session: requests.Session | None = None) -> int:
+    """Before rewriting the Candidates tab, read it back and honour any Y in its promote column."""
+    session = session or requests.Session()
+    try:
+        data = get_json(session, url, {"tab": TAB_NAMES["candidates"], "rows": "1"})
+    except SheetsSyncError as e:
+        log.warning("sheets: could not read Candidates back (%s); promote marks not applied this time", e)
+        return 0
+    return radar.apply_promote_marks(conn, data.get("rows") or [])
+
+
+def pages_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
+    return scaling.pages_tab_rows(conn, list(_stores(conn)), as_of)
 
 
 def products_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
@@ -319,7 +344,7 @@ def verify(conn: sqlite3.Connection, url: str, as_of: str | None = None,
 
 def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = None) -> list[dict]:
     builders = {"signals": signals_rows, "families": families_rows, "categories": categories_rows,
-                "stores": stores_rows, "products": products_rows, "alerts": alerts_rows}
+                "stores": stores_rows, "pages": pages_rows, "candidates": candidates_rows, "products": products_rows, "alerts": alerts_rows}
     plan = []
     for tab in TAB_ORDER:
         if tab not in tabs:
@@ -335,6 +360,8 @@ def sync(conn: sqlite3.Connection, url: str, tabs=TAB_ORDER, as_of: str | None =
     if not url and not dry_run:
         raise SheetsSyncError("SHEETS_WEBHOOK_URL is not set (put it in .env)")
     session = session or requests.Session()
+    if "candidates" in tabs and url and not dry_run:
+        read_promote_marks(conn, url, session)
     summaries = []
     for item in build_plan(conn, tabs, as_of):
         n = len(item["chunks"])

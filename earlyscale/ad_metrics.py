@@ -835,8 +835,8 @@ def write_alerts_markdown(conn: sqlite3.Connection, today: str, path: Path | Non
         return None
     path = path or (config.ALERTS_DIR / f"{today}.md")
     path.parent.mkdir(parents=True, exist_ok=True)
-    from . import ad_detail, inventory
-    names = {**RULES, **inventory.RULES, **ad_detail.RULES}
+    from . import ad_detail, inventory, scaling
+    names = {**RULES, **inventory.RULES, **ad_detail.RULES, **scaling.RULES}
     lines = [f"# Alerts {today}", ""]
     for r in rows:
         lines.append(f"- **rule {r['rule']}** ({names.get(r['rule'], '')}) {r['store_domain']} "
