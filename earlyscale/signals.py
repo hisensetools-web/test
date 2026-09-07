@@ -258,6 +258,7 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
             "" if p["min_price"] is None else p["min_price"], sold_out,
             "" if rank is None else rank, rank_delta, fam_new_7d[fam[p["product_id"]]],
             m.get("ads_pointing_here", ""), m.get("ads_launched_7d", ""), m.get("ads_launched_prev_7d", ""), m.get("ad_velocity_wow", ""),
+            m.get("ads_as_of", ""),
             _blank(m.get("engagement_per_day")), _blank(m.get("days_running_max")),
             m.get("concept_status", ""), _blank(m.get("eu_reach_slope_7d")), _blank(m.get("comment_delta_1d")),
             iv.get("signal_source", ""), iv.get("inventory_tracked", ""), _blank(iv.get("stock_level")),

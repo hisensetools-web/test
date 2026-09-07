@@ -23,7 +23,7 @@ log = logging.getLogger("earlyscale.sheets")
 
 STORES_HEADERS = ["store", "meta page", "last status", "products", "sold-out variants", "new products 7d",
                   "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date",
-                  "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow",
+                  "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow",
                   "ads_to_products", "products_with_ads", "ads_not_attached (why)"]
 PRODUCTS_HEADERS = ["date", "store", "handle", "title", "published_at", "updated_at", "price",
                     "available variants", "total variants", "collection position"]
@@ -32,7 +32,7 @@ ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
                    "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
                    "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d",
-                   "ad_velocity_wow", "engagement_per_day",
+                   "ad_velocity_wow", "ads_as_of", "engagement_per_day",
                    "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d",
                    "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d",
                    "units_per_day_wow"]
@@ -100,10 +100,10 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
         b = ad_metrics.landing_breakdown(conn, s["id"], s["store_domain"], as_of)
         if b["snapshot"]:
             v = ad_metrics.ad_velocity(conn, s["id"], b["snapshot"])
-            age = [b["active"], v["new_ads_7d"], v["new_ads_prev_7d"], ad_metrics._wow_cell(v["ad_velocity_wow"]),
+            age = [b["snapshot"], b["active"], v["new_ads_7d"], v["new_ads_prev_7d"], ad_metrics._wow_cell(v["ad_velocity_wow"]),
                    b["to_products"], b["products"], ad_metrics.breakdown_summary(b)]
         else:
-            age = ["", "", "", "", "", "", ""]
+            age = ["never", "", "", "", "", "", "", ""]
         if d is None:
             rows.append([s["store_domain"], s["meta_page_name"] or "", status, "", "", "", "", "", "", "", ""] + age)
             continue

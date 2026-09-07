@@ -901,7 +901,7 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
         elif d and lo14 < d <= lo7:
             rec[1] += 1
     for h, (n7, p7) in launches.items():
-        out[h] = {"ads_pointing_here": 0, "ads_launched_7d": n7, "ads_launched_prev_7d": p7,
+        out[h] = {"ads_as_of": snap, "ads_pointing_here": 0, "ads_launched_7d": n7, "ads_launched_prev_7d": p7,
                   "ad_velocity_wow": _wow_cell(round(n7 / p7, 2) if p7 else (None if n7 == 0 else float("inf"))),
                   "days_running_max": None, "engagement_per_day": None, "concept_status": "",
                   "eu_reach_slope_7d": None, "comment_delta_1d": None}
@@ -914,7 +914,7 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
              AND COALESCE(a.page_ignored, 0) = 0
            GROUP BY a.product_handle""", (store_id, snap)):
         rec = out.setdefault(r["product_handle"], {"ads_launched_7d": 0, "ads_launched_prev_7d": 0, "ad_velocity_wow": "", "concept_status": ""})
-        rec.update({"ads_pointing_here": r["n"], "days_running_max": r["dmax"],
+        rec.update({"ads_as_of": snap, "ads_pointing_here": r["n"], "days_running_max": r["dmax"],
                     "engagement_per_day": None if r["epd"] is None else round(r["epd"], 1),
                     "eu_reach_slope_7d": None if not r["slope_n"] else round(r["slope"], 1),
                     "comment_delta_1d": None if not r["cdelta_n"] else int(r["cdelta"])})
