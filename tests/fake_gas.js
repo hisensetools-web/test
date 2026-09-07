@@ -25,10 +25,18 @@ class Sheet {
   getName() { return this.name; }
   getLastRow() { let last = 0; this.cells.forEach((row, i) => { if (row && row.some(v => v !== "" && v !== null && v !== undefined)) last = i + 1; }); return last; }
   getMaxRows() { return Math.max(this.maxRows, this.cells.length); }
-  getMaxColumns() { return 26; }
+  getMaxColumns() { return this.maxCols || 26; }
   setFrozenRows(n) { this.frozenRows = n; }
   autoResizeColumns(c, n) { this.autoResized = n; }
-  getRange(r, c, nr = 1, nc = 1) { return new Range(this, r, c, nr, nc); }
+  getRange(r, c, nr = 1, nc = 1) {
+    // Real Apps Script throws for a range outside the grid; keep the fake honest so the
+    // "grow the sheet first" logic in Code.gs is actually exercised.
+    if (r < 1 || c < 1 || nr < 1 || nc < 1 || r + nr - 1 > this.getMaxRows() || c + nc - 1 > this.getMaxColumns())
+      throw new Error("The coordinates or dimensions of the range are invalid.");
+    return new Range(this, r, c, nr, nc);
+  }
+  insertRowsAfter(after, n) { this.maxRows = Math.max(this.maxRows, after) + n; return this; }
+  insertColumnsAfter(after, n) { this.maxCols = Math.max(this.maxCols || 26, after) + n; return this; }
 }
 class Range {
   constructor(s, r, c, nr, nc) { Object.assign(this, { s, r, c, nr, nc }); }
@@ -88,7 +96,11 @@ vm.runInContext(fs.readFileSync(path.join(__dirname, "..", "sheets", "Code.gs"),
 const responses = {}; let seq = 0;
 const server = http.createServer((req, res) => {
   const url = new URL(req.url, "http://x");
-  if (req.method === "GET" && url.pathname === "/exec") { const o = sandbox.doGet({}); res.writeHead(200, { "Content-Type": o.mime }); return res.end(o.content); }
+  if (req.method === "GET" && url.pathname === "/exec") {
+    const parameter = {}; for (const [k, v] of url.searchParams) parameter[k] = v;
+    const o = sandbox.doGet({ parameter });
+    res.writeHead(200, { "Content-Type": o.mime }); return res.end(o.content);
+  }
   if (req.method === "GET" && url.pathname === "/__dump") {
     const out = { __order: order.map(s => s.name) }; for (const [n, s] of Object.entries(sheets)) out[n] = { frozenRows: s.frozenRows, autoResized: s.autoResized, hidden: [...s.hidden].sort((a, b) => a - b), rows: s.cells.slice(0, s.getLastRow()).map(r => r.map(v => v instanceof Date ? "DATE:" + v.toISOString().slice(0, 10) : v)) };
     res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify(out));

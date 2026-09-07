@@ -15,8 +15,8 @@
  *    or  { "ok": false, "error": "..." }
  *
  * Tabs are created with a bold, frozen header row and auto-sized columns the first
- * time they are written. "Products" and "Alerts" are de-duplicated on their key
- * columns so re-running a sync never creates duplicate rows.
+ * time they are written. "Alerts" is de-duplicated on its key columns so re-running a
+ * sync never creates duplicate rows; every other tab is rewritten in full each sync.
  */
 
 var TABS = {
@@ -57,8 +57,8 @@ var TABS = {
   Products: {
     headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price",
               "available variants", "total variants", "collection position"],
-    keyCols: [0, 1, 2],            // date + store + handle
-    textCols: [0, 1, 2, 3, 4, 5],
+    keyCols: null,                 // the full latest catalogue of every store, rewritten each sync
+    textCols: [0, 1, 2, 3, 4, 5],  // (history stays in data/tracker.db: `python tracker.py product <handle>`)
     moveToEnd: true,               // raw data lives at the end of the tab bar
     hideCols: [7, 8]               // available / total variants (still there, just hidden)
   },
@@ -70,8 +70,35 @@ var TABS = {
   }
 };
 
-/** Health check: open the /exec URL in a browser and you should see "ok". */
+/** Health check: open the /exec URL in a browser and you should see "ok".
+ *  ?tabs=1            -> JSON {tab: rows} for every tab the script knows (rows exclude the header)
+ *  ?tab=Products      -> JSON {tab, rows, maxRows}
+ *  ?tab=Products&group=1 -> also {byValue: {value in column 1 (0-based): count}}, e.g. rows per store */
 function doGet(e) {
+  var p = (e && e.parameter) || {};
+  if (p.tabs) {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var out = {};
+    for (var name in TABS) {
+      var sh = ss.getSheetByName(name);
+      out[name] = sh ? Math.max(0, sh.getLastRow() - 1) : null;
+    }
+    return json_({ ok: true, tabs: out });
+  }
+  if (p.tab) {
+    var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(p.tab);
+    if (!sheet) return json_({ ok: true, tab: p.tab, rows: null, maxRows: null });
+    var last = sheet.getLastRow();
+    var res = { ok: true, tab: p.tab, rows: Math.max(0, last - 1), maxRows: sheet.getMaxRows() };
+    if (p.group !== undefined && last > 1) {
+      var col = parseInt(p.group, 10) + 1;
+      var vals = sheet.getRange(2, col, last - 1, 1).getValues();
+      var by = {};
+      for (var i = 0; i < vals.length; i++) { var k = cellText_(vals[i][0]); by[k] = (by[k] || 0) + 1; }
+      res.byValue = by;
+    }
+    return json_(res);
+  }
   return ContentService.createTextOutput("ok");
 }
 
@@ -176,6 +203,11 @@ function writeRows_(sheet, spec, rows) {
     return out;
   });
   var start = sheet.getLastRow() + 1;
+  // A range past the grid throws in Apps Script ("coordinates or dimensions of the range are
+  // invalid"); new sheets have 1000 rows, so a full catalogue used to fail part-way. Grow first.
+  var need = start + padded.length - 1 - sheet.getMaxRows();
+  if (need > 0) sheet.insertRowsAfter(sheet.getMaxRows(), need);
+  if (sheet.getMaxColumns() < width) sheet.insertColumnsAfter(sheet.getMaxColumns(), width - sheet.getMaxColumns());
   var range = sheet.getRange(start, 1, padded.length, width);
   // Force text format on key/date columns BEFORE writing so "2026-09-06" and ISO
   // timestamps stay strings (otherwise Sheets parses them into dates and the

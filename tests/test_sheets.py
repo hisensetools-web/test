@@ -160,7 +160,7 @@ class SyncTests(unittest.TestCase):
         out = sheets.sync(conn, "https://x/exec", session=session)
         payloads = [json.loads(c.kwargs["data"]) for c in session.post.call_args_list]
         self.assertEqual([p["tab"] for p in payloads], ["Signals", "Families", "Categories", "Stores", "Store Age", "Products", "Alerts"])
-        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 5 + ["append", "append"])
+        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 6 + ["append"])
         self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 7)
         self.assertEqual([x["tab"] for x in out], ["Signals", "Families", "Categories", "Stores", "Store Age", "Products", "Alerts"])
 
@@ -192,3 +192,53 @@ class WatchlistRemoveTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VerifyTests(unittest.TestCase):
+    """verify() reads counts back from the web app's doGet and compares with the DB."""
+
+    def _session(self, tabs_json, products_json):
+        session = mock.Mock()
+        def get(url, params=None, **kw):
+            if params and params.get("tabs"):
+                return _resp(200, json.dumps({"ok": True, "tabs": tabs_json}))
+            if params and params.get("tab"):
+                return _resp(200, json.dumps({"ok": True, "tab": "Products", "rows": sum(products_json.values()), "byValue": products_json}))
+            return _resp(404, "nope")
+        session.get.side_effect = get
+        return session
+
+    def test_match(self):
+        conn = two_day_db()
+        plan = {p["tab"]: len(p["rows"]) for p in sheets.build_plan(conn)}
+        by_store = {}
+        for r in sheets.products_rows(conn):
+            by_store[r[1]] = by_store.get(r[1], 0) + 1
+        v = sheets.verify(conn, "https://x/exec", session=self._session(plan, by_store))
+        self.assertEqual(v["problems"], [])
+        self.assertTrue(all(t["ok"] for t in v["tabs"]))
+        self.assertTrue(all(p["ok"] for p in v["products"]))
+
+    def test_truncated_products_tab_is_reported_per_store(self):
+        conn = two_day_db()
+        plan = {p["tab"]: len(p["rows"]) for p in sheets.build_plan(conn)}
+        by_store = {}
+        for r in sheets.products_rows(conn):
+            by_store[r[1]] = by_store.get(r[1], 0) + 1
+        first = sorted(by_store)[0]
+        short = dict(by_store, **{first: by_store[first] + 1})    # the sheet holds a different count for one store
+        plan_short = dict(plan, Products=sum(short.values()))
+        plan_short["Alerts"] = plan["Alerts"] + 5                  # append tab may hold more than today's rows
+        v = sheets.verify(conn, "https://x/exec", session=self._session(plan_short, short))
+        bad = [p for p in v["products"] if not p["ok"]]
+        self.assertEqual([(p["store"], p["sheet"], p["expected"]) for p in bad], [(first, by_store[first] + 1, by_store[first])])
+        self.assertTrue(any("Products:" in x for x in v["problems"]))
+        self.assertTrue(next(t for t in v["tabs"] if t["tab"] == "Alerts")["ok"])
+
+    def test_old_deployment_without_doget_json_is_explained(self):
+        conn = two_day_db()
+        session = mock.Mock()
+        session.get.return_value = _resp(200, "ok", ctype="text/plain")
+        with self.assertRaises(sheets.SheetsSyncError) as cm:
+            sheets.verify(conn, "https://x/exec", session=session)
+        self.assertIn("re-paste sheets/Code.gs", str(cm.exception))

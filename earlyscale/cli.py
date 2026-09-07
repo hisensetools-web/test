@@ -166,12 +166,47 @@ def cmd_run(args) -> int:
     return rc
 
 
-def _do_sheets_sync(conn, tabs=sheets.TAB_ORDER, as_of=None, dry_run=False) -> int:
+def _do_sheets_sync(conn, tabs=sheets.TAB_ORDER, as_of=None, dry_run=False, verify=True) -> int:
     try:
         summaries = sheets.sync(conn, config.SHEETS_WEBHOOK_URL, tabs=tabs, as_of=as_of, dry_run=dry_run)
     except sheets.SheetsSyncError as e:
         console.print(f"[red]sheets sync failed:[/] {e}")
         return 3
+    rc = _print_sync_summary(summaries, dry_run)
+    if verify and not dry_run:
+        rc = _verify_sheets(conn, as_of) or rc
+    return rc
+
+
+def _verify_sheets(conn, as_of=None) -> int:
+    """Read row counts back from the live sheet and compare with the DB. Returns 3 on a mismatch."""
+    try:
+        v = sheets.verify(conn, config.SHEETS_WEBHOOK_URL, as_of)
+    except sheets.SheetsSyncError as e:
+        console.print(f"[yellow]could not verify the sheet:[/] {e}")
+        return 0
+    t = Table(title="sheet vs database")
+    for c in ("tab", "mode", "rows in DB", "rows in sheet", "ok"):
+        t.add_column(c, justify="right" if "rows" in c else "left")
+    for x in v["tabs"]:
+        t.add_row(x["tab"], x["mode"], str(x["expected"]), "?" if x["sheet"] is None else str(x["sheet"]), "yes" if x["ok"] else "[red]NO[/]")
+    console.print(t)
+    bad = [p for p in v["products"] if not p["ok"]]
+    if bad:
+        t = Table(title="Products rows per store that differ")
+        for c in ("store", "rows in DB", "rows in sheet"):
+            t.add_column(c, justify="left" if c == "store" else "right")
+        for p in bad[:60]:
+            t.add_row(_short(p["store"]), str(p["expected"]), str(p["sheet"]))
+        console.print(t)
+    if v["problems"]:
+        console.print(f"[red]{len(v['problems'])} mismatch(es)[/] - the sheet does not hold what the DB holds (see above)")
+        return 3
+    console.print("[green]sheet matches the database[/]" + (f" ({len(v['products'])} stores' catalogues complete)" if v["products"] else ""))
+    return 0
+
+
+def _print_sync_summary(summaries, dry_run) -> int:
     t = Table(title="Google Sheets sync" + (" (dry run, nothing sent)" if dry_run else ""))
     for c in ("tab", "rows", "chunks", "written", "skipped"):
         t.add_column(c, justify="right" if c != "tab" else "left")
@@ -196,7 +231,9 @@ def cmd_sync_sheets(args) -> int:
         console.print(f"[red]unknown tab(s):[/] {', '.join(bad)} (choose from {', '.join(sheets.TAB_ORDER)})")
         return 2
     as_of = _parse_date(args.date) if args.date else None
-    return _do_sheets_sync(conn, tabs=tabs, as_of=as_of, dry_run=args.dry_run)
+    if args.verify_only:
+        return _verify_sheets(conn, as_of)
+    return _do_sheets_sync(conn, tabs=tabs, as_of=as_of, dry_run=args.dry_run, verify=not args.no_verify)
 
 
 def cmd_remove_store(args) -> int:
@@ -1397,9 +1434,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("sync-sheets", help="push latest snapshot + deltas to Google Sheets via Apps Script")
     s.add_argument("--date", help="sync the snapshot as of this date (default: latest)")
-    s.add_argument("--tabs", help="comma list from stores,products,alerts (default all)")
+    s.add_argument("--tabs", help="comma list from signals,families,categories,stores,store_age,products,alerts (default all)")
     s.add_argument("--dry-run", action="store_true", help="build and size the chunks but send nothing")
     s.add_argument("--watchlist", help="alternate watchlist.csv (only its stores are synced)")
+    s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")
+    s.add_argument("--no-verify", action="store_true", help="skip the read-back comparison after syncing")
     s.set_defaults(fn=cmd_sync_sheets)
 
     s = sub.add_parser("remove-store", help="remove one or more domains from watchlist.csv")

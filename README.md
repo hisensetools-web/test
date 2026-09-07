@@ -104,12 +104,29 @@ three tabs, each with a bold frozen header row:
 | **Families** | one per product family per store | overwritten; a family = handles sharing a base name or normalised title. Handle count, newest/oldest published_at, launches in 7/14/30 days, best rank, handle list. Sorted by 7-day launches |
 | **Categories** | one per keyword category | overwritten; categories are title unigrams/bigrams shared by 2+ stores (nothing hardcoded), with store/family counts and newest publish date. Families with no shared keyword fall into `(uncategorised)` |
 | **Stores** | one per store in watchlist.csv | fully overwritten every sync, sorted by change score |
-| **Products** | one per product per snapshot date | appended; duplicates (same date + store + handle) are skipped, so syncing twice is safe. Kept at the end of the tab bar with the two variant-count columns hidden |
+| **Products** | one per product, every watched store, latest snapshot | the **full current catalogue**, rewritten every sync (no per-store cap). History is not in the sheet: `python tracker.py product <handle>` reads it from the DB |
 | **Alerts** | one per alert | appended; duplicates (date + store + handle + rule + detail) skipped |
 
 From then on `python tracker.py run` syncs automatically at the end whenever
 `SHEETS_WEBHOOK_URL` is set (use `--no-sync` to skip). `run_daily.bat` needs no change: the
 tracker reads `.env` itself. Exit code 3 means the run succeeded but the sync failed.
+
+### Checking the sheet holds everything
+
+Every sync ends by reading row counts back from the sheet and comparing them with the database,
+per tab and, for Products, per store. A mismatch is printed and the command exits 3. To check
+without sending anything:
+
+```bash
+python tracker.py sync-sheets --verify-only
+```
+
+This needs the current `Code.gs` (its `doGet` answers `?tabs=1` and `?tab=Products&group=1`);
+an older deployment answers plain `ok` and the check says so. Two things the sync now does
+that older versions did not: it grows the sheet's grid before writing (Apps Script throws for a
+range past the grid, and a new sheet has 1000 rows, so a big catalogue used to stop part-way),
+and Products is rewritten in full each time instead of appended, so it no longer grows by a
+whole catalogue per day.
 
 ### After updating Code.gs
 

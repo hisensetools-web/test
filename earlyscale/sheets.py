@@ -45,7 +45,7 @@ TAB_ORDER = ("signals", "families", "categories", "stores", "store_age", "produc
 TAB_NAMES = {"signals": "Signals", "families": "Families", "categories": "Categories",
              "stores": "Stores", "store_age": "Store Age", "products": "Products", "alerts": "Alerts"}
 TAB_MODES = {"signals": "replace", "families": "replace", "categories": "replace",
-             "stores": "replace", "store_age": "replace", "products": "append", "alerts": "append"}
+             "stores": "replace", "store_age": "replace", "products": "replace", "alerts": "append"}
 
 
 _watchlist_path = None   # set by set_watchlist_path(); None = default watchlist.csv
@@ -257,6 +257,59 @@ def post_payload(session: requests.Session, url: str, payload: dict, retries: in
             log.warning("sheets: retry %d/%d after %s (sleep %.1fs)", attempt + 1, retries, last_err, wait)
             time.sleep(wait)
     raise SheetsSyncError(f"giving up after {retries + 1} attempts: {last_err}")
+
+
+def get_json(session: requests.Session, url: str, params: dict) -> dict:
+    """GET the web app (follows the same 302 hop as POST) and parse its JSON."""
+    r = session.get(url, params=params, timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
+    hops = 0
+    while r.status_code in (301, 302, 303, 307, 308) and hops < 5:
+        r = session.get(urljoin(r.url, r.headers.get("Location", "")), timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
+        hops += 1
+    text = r.text.strip()
+    if r.status_code != 200 or not text.startswith("{"):
+        raise SheetsSyncError(_explain_non_json(text, r.status_code) if not text.startswith("{") else f"HTTP {r.status_code}")
+    data = json.loads(text)
+    if not data.get("ok"):
+        raise SheetsSyncError(f"Apps Script reported an error: {data.get('error')}")
+    return data
+
+
+def verify(conn: sqlite3.Connection, url: str, as_of: str | None = None,
+           session: requests.Session | None = None) -> dict:
+    """Compare what the sheet holds with what the DB says it should: rows per tab, and for
+    Products rows per store. Returns {"tabs": [...], "products": [...], "problems": [...]}.
+    Needs the doGet of the current Code.gs (older deployments answer plain 'ok')."""
+    session = session or requests.Session()
+    try:
+        counts = get_json(session, url, {"tabs": "1"}).get("tabs") or {}
+    except (SheetsSyncError, ValueError) as e:
+        raise SheetsSyncError(f"the deployed Code.gs does not answer ?tabs=1 (re-paste sheets/Code.gs and deploy a new version): {e}") from e
+    plan = build_plan(conn, TAB_ORDER, as_of)
+    tabs, problems = [], []
+    for item in plan:
+        expected = len(item["rows"])
+        have = counts.get(item["tab"])
+        ok = (have is not None) and (have == expected if item["mode"] == "replace" else have >= expected)
+        tabs.append({"tab": item["tab"], "mode": item["mode"], "expected": expected, "sheet": have, "ok": ok})
+        if not ok:
+            problems.append(f"{item['tab']}: sheet has {have} rows, DB has {expected}")
+    products = []
+    try:
+        by = get_json(session, url, {"tab": TAB_NAMES["products"], "group": "1"}).get("byValue") or {}
+    except SheetsSyncError as e:
+        problems.append(f"could not read Products per store: {e}")
+        by = None
+    if by is not None:
+        want: dict[str, int] = {}
+        for r in products_rows(conn, as_of):
+            want[r[1]] = want.get(r[1], 0) + 1
+        for store in sorted(set(want) | set(by)):
+            w, h = want.get(store, 0), int(by.get(store, 0))
+            products.append({"store": store, "expected": w, "sheet": h, "ok": w == h})
+            if w != h:
+                problems.append(f"Products/{store}: sheet has {h} rows, DB has {w}")
+    return {"tabs": tabs, "products": products, "problems": problems}
 
 
 # ---------------------------------------------------------------- orchestration
