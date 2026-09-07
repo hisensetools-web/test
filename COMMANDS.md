@@ -23,7 +23,19 @@ Then:
 | 09:00 daily | Shopify snapshot, stock probe, Sheets sync | Signals, Families, Categories, Stores, Products tabs refreshed; ~15 min |
 | 22:00 daily | Meta Ad Library, least recently scraped stores first, up to 8 h, then Sheets sync | ad columns on Signals, concepts, lineage, delivery, page likes |
 
-The machine must be on and logged in at those times. Logs: `logs\run_YYYY-MM-DD.log` and `logs\meta_YYYY-MM-DD.log`.
+The machine must be on and logged in at those times (the tracker keeps Windows awake while a pass runs; a closed lid still sleeps it). Logs: `logs\run_YYYY-MM-DD.log` and `logs\meta_YYYY-MM-DD.log`.
+
+## 2b. Getting the data into the Google Sheet
+
+You normally do nothing: both scheduled tasks end with a sync, and so does `python tracker.py run`.
+The sync only happens if `SHEETS_WEBHOOK_URL=...` is in `.env`. To push by hand at any time:
+
+```powershell
+python tracker.py sync-sheets                # rewrite every tab from the database, then check row counts
+python tracker.py sync-sheets --verify-only  # check only, send nothing
+```
+
+Every sync ends with a "sheet vs database" table; every row should say `yes`.
 
 ## 3. Looking at the data
 

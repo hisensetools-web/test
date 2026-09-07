@@ -103,6 +103,7 @@ def cmd_run(args) -> int:
     only = set(args.only) if args.only else None
     console.print(f"run: snapshot_date={snapshot_date} stores={len(only or stores)} db={args.db or config.DB_PATH}")
     t0 = time.monotonic()
+    awake = meta_ads.KeepAwake().__enter__()
     ok, failed = run_products_pass(conn, stores, snapshot_date, only)
     console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
     rc = 1 if ok == 0 and failed else 0
@@ -142,6 +143,7 @@ def cmd_run(args) -> int:
         console.print("syncing to Google Sheets (SHEETS_WEBHOOK_URL is set) ...")
         if _do_sheets_sync(conn, as_of=snapshot_date) != 0:
             rc = rc or 3
+    awake.__exit__(None, None, None)
     return rc
 
 
@@ -240,7 +242,10 @@ def plan_meta_stores(conn, stores: list[dict], only: set[str] | None = None, sco
     for r in conn.execute("""SELECT s.store_domain, MAX(r.snapshot_date) AS d FROM meta_page_runs r JOIN stores s ON s.id = r.store_id
                              WHERE r.status = 'ok' GROUP BY s.store_domain"""):
         last[r["store_domain"]] = r["d"]
-    return sorted(stores, key=lambda s: (last.get(s["store_domain"]) or "", s["store_domain"]))
+    # stores with a product catalogue first: without one, ads cannot attach to products and the
+    # pass only feeds noise (the 404 domains had hundreds of ads and dozens of alerts, 0 resolved)
+    has_products = {r[0] for r in conn.execute("SELECT DISTINCT s.store_domain FROM products_daily p JOIN stores s ON s.id = p.store_id")}
+    return sorted(stores, key=lambda s: (0 if s["store_domain"] in has_products else 1, last.get(s["store_domain"]) or "", s["store_domain"]))
 
 
 def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | None = None,
@@ -254,7 +259,7 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
     deadline = time.monotonic() + budget
     ok = failed = 0
     session = shopify.make_session()   # for landing-page fetches
-    with sync_playwright() as p:
+    with sync_playwright() as p, meta_ads.KeepAwake():
         handle = meta_ads.BrowserHandle(p, headless=headless)
         try:
             for i, s in enumerate(stores):
@@ -309,6 +314,10 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                                              time.monotonic() - t0)
                     log.error("%-28s FAILED: %s", domain, e)
                     failed += 1
+                took = time.monotonic() - t0
+                if took > 25 * 60:
+                    log.warning("%-28s took %.0f min for one store; the machine probably slept part of the way (the budget clock kept running)",
+                                domain, took / 60)
                 if i < len(stores) - 1:
                     meta_ads._wait()
         finally:
@@ -386,7 +395,8 @@ def cmd_inventory(args) -> int:
     console.print(f"inventory: snapshot_date={snapshot_date} stores={len(targets)} waits={config.INVENTORY_WAIT_MIN:.0f}-{config.INVENTORY_WAIT_MAX:.0f}s "
                   f"max_variants={config.INVENTORY_MAX_VARIANTS}/store")
     t0 = time.monotonic()
-    results = run_inventory_pass(conn, targets, snapshot_date)
+    with meta_ads.KeepAwake():
+        results = run_inventory_pass(conn, targets, snapshot_date)
     t = Table(title="hero variants by fallback rung")
     for c in ("store", "cart_probe", "theme_inventory", "ads_only", "blocked", "components", "skipped", "alerts"):
         t.add_column(c, justify="left" if c == "store" else "right")
@@ -581,7 +591,7 @@ def cmd_ads_detail(args) -> int:
     stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
     only = set(args.only) if args.only else None
     targets = [s for s in stores if not only or s["store_domain"] in only]
-    with sync_playwright() as pw:
+    with sync_playwright() as pw, meta_ads.KeepAwake():
         handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
         browser = handle
         try:

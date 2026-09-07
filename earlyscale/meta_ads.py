@@ -327,6 +327,33 @@ def launch_kwargs() -> dict:
     (e.g. a pre-installed Chromium when Playwright's own download is unavailable)."""
     return {"executable_path": config.META_CHROMIUM_PATH} if config.META_CHROMIUM_PATH else {}
 
+class KeepAwake:
+    """While a long pass runs, stop Windows from sleeping (the display may still turn off).
+    A sleeping laptop pauses the pass but not the wall-clock budget: one night showed a 3-minute
+    step taking 5.8 hours. No-op on other platforms or if the call fails. Use as a context manager."""
+    ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
+
+    def __enter__(self):
+        self.active = False
+        try:
+            import ctypes
+            if hasattr(ctypes, "windll"):
+                ctypes.windll.kernel32.SetThreadExecutionState(self.ES_CONTINUOUS | self.ES_SYSTEM_REQUIRED)
+                self.active = True
+        except Exception:  # noqa: BLE001
+            self.active = False
+        return self
+
+    def __exit__(self, *exc):
+        if self.active:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(self.ES_CONTINUOUS)
+            except Exception:  # noqa: BLE001
+                pass
+        return False
+
+
 class BrowserHandle:
     """Lazily launched Chromium that is relaunched when it dies (a heavy page can take the whole
     browser process down; the pass must carry on with the next ad / store instead of failing)."""
