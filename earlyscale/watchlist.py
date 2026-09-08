@@ -10,12 +10,18 @@ COLUMNS = ["store_domain", "meta_page_name", "meta_page_id", "notes"]
 
 
 def normalise_domain(domain: str) -> str:
-    """Lower-case, strip trailing slash and the default https:// scheme.
-    An explicit http:// (local mock stores) is preserved."""
-    d = domain.strip().lower().rstrip("/")
-    if d.startswith("https://"):
+    """'https://www.Example.com/products/x?y=1' -> 'example.com': lower-case, no scheme, no www., no path.
+    An explicit http:// origin (local mock stores, usually with a port) is preserved as 'http://host:port'."""
+    d = domain.strip().lower()
+    scheme = ""
+    if d.startswith("http://"):
+        scheme, d = "http://", d[len("http://"):]
+    elif d.startswith("https://"):
         d = d[len("https://"):]
-    return d
+    d = d.split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    if d.startswith("www."):
+        d = d[len("www."):]
+    return scheme + d if scheme and ":" in d else d
 
 
 def read_watchlist(path: Path | None = None) -> list[dict]:
