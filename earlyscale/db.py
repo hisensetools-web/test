@@ -262,7 +262,12 @@ CREATE TABLE IF NOT EXISTS radar_domains (
     example_text        TEXT,
     promote_flag        TEXT,               -- Y from the Candidates tab
     promoted_at         TEXT,
-    note                TEXT
+    note                TEXT,
+    searched_at         TEXT,               -- last Ad Library search for this domain (active_ads is a sweep lower bound before that)
+    ads_in_sweeps       INTEGER,            -- distinct hook/copycat ads landing here
+    products_fetched    TEXT,               -- last catalogue read (weekly refresh for candidates)
+    handles_new         TEXT,               -- handles published <= 30 days ago at the last catalogue read
+    store_domain        TEXT                -- the Shopify store behind a lander row
 );
 -- Ads seen by Radar searches (hook phrases, copycat queries, domain checks).
 CREATE TABLE IF NOT EXISTS radar_ads (
@@ -281,6 +286,17 @@ CREATE TABLE IF NOT EXISTS radar_ads (
     is_active       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_radar_ads_domain ON radar_ads(landing_domain);
+-- Every (ad, search) pair: the yield report credits each phrase that returned the ad, not only the first one.
+CREATE TABLE IF NOT EXISTS radar_ad_hits (
+    ad_id           TEXT NOT NULL,
+    source          TEXT NOT NULL,
+    query           TEXT,
+    landing_domain  TEXT,
+    seen            TEXT,
+    PRIMARY KEY (ad_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_radar_hits_source ON radar_ad_hits(source);
+CREATE INDEX IF NOT EXISTS idx_radar_hits_domain ON radar_ad_hits(landing_domain);
 CREATE TABLE IF NOT EXISTS radar_runs (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL,      -- sweep | copycat | web | triage | import
@@ -363,12 +379,15 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     path = Path(path) if path is not None else config.DB_PATH
     if str(path) != ":memory:":
         path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path))
+    conn = sqlite3.connect(str(path), timeout=60)   # wait for another tracker command instead of "database is locked"
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
     _migrate(conn)
+    conn.execute("""INSERT OR IGNORE INTO radar_ad_hits (ad_id, source, query, landing_domain, seen)
+                    SELECT ad_id, source, query, landing_domain, first_seen FROM radar_ads WHERE source IS NOT NULL""")
+    conn.commit()
     return conn
 
 
@@ -390,6 +409,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
                      # part 2 (B): matched feed post and its latest counts
                      ("post_id", "TEXT"), ("post_permalink", "TEXT")],
         "meta_concepts_daily": [("ads_delivering", "INTEGER"), ("survival_source", "TEXT")],
+        "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
+                          ("store_domain", "TEXT")],
         "alerts": [("dedupe_key", "TEXT")],
         "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
                    ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT")],

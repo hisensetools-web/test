@@ -82,7 +82,7 @@ python tracker.py run                                  # morning pass now (~15 m
 python tracker.py ads --only x.com y.com               # Meta for specific stores (~6 min each)
 python tracker.py ads --max-minutes 60                 # Meta for the watchlist, capped at an hour
 python tracker.py inventory --only x.com               # stock probe for specific stores
-python tracker.py radar --sweep                        # weekly discovery sweeps now (~3-4 h), then triage
+python tracker.py radar --sweep                        # weekly discovery sweeps now (~3-4 h), then triage; a re-run continues where it stopped
 python tracker.py radar                                # triage new / parked domains only (~30 min)
 ```
 
@@ -125,6 +125,8 @@ Captured posts are re-counted by the morning run automatically.
 | `META_MAX_SCROLLS=40` / `META_DETAIL_MAX=30` | how deep each store's Meta scrape goes (~6 min per store at these) |
 | `RADAR_MAX_MINUTES=240` | cap for one radar run (sweeps + triage); leftovers continue next time |
 | `RADAR_MAX_AGE_DAYS=180` / `RADAR_MIN_ACTIVE_ADS=10` | promotion thresholds: (age <= 180 d OR a product <= 30 d old with >= 3 ads) AND >= 10 active ads |
+| `RADAR_FUNNEL_MIN_ADS=3` | a non-Shopify lander needs this many sweep ads to be tracked as a funnel; fewer = discarded (1 keeps everything) |
+| `RADAR_MAX_TRIAGE=40` | Ad Library searches per run for candidates that could promote; the rest wait for the next night |
 | `RADAR_MAX_ADS_PER_QUERY=500` / `RADAR_COUNTRY=US` | how deep each hook / copycat search goes |
 | `RADAR_SWEEP_WEEKDAY=6` | which weekday the sweeps run (6 = Sunday) |
 
@@ -139,3 +141,6 @@ Runs on its own inside the 22:00 task. What you do:
   (picked up by the next sync + radar run). Rows are re-checked daily and promote themselves the day
   they cross the thresholds; `type=funnel` rows are non-Shopify landers whose ads are tracked anyway.
 - **Signals tab:** `store_badge=NEW` marks stores Radar added in the last 14 days.
+- **Reading a Candidates row:** `active_ads` is every ad radar has seen landing there; while `searched_at`
+  is empty that is only what the sweeps happened to catch. Young stores and stores with a hot new product
+  get an Ad Library search of their pages within the next nights (40 per night), then `active_ads` is real.

@@ -92,6 +92,13 @@ RADAR_SWEEP_WEEKDAY = int(os.environ.get("RADAR_SWEEP_WEEKDAY", "6"))        # 6
 RADAR_NEW_BADGE_DAYS = 14
 RADAR_MAX_MINUTES = float(os.environ.get("RADAR_MAX_MINUTES", "240"))       # budget for one radar run (sweeps + triage)
 RADAR_MAX_COPYCAT_QUERIES = int(os.environ.get("RADAR_MAX_COPYCAT_QUERIES", "60"))   # per sweep, least recently searched first
+RADAR_FUNNEL_MIN_ADS = int(os.environ.get("RADAR_FUNNEL_MIN_ADS", "3"))     # non-Shopify lander needs this many sweep ads to be tracked as a funnel
+RADAR_CHECK_WORKERS = int(os.environ.get("RADAR_CHECK_WORKERS", "6"))       # concurrent Shopify checks in triage stage 1
+RADAR_RESEARCH_DAYS = int(os.environ.get("RADAR_RESEARCH_DAYS", "7"))       # do not re-run a candidate's Ad Library search sooner than this
+RADAR_RESWEEP_DAYS = int(os.environ.get("RADAR_RESWEEP_DAYS", "6"))         # a phrase searched this recently is skipped (sweep resume)
+RADAR_REFRESH_DAYS = int(os.environ.get("RADAR_REFRESH_DAYS", "7"))         # re-read a Shopify candidate's catalogue this often (new products)
+RADAR_TRIAGE_MINUTES = float(os.environ.get("RADAR_TRIAGE_MINUTES", "60"))  # part of RADAR_MAX_MINUTES kept back from the sweeps for triage
+RADAR_SEARCH_MAX_ADS = int(os.environ.get("RADAR_SEARCH_MAX_ADS", "200"))   # ads collected per candidate page/domain search
 META_REACH_MIN = int(os.environ.get("META_REACH_MIN", "1000"))    # ignore reach-slope alerts below this reach
 
 # Inventory-delta sales tracking. INVENTORY_STORES = comma list of domains to probe daily (rollout gate);

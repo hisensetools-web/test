@@ -143,8 +143,10 @@ def normalise_landing_domain(url_or_domain: str | None) -> str | None:
 
 # ---------------------------------------------------------------- Ad Library searches
 
-def search_ads(browser, query: str, max_ads: int | None = None, search_type: str = "keyword_unordered") -> list[dict]:
-    url = meta_ads.build_search_url(query=query, country=config.RADAR_COUNTRY, search_type=search_type)
+def search_ads(browser, query: str | None, max_ads: int | None = None, search_type: str = "keyword_unordered",
+               page_id: str | None = None) -> list[dict]:
+    """One Ad Library search: a phrase / domain (keyword_unordered) or every active ad of one page (page_id)."""
+    url = meta_ads.build_search_url(query=query, page_id=page_id, country=config.RADAR_COUNTRY, search_type=search_type)
     if hasattr(browser, "get"):          # meta_ads.BrowserHandle: relaunches a dead Chromium
         browser = browser.get()
     res = meta_ads.scrape_page(url, max_ads=max_ads or config.RADAR_MAX_ADS_PER_QUERY, browser=browser)
@@ -153,38 +155,72 @@ def search_ads(browser, query: str, max_ads: int | None = None, search_type: str
     return res.ads
 
 
+def _retry_locked(fn, tries: int = 6, pause: float = 10.0):
+    """Run fn(); on 'database is locked' (another tracker command writing) wait and retry."""
+    for i in range(tries):
+        try:
+            return fn()
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() or i == tries - 1:
+                raise
+            log.warning("radar: database is locked (another tracker command running?); retrying in %.0f s", pause)
+            time.sleep(pause)
+
+
 def record_ads(conn: sqlite3.Connection, ads: list[dict], query: str, source: str, today: str) -> tuple[int, set[str]]:
+    """Upsert every ad (first query keeps the row; every query gets a radar_ad_hits row for the yield report)."""
     domains: set[str] = set()
-    for a in ads:
-        dom = normalise_landing_domain(a.get("landing_url") or a.get("landing_domain"))
-        body = a.get("primary_text") or ""
-        conn.execute("""INSERT INTO radar_ads (ad_id, query, source, page_id, page_name, landing_url, landing_domain, body_len, body_snippet,
-                          start_date, first_seen, last_seen, is_active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-                        ON CONFLICT(ad_id) DO UPDATE SET last_seen = excluded.last_seen, is_active = excluded.is_active,
-                          landing_domain = COALESCE(excluded.landing_domain, landing_domain), page_name = COALESCE(excluded.page_name, page_name)""",
-                     (a["ad_id"], query, source, a.get("page_id"), a.get("page_name"), a.get("landing_url"), dom, len(body), body[:200],
-                      a.get("start_date"), today, today, 1 if a.get("is_active", True) else 0))
-        if dom:
-            domains.add(dom)
-    conn.commit()
+
+    def write():
+        for a in ads:
+            dom = normalise_landing_domain(a.get("landing_url") or a.get("landing_domain"))
+            body = a.get("primary_text") or ""
+            conn.execute("""INSERT INTO radar_ads (ad_id, query, source, page_id, page_name, landing_url, landing_domain, body_len, body_snippet,
+                              start_date, first_seen, last_seen, is_active) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                            ON CONFLICT(ad_id) DO UPDATE SET last_seen = excluded.last_seen, is_active = excluded.is_active,
+                              landing_domain = COALESCE(excluded.landing_domain, landing_domain), page_name = COALESCE(excluded.page_name, page_name),
+                              page_id = COALESCE(excluded.page_id, page_id)""",
+                         (a["ad_id"], query, source, a.get("page_id"), a.get("page_name"), a.get("landing_url"), dom, len(body), body[:200],
+                          a.get("start_date"), today, today, 1 if a.get("is_active", True) else 0))
+            conn.execute("INSERT OR IGNORE INTO radar_ad_hits (ad_id, source, query, landing_domain, seen) VALUES (?,?,?,?,?)",
+                         (a["ad_id"], source, query, dom, today))
+            if dom:
+                domains.add(dom)
+        conn.commit()
+    _retry_locked(write)
     return len(ads), domains
 
 
 def _run(conn, kind, query, started, ads=None, domains=None, note=""):
-    conn.execute("INSERT INTO radar_runs (kind, query, started_at, ended_at, ads_found, domains_found, note) VALUES (?,?,?,?,?,?,?)",
-                 (kind, query, started, _utcnow(), ads, domains, note[:300]))
-    conn.commit()
+    def write():
+        conn.execute("INSERT INTO radar_runs (kind, query, started_at, ended_at, ads_found, domains_found, note) VALUES (?,?,?,?,?,?,?)",
+                     (kind, query, started, _utcnow(), ads, domains, note[:300]))
+        conn.commit()
+    _retry_locked(write)
+
+
+def recently_searched(conn: sqlite3.Connection, kind: str, days: int) -> set[str]:
+    """Queries of this kind that completed without error in the last `days` days (so a crashed or budget-capped
+    sweep resumes where it stopped instead of repeating the phrases it already did)."""
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).replace(microsecond=0).isoformat()
+    return {r[0] for r in conn.execute("SELECT DISTINCT query FROM radar_runs WHERE kind = ? AND note = '' AND started_at >= ?", (kind, cutoff))}
 
 
 def sweep(conn: sqlite3.Connection, browser, queries: list[tuple[str, str]], today: str, search=search_ads, wait=None,
-          deadline: float | None = None) -> dict:
-    """queries: [(query, source)]. Returns {queries, ads, domains, deferred}."""
+          deadline: float | None = None, skip_days: int | None = None) -> dict:
+    """queries: [(query, source)]. Returns {queries, ads, domains, deferred, skipped}."""
     wait = wait or meta_ads._wait
     total_ads, all_domains = 0, set()
-    deferred = 0
-    for i, (q, source) in enumerate(queries):
+    deferred = skipped = 0
+    done_recently = recently_searched(conn, queries[0][1].split(":")[0], skip_days) if (skip_days and queries) else set()
+    pending = [(q, src) for q, src in queries if q not in done_recently]
+    skipped = len(queries) - len(pending)
+    if skipped:
+        log.info("radar: %d quer%s already searched in the last %d days; continuing with the other %d",
+                 skipped, "y" if skipped == 1 else "ies", skip_days, len(pending))
+    for i, (q, source) in enumerate(pending):
         if deadline is not None and time.monotonic() > deadline:
-            deferred = len(queries) - i
+            deferred = len(pending) - i
             log.warning("radar: budget spent; %d quer%s deferred to the next sweep", deferred, "y" if deferred == 1 else "ies")
             break
         started = _utcnow()
@@ -198,14 +234,19 @@ def sweep(conn: sqlite3.Connection, browser, queries: list[tuple[str, str]], tod
             _run(conn, source.split(":")[0], q, started, note=f"error: {e}")
             log.warning("radar: %r failed: %s", q, e)
             continue
-        n, doms = record_ads(conn, ads, q, source, today)
+        try:
+            n, doms = record_ads(conn, ads, q, source, today)
+        except sqlite3.OperationalError as e:
+            _run(conn, source.split(":")[0], q, started, note=f"db error: {e}")
+            log.error("radar: could not store the ads for %r (%s); the phrase is searched again next time", q, e)
+            continue
         _run(conn, source.split(":")[0], q, started, n, len(doms))
         log.info("radar: %-40s ads=%-4d domains=%d", q[:40], n, len(doms))
         total_ads += n
         all_domains |= doms
-        if i < len(queries) - 1:
+        if i < len(pending) - 1:
             wait()
-    return {"queries": len(queries) - deferred, "ads": total_ads, "domains": all_domains, "deferred": deferred}
+    return {"queries": len(pending) - deferred, "ads": total_ads, "domains": all_domains, "deferred": deferred, "skipped": skipped}
 
 
 # ---------------------------------------------------------------- web search (copycat, best effort)
@@ -238,15 +279,20 @@ def known_domains(conn: sqlite3.Connection, watchlist_path: Path | None = None) 
     return wl, seen
 
 
-def new_domains(conn: sqlite3.Connection, watchlist_path: Path | None = None) -> list[tuple[str, str]]:
-    """[(domain, source)] seen by radar ads but neither on the watchlist nor triaged before."""
+def new_domains(conn: sqlite3.Connection, watchlist_path: Path | None = None) -> list[tuple[str, str, int]]:
+    """[(domain, source, ads_in_sweeps)] seen by radar ads but neither on the watchlist nor triaged before, most ads
+    first. Discarded non-Shopify domains come back once enough ads point at them to count as a funnel."""
     wl, seen = known_domains(conn, watchlist_path)
+    revive = {r[0] for r in conn.execute("SELECT domain FROM radar_domains WHERE status = 'discarded'")}
     out = []
-    for r in conn.execute("""SELECT landing_domain, MIN(source) AS src, COUNT(*) AS n FROM radar_ads WHERE landing_domain IS NOT NULL
+    for r in conn.execute("""SELECT landing_domain, MIN(source) AS src, COUNT(*) AS n FROM radar_ads
+                             WHERE landing_domain IS NOT NULL AND COALESCE(is_active, 1) = 1
                              GROUP BY landing_domain ORDER BY n DESC"""):
         d = r["landing_domain"]
-        if d and d not in wl and d not in seen:
-            out.append((d, r["src"]))
+        if not d or d in wl:
+            continue
+        if d not in seen or (d in revive and r["n"] >= config.RADAR_FUNNEL_MIN_ADS):
+            out.append((d, r["src"], r["n"]))
     return out
 
 
@@ -274,11 +320,15 @@ def outbound_shop_domains(html: str, own_domain: str) -> list[str]:
     return [d for d, _ in scores.most_common(5)]
 
 
-def follow_lander(conn: sqlite3.Connection, domain: str, session=None, fetch=ad_metrics.fetch_landing, check=is_shopify) -> tuple[str | None, list[dict]]:
+def landing_urls(conn: sqlite3.Connection, domain: str, limit: int = 3) -> list[str]:
+    return [r[0] for r in conn.execute("SELECT DISTINCT landing_url FROM radar_ads WHERE landing_domain = ? AND landing_url IS NOT NULL LIMIT ?",
+                                       (domain, limit))]
+
+
+def follow_lander_urls(urls: list[str], domain: str, session=None, fetch=ad_metrics.fetch_landing, check=is_shopify) -> tuple[str | None, list[dict]]:
     """For a non-Shopify landing domain: open up to 3 of its ad landing pages, collect the shop domains they
-    link to, and return the first that is a Shopify storefront (with its products)."""
+    link to, and return the first that is a Shopify storefront (with its products). Pure HTTP, thread-safe."""
     session = session or shopify.make_session()
-    urls = [r[0] for r in conn.execute("SELECT DISTINCT landing_url FROM radar_ads WHERE landing_domain = ? AND landing_url IS NOT NULL LIMIT 3", (domain,))]
     cands: Counter = Counter()
     for u in urls:
         try:
@@ -292,6 +342,44 @@ def follow_lander(conn: sqlite3.Connection, domain: str, session=None, fetch=ad_
         if ok:
             return d, products
     return None, []
+
+
+def follow_lander(conn: sqlite3.Connection, domain: str, session=None, fetch=ad_metrics.fetch_landing, check=is_shopify) -> tuple[str | None, list[dict]]:
+    return follow_lander_urls(landing_urls(conn, domain), domain, session, fetch=fetch, check=check)
+
+
+def classify_domain(domain: str, urls: list[str], session=None, check=is_shopify, fetch=ad_metrics.fetch_landing) -> dict:
+    """Stage 1 of triage, HTTP only (runs in a thread pool): Shopify storefront, a lander in front of one, or a funnel.
+    Returns {type, store_domain, products, lander_domain}."""
+    session = session or shopify.make_session()
+    ok, products = check(domain, session)
+    if ok:
+        return {"type": "shopify", "store_domain": domain, "products": products, "lander_domain": None}
+    shop, products = follow_lander_urls(urls, domain, session, fetch=fetch, check=check)
+    if shop:
+        return {"type": "shopify", "store_domain": shop, "products": products, "lander_domain": domain}
+    return {"type": "funnel", "store_domain": domain, "products": [], "lander_domain": None}
+
+
+def classify_many(conn: sqlite3.Connection, domains: list[str], check=is_shopify, fetch=ad_metrics.fetch_landing,
+                  workers: int | None = None, deadline: float | None = None):
+    """Yield (domain, classification) for many domains, checked concurrently (each on its own HTTP session)."""
+    from concurrent.futures import ThreadPoolExecutor
+    urls = {d: landing_urls(conn, d) for d in domains}
+    workers = workers or config.RADAR_CHECK_WORKERS
+
+    def one(d):
+        try:
+            return d, classify_domain(d, urls[d], shopify.make_session(), check=check, fetch=fetch)
+        except Exception as e:  # noqa: BLE001
+            log.warning("radar: classify %s failed: %s", d, e)
+            return d, {"type": "funnel", "store_domain": d, "products": [], "lander_domain": None}
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for i in range(0, len(domains), workers * 4):          # small batches so a spent budget stops quickly
+            if deadline is not None and time.monotonic() > deadline:
+                return
+            for d, cls in pool.map(one, domains[i:i + workers * 4]):
+                yield d, cls
 
 
 def domain_ads(conn: sqlite3.Connection, domain: str, products: list[dict], today: str) -> dict:
@@ -318,80 +406,168 @@ def domain_ads(conn: sqlite3.Connection, domain: str, products: list[dict], toda
             "example_text": example[:200], "hot_new_product": hot}
 
 
+def top_page_ids(conn: sqlite3.Connection, domains: list[str], limit: int = 3) -> list[str]:
+    c: Counter = Counter()
+    for d in domains:
+        for r in conn.execute("SELECT page_id, COUNT(*) n FROM radar_ads WHERE landing_domain = ? AND page_id IS NOT NULL GROUP BY page_id", (d,)):
+            c[r["page_id"]] += r["n"]
+    return [pid for pid, _ in c.most_common(limit)]
+
+
 def decide(age_days: int | None, active_ads: int, hot_new_product: str | None) -> bool:
     young = age_days is not None and age_days <= config.RADAR_MAX_AGE_DAYS
     return (young or bool(hot_new_product)) and active_ads >= config.RADAR_MIN_ACTIVE_ADS
 
 
-def triage_domain(conn: sqlite3.Connection, browser, domain: str, source: str, today: str, session=None,
-                  search=search_ads, check=is_shopify, follow=None, identity=store_age.fetch_identity,
-                  watchlist_path: Path | None = None) -> dict:
-    """Classify one domain and write its radar_domains row. Returns the row as a dict (+ 'promoted')."""
-    session = session or shopify.make_session()
-    follow = follow or (lambda c, d, s: follow_lander(c, d, s, check=check))
-    row = conn.execute("SELECT * FROM radar_domains WHERE domain = ?", (domain,)).fetchone()
-    rec = dict(row) if row else {"domain": domain, "status": "candidate", "source": source, "first_seen": today}
-    rec["last_checked"] = today
-    store_domain, products = domain, []
-    ok, products = check(domain, session)
-    if not ok:
-        shop, products = follow(conn, domain, session)
-        if shop:
-            rec["lander_domain"], store_domain = domain, shop
-            rec["type"] = "shopify"
-            log.info("radar: %s is a lander; its checkout is %s", domain, shop)
-        else:
-            rec["type"] = "funnel"
-    else:
-        rec["type"] = "shopify"
-    # ads pointing at the domain (a fresh search so counts are current), then the lander's own ads
+def _eligible(rec: dict) -> bool:
+    """Could this row ever promote? Shopify stores that are young or have a hot new product. Old stores without one
+    can only get there through a new product, which the weekly products refresh picks up."""
+    if rec.get("type") != "shopify":
+        return False
+    age = rec.get("store_age_days")
+    return (age is not None and age <= config.RADAR_MAX_AGE_DAYS) or bool(rec.get("hot_new_product"))
+
+
+def _needs_search(rec: dict, today: str) -> bool:
+    """An Ad Library search (minutes) is spent only where it can change the verdict: eligible stores and funnels with
+    enough ads, and not more often than every RADAR_RESEARCH_DAYS days."""
+    if rec.get("status") not in (None, "candidate"):
+        return False
+    last = rec.get("searched_at")
+    if last and (date.fromisoformat(today) - date.fromisoformat(last)).days < config.RADAR_RESEARCH_DAYS:
+        return False
+    if rec.get("type") == "funnel":
+        return (rec.get("ads_in_sweeps") or 0) >= config.RADAR_FUNNEL_MIN_ADS
+    return _eligible(rec) and (rec.get("active_ads") or 0) < config.RADAR_MIN_ACTIVE_ADS
+
+
+def _store_facts(conn, rec: dict, store_domain: str, products: list[dict], today: str, identity, session) -> None:
+    rec["products"] = len(products)
+    firsts = sorted(p["created_at"][:10] for p in products if p.get("created_at"))
+    rec["store_first_created"] = firsts[0] if firsts else rec.get("store_first_created")
+    rec["products_fetched"] = today
+    rec["handles_new"] = ",".join(sorted(p["handle"] for p in products if _published_within(p, today, 30)))[:2000]
+    if rec.get("shop_id") is None:
+        try:
+            rec["shop_id"] = identity(store_domain, session).get("shop_id")
+        except Exception:  # noqa: BLE001
+            pass
+    cal = store_age.build_calibration(conn)
+    est = store_age.estimate_created(rec.get("shop_id"), cal)["created"] if rec.get("shop_id") else None
+    rec["store_created_est"] = est.isoformat() if est else rec["store_first_created"]
+
+
+def _published_within(p: dict, today: str, days: int) -> bool:
+    pub = (p.get("published_at") or "")[:10]
     try:
-        ads = search(browser, store_domain, max_ads=200)
-        record_ads(conn, ads, store_domain, f"domain:{store_domain}", today)
-    except Exception as e:  # noqa: BLE001
-        log.warning("radar: ad search for %s failed: %s", store_domain, e)
+        return bool(pub) and (date.fromisoformat(today) - date.fromisoformat(pub)).days <= days
+    except ValueError:
+        return False
+
+
+def _stats(conn, rec: dict, store_domain: str, products: list[dict], today: str) -> None:
+    """active_ads / pages / top page / example / hot from what radar_ads holds for the store (+ its lander)."""
+    if not products and rec.get("handles_new"):
+        # no fresh catalogue this run: the handles published <= 30 days ago from the last fetch still identify a hot product
+        products = [{"handle": h, "published_at": today} for h in rec["handles_new"].split(",") if h]
     stats = domain_ads(conn, store_domain, products, today)
     if rec.get("lander_domain"):
-        lander_stats = domain_ads(conn, domain, [], today)
-        stats["active_ads"] += lander_stats["active_ads"]
-        stats["pages"] = max(stats["pages"], lander_stats["pages"])
-        stats["top_page"] = stats["top_page"] or lander_stats["top_page"]
-        stats["example_text"] = stats["example_text"] or lander_stats["example_text"]
+        ls = domain_ads(conn, rec["lander_domain"], [], today)
+        stats["active_ads"] += ls["active_ads"]
+        stats["pages"] = max(stats["pages"], ls["pages"])
+        stats["top_page"] = stats["top_page"] or ls["top_page"]
+        stats["example_text"] = stats["example_text"] or ls["example_text"]
     rec.update({k: stats[k] for k in ("active_ads", "pages", "top_page", "example_text", "hot_new_product")})
-    if rec["type"] == "shopify":
-        rec["products"] = len(products)
-        firsts = sorted(p["created_at"][:10] for p in products if p.get("created_at"))
-        rec["store_first_created"] = firsts[0] if firsts else None
-        try:
-            ident = identity(store_domain, session)
-            rec["shop_id"] = ident.get("shop_id")
-        except Exception:  # noqa: BLE001
-            ident = {}
-        cal = store_age.build_calibration(conn)
-        est = store_age.estimate_created(rec.get("shop_id"), cal)["created"] if rec.get("shop_id") else None
-        created = est.isoformat() if est else rec["store_first_created"]
-        rec["store_created_est"] = created
-        rec["store_age_days"] = store_age.age_days(created, today) if created else None
-        promote = decide(rec["store_age_days"], rec["active_ads"], rec["hot_new_product"]) or (rec.get("promote_flag") or "").upper() == "Y"
-    else:
+    rec["ads_in_sweeps"] = conn.execute("""SELECT COUNT(DISTINCT ad_id) FROM radar_ad_hits WHERE landing_domain IN (?, ?)
+                                           AND (source LIKE 'hook:%' OR source LIKE 'copycat:%')""",
+                                        (store_domain, rec.get("lander_domain") or store_domain)).fetchone()[0]
+    rec["store_age_days"] = store_age.age_days(rec["store_created_est"], today) if rec.get("store_created_est") else None
+
+
+DOMAIN_COLS = ("domain", "type", "status", "source", "first_seen", "last_checked", "lander_domain", "shop_id", "store_created_est",
+               "store_first_created", "store_age_days", "products", "active_ads", "pages", "top_page", "hot_new_product", "example_text",
+               "promote_flag", "promoted_at", "note", "searched_at", "ads_in_sweeps", "products_fetched", "handles_new", "store_domain")
+
+
+def _save(conn, rec: dict) -> None:
+    def write():
+        conn.execute(f"INSERT OR REPLACE INTO radar_domains ({', '.join(DOMAIN_COLS)}) VALUES ({', '.join('?' * len(DOMAIN_COLS))})",
+                     tuple(rec.get(c) for c in DOMAIN_COLS))
+        conn.commit()
+    _retry_locked(write)
+
+
+def triage_domain(conn: sqlite3.Connection, browser, domain: str, source: str, today: str, session=None,
+                  search=search_ads, check=is_shopify, follow=None, identity=store_age.fetch_identity,
+                  watchlist_path: Path | None = None, fetch=ad_metrics.fetch_landing, classified: dict | None = None,
+                  allow_search: bool = True, refetch: bool = True) -> dict:
+    """Classify one domain, write its radar_domains row, promote when it qualifies. Returns the row (+ 'promoted', 'searched').
+
+    Stage 1 (HTTP): Shopify check, lander follow, store facts. Skipped when `classified` is passed (thread pool) or
+    `refetch` is False (daily re-check from stored facts). Stage 2 (browser, minutes): an Ad Library search by the
+    store's top pages (fallback: the domain as a keyword), only when `_needs_search` says it can change the verdict."""
+    session = session or shopify.make_session()
+    row = conn.execute("SELECT * FROM radar_domains WHERE domain = ?", (domain,)).fetchone()
+    rec = dict(row) if row else {"domain": domain, "status": None, "source": source, "first_seen": today}
+    rec["last_checked"] = today
+    products: list[dict] = []
+    if classified is None and (refetch or not rec.get("type")):
+        if follow is not None:                      # legacy hook used by tests: (conn, domain, session) -> (shop, products)
+            ok, products = check(domain, session)
+            if ok:
+                classified = {"type": "shopify", "store_domain": domain, "products": products, "lander_domain": None}
+            else:
+                shop, products = follow(conn, domain, session)
+                classified = ({"type": "shopify", "store_domain": shop, "products": products, "lander_domain": domain} if shop
+                              else {"type": "funnel", "store_domain": domain, "products": [], "lander_domain": None})
+        else:
+            classified = classify_domain(domain, landing_urls(conn, domain), session, check=check, fetch=fetch)
+    if classified is not None:
+        rec["type"], rec["lander_domain"] = classified["type"], classified["lander_domain"]
+        products = classified["products"]
+        if classified["lander_domain"]:
+            log.info("radar: %s is a lander; its checkout is %s", domain, classified["store_domain"])
+    if classified is not None:
+        rec["store_domain"] = classified["store_domain"]
+    store_domain = rec.get("store_domain") or domain
+    if rec["type"] == "shopify" and products:
+        _store_facts(conn, rec, store_domain, products, today, identity, session)
+    elif rec["type"] != "shopify":
         rec["products"] = 0
-        promote = False
-    if promote and rec["status"] != "promoted":
+    _stats(conn, rec, store_domain, products, today)
+    forced = (rec.get("promote_flag") or "").upper() == "Y"
+    promote = rec["type"] == "shopify" and (forced or decide(rec["store_age_days"], rec["active_ads"], rec["hot_new_product"]))
+    rec["searched"] = False
+    if not promote and allow_search and _needs_search(rec, today):
+        if True:
+            pids = top_page_ids(conn, [store_domain] + ([rec["lander_domain"]] if rec.get("lander_domain") else []))
+            try:
+                if pids:
+                    for pid in pids:
+                        ads = search(browser, None, max_ads=config.RADAR_SEARCH_MAX_ADS, page_id=pid)
+                        record_ads(conn, ads, f"page:{pid}", f"page:{pid}", today)
+                else:
+                    ads = search(browser, store_domain, max_ads=config.RADAR_SEARCH_MAX_ADS)
+                    record_ads(conn, ads, store_domain, f"domain:{store_domain}", today)
+                rec["searched_at"], rec["searched"] = today, True
+            except Exception as e:  # noqa: BLE001
+                log.warning("radar: ad search for %s failed: %s", store_domain, e)
+            _stats(conn, rec, store_domain, products, today)
+            promote = rec["type"] == "shopify" and decide(rec["store_age_days"], rec["active_ads"], rec["hot_new_product"])
+    if promote and rec.get("status") != "promoted":
         note = f"radar: {rec['source']} {today}" + (f" via {domain}" if rec.get("lander_domain") else "")
         append_to_watchlist({"store_domain": store_domain, "meta_page_name": rec.get("top_page") or "", "notes": note}, watchlist_path)
         rec["status"], rec["promoted_at"] = "promoted", today
         log.info("radar: PROMOTED %s (age %s d, %s active ads, hot=%s) -> watchlist", store_domain, rec.get("store_age_days"),
                  rec["active_ads"], rec.get("hot_new_product"))
-    elif rec["status"] not in ("promoted", "watchlist"):
-        rec["status"] = "candidate"
+    elif rec.get("status") not in ("promoted", "watchlist"):
+        if rec["type"] == "funnel" and (rec.get("ads_in_sweeps") or 0) < config.RADAR_FUNNEL_MIN_ADS:
+            rec["status"] = "discarded"          # non-Shopify with too few ads to be worth tracking (revived if more show up)
+        else:
+            rec["status"] = "candidate"
     rec["domain"] = domain
-    cols = ("domain", "type", "status", "source", "first_seen", "last_checked", "lander_domain", "shop_id", "store_created_est",
-            "store_first_created", "store_age_days", "products", "active_ads", "pages", "top_page", "hot_new_product", "example_text",
-            "promote_flag", "promoted_at", "note")
-    conn.execute(f"INSERT OR REPLACE INTO radar_domains ({', '.join(cols)}) VALUES ({', '.join('?' * len(cols))})",
-                 tuple(rec.get(c) for c in cols))
-    conn.commit()
-    rec["promoted"] = promote
+    _save(conn, rec)
+    rec["promoted"] = promote and rec.get("promoted_at") == today
     return rec
 
 
@@ -464,18 +640,26 @@ def import_folder(conn: sqlite3.Connection, today: str, folder: Path | None = No
 
 def run_radar(conn: sqlite3.Connection, browser, today: str, do_sweep: bool | None = None, session=None,
               search=search_ads, check=is_shopify, identity=store_age.fetch_identity, web_search=web_search_domains,
-              watchlist_path: Path | None = None, wait=None, max_minutes: float | None = None) -> dict:
-    """imports -> (weekly) hook + copycat sweeps -> triage new domains -> re-triage candidates."""
+              watchlist_path: Path | None = None, wait=None, max_minutes: float | None = None,
+              fetch=ad_metrics.fetch_landing, workers: int | None = None) -> dict:
+    """imports -> (weekly) hook + copycat sweeps -> classify every new landing domain (HTTP, threads) ->
+    daily re-check of every candidate from stored facts -> Ad Library searches where they can change a verdict."""
     session = session or shopify.make_session()
     wait = wait or meta_ads._wait
     if do_sweep is None:
         do_sweep = date.fromisoformat(today).weekday() == config.RADAR_SWEEP_WEEKDAY
-    deadline = time.monotonic() + (max_minutes if max_minutes is not None else config.RADAR_MAX_MINUTES) * 60
+    budget = (max_minutes if max_minutes is not None else config.RADAR_MAX_MINUTES) * 60
+    t0 = time.monotonic()
+    deadline = t0 + budget
+    # sweeps stop early enough to leave RADAR_TRIAGE_MINUTES for the classification + searches that follow
+    sweep_deadline = t0 + max(0.0, budget - min(config.RADAR_TRIAGE_MINUTES * 60, budget / 2))
     out = {"imports": import_folder(conn, today, watchlist_path=watchlist_path), "sweep": None, "copycat": None, "web": None,
-           "found": 0, "discarded": 0, "promoted": 0, "parked": 0, "funnels": 0, "retriaged": 0, "promoted_later": 0, "deferred_triage": 0}
+           "found": 0, "shopify": 0, "discarded": 0, "promoted": 0, "parked": 0, "funnels": 0, "retriaged": 0, "promoted_later": 0,
+           "deferred_triage": 0, "searched": 0, "deferred_search": 0, "refreshed": 0}
     if do_sweep:
         hooks = load_hooks()
-        out["sweep"] = sweep(conn, browser, [(h, f"hook:{h}") for h in hooks], today, search=search, wait=wait, deadline=deadline)
+        out["sweep"] = sweep(conn, browser, [(h, f"hook:{h}") for h in hooks], today, search=search, wait=wait,
+                             deadline=sweep_deadline, skip_days=config.RADAR_RESWEEP_DAYS)
         heroes = hero_queries(conn, today)
         # copycat queries rotate: least recently searched first, RADAR_MAX_COPYCAT_QUERIES per sweep
         last = {r[0]: r[1] for r in conn.execute("SELECT query, MAX(started_at) FROM radar_runs WHERE kind = 'copycat' GROUP BY query")}
@@ -487,10 +671,13 @@ def run_radar(conn: sqlite3.Connection, browser, today: str, do_sweep: bool | No
                 qs.append((h["query"], f"copycat:{h['store']}/{h['handle']}"))
         qs.sort(key=lambda x: last.get(x[0]) or "")
         qs = qs[: config.RADAR_MAX_COPYCAT_QUERIES]
-        out["copycat"] = sweep(conn, browser, qs, today, search=search, wait=wait, deadline=deadline)
+        out["copycat"] = sweep(conn, browser, qs, today, search=search, wait=wait, deadline=sweep_deadline,
+                               skip_days=config.RADAR_RESWEEP_DAYS)
         if config.RADAR_WEB_SEARCH and web_search is not None:
             web_domains = set()
             for h in heroes[: config.RADAR_MAX_WEB_QUERIES]:
+                if time.monotonic() > sweep_deadline:
+                    break
                 for d in web_search(h["title"] or h["query"], session):
                     web_domains.add((d, f"web:{h['store']}/{h['handle']}"))
                 time.sleep(1.0)
@@ -499,50 +686,84 @@ def run_radar(conn: sqlite3.Connection, browser, today: str, do_sweep: bool | No
                                 VALUES (?,?,?,?,?,?,0)""", (f"web:{d}", src, src, d, today, today))
             conn.commit()
             out["web"] = {"queries": min(len(heroes), config.RADAR_MAX_WEB_QUERIES), "domains": len(web_domains)}
-    # triage new domains
-    todo = new_domains(conn, watchlist_path)[: config.RADAR_MAX_TRIAGE]
+    # stage 1: classify every new landing domain (HTTP only, concurrent), plus a weekly catalogue refresh of Shopify candidates
+    todo = new_domains(conn, watchlist_path)
     out["found"] = len(todo)
-    for i, (dom, src) in enumerate(todo):
-        if time.monotonic() > deadline:
-            out["deferred_triage"] = len(todo) - i
-            log.warning("radar: budget spent; %d new domain(s) wait for the next run", out["deferred_triage"])
-            break
-        rec = triage_domain(conn, browser, dom, src, today, session, search=search, check=check, identity=identity, watchlist_path=watchlist_path)
-        if rec["type"] == "funnel":
-            out["funnels"] += 1
-            out["parked"] += 1
-        elif rec["promoted"]:
-            out["promoted"] += 1
-        else:
-            out["parked"] += 1
-        if i < len(todo) - 1:
-            wait()
-    # re-triage existing candidates daily (thresholds may be crossed, or promote=Y set on the sheet)
-    cands = [dict(r) for r in conn.execute("SELECT * FROM radar_domains WHERE status = 'candidate' AND last_checked < ?", (today,))]
-    for i, c in enumerate(cands):
-        if time.monotonic() > deadline:
-            break
-        rec = triage_domain(conn, browser, c["domain"], c["source"], today, session, search=search, check=check, identity=identity, watchlist_path=watchlist_path)
+    src_of = {d: src for d, src, _ in todo}
+    stale = (date.fromisoformat(today) - timedelta(days=config.RADAR_REFRESH_DAYS)).isoformat()
+    refresh_rows = {r["domain"]: r["source"] for r in conn.execute("""SELECT domain, source FROM radar_domains WHERE status = 'candidate'
+                                                                       AND type = 'shopify' AND COALESCE(products_fetched, '') < ?""", (stale,))}
+    stage1 = [d for d, _, _ in todo] + [d for d in refresh_rows if d not in src_of]
+    done = 0
+    for dom, cls in classify_many(conn, stage1, check=check, fetch=fetch, workers=workers, deadline=deadline):
+        done += 1
+        rec = triage_domain(conn, browser, dom, src_of.get(dom) or refresh_rows.get(dom) or "?", today, session, search=search, check=check,
+                            identity=identity, watchlist_path=watchlist_path, fetch=fetch, classified=cls, allow_search=False)
+        if dom not in src_of:
+            out["refreshed"] += 1
+            if rec["promoted"]:
+                out["promoted_later"] += 1
+    if done < len(stage1):
+        out["deferred_triage"] = len(stage1) - done
+        log.warning("radar: budget spent; %d domain(s) wait for the next run", out["deferred_triage"])
+    # daily re-check of every other candidate from stored facts (age moves, promote=Y from the sheet, new sweep ads)
+    checked_today = set(stage1)
+    for c in [dict(r) for r in conn.execute("SELECT * FROM radar_domains WHERE status = 'candidate' AND COALESCE(last_checked, '') < ?", (today,))]:
+        if c["domain"] in checked_today:
+            continue
+        rec = triage_domain(conn, browser, c["domain"], c["source"], today, session, search=search, check=check, identity=identity,
+                            watchlist_path=watchlist_path, fetch=fetch, allow_search=False, refetch=False)
         out["retriaged"] += 1
         if rec["promoted"]:
             out["promoted_later"] += 1
-        if i < len(cands) - 1:
+    # stage 2: Ad Library searches where they can change a verdict, most sweep ads first, within the budget
+    cands = [dict(r) for r in conn.execute("SELECT * FROM radar_domains WHERE status = 'candidate' ORDER BY ads_in_sweeps DESC, store_age_days ASC")]
+    queue = [c for c in cands if _needs_search(c, today)]
+    queue.sort(key=lambda c: (0 if c["type"] == "shopify" else 1, -(c.get("ads_in_sweeps") or 0)))
+    batch = queue[: config.RADAR_MAX_TRIAGE]
+    out["deferred_search"] = len(queue) - len(batch)
+    for i, c in enumerate(batch):
+        if time.monotonic() > deadline:
+            out["deferred_search"] = len(queue) - i
+            log.warning("radar: budget spent; %d Ad Library search(es) wait for the next run", out["deferred_search"])
+            break
+        rec = triage_domain(conn, browser, c["domain"], c["source"], today, session, search=search, check=check, identity=identity,
+                            watchlist_path=watchlist_path, fetch=fetch, allow_search=True, refetch=False)
+        out["searched"] += 1 if rec.get("searched") else 0
+        if rec["promoted"] and c["domain"] not in src_of:
+            out["promoted_later"] += 1
+        if i < len(batch) - 1:
             wait()
+    # what became of this run's new domains, after every stage
+    for r in conn.execute("SELECT domain, type, status, last_checked FROM radar_domains"):
+        if r["domain"] not in src_of or r["last_checked"] != today:
+            continue
+        out["shopify"] += 1 if r["type"] == "shopify" else 0
+        if r["status"] == "promoted":
+            out["promoted"] += 1
+        elif r["status"] == "discarded":
+            out["discarded"] += 1
+        else:
+            out["parked"] += 1
+            out["funnels"] += 1 if r["type"] == "funnel" else 0
     return out
 
 
 CANDIDATES_HEADERS = ["domain", "type", "status", "first_seen", "store_age_days", "store_created_est", "store_first_created", "products",
-                      "active_ads", "pages", "top page", "example ad text", "hot new product", "source", "lander_domain", "last_checked",
-                      "promote"]
+                      "active_ads", "ads_in_sweeps", "searched_at", "pages", "top page", "example ad text", "hot new product", "source",
+                      "lander_domain", "last_checked", "promote"]
 
 
 def candidates_rows(conn: sqlite3.Connection) -> list[list]:
+    """Candidates first (most active ads first), then promoted rows. active_ads counts every ad radar has seen landing
+    on the domain; until searched_at is set that is a lower bound from the sweeps only."""
     rows = []
     for r in conn.execute("""SELECT * FROM radar_domains WHERE status IN ('candidate', 'promoted') ORDER BY
                              CASE status WHEN 'candidate' THEN 0 ELSE 1 END, active_ads DESC, first_seen DESC"""):
         rows.append([r["domain"], r["type"] or "", r["status"], r["first_seen"], "" if r["store_age_days"] is None else r["store_age_days"],
                      r["store_created_est"] or "", r["store_first_created"] or "", "" if r["products"] is None else r["products"],
-                     "" if r["active_ads"] is None else r["active_ads"], "" if r["pages"] is None else r["pages"], r["top_page"] or "",
+                     "" if r["active_ads"] is None else r["active_ads"], "" if r["ads_in_sweeps"] is None else r["ads_in_sweeps"],
+                     r["searched_at"] or "", "" if r["pages"] is None else r["pages"], r["top_page"] or "",
                      (r["example_text"] or "")[:200], r["hot_new_product"] or "", r["source"] or "", r["lander_domain"] or "",
                      r["last_checked"] or "", r["promote_flag"] or ""])
     return rows
@@ -563,29 +784,35 @@ def apply_promote_marks(conn: sqlite3.Connection, sheet_rows: list[list]) -> int
 
 
 def summary_counts(conn: sqlite3.Connection) -> dict:
-    c = {k: 0 for k in ("candidate", "promoted", "discarded", "watchlist", "funnel")}
+    c = {k: 0 for k in ("candidate", "promoted", "discarded", "watchlist", "funnel", "shopify")}
     for r in conn.execute("SELECT status, type, COUNT(*) n FROM radar_domains GROUP BY status, type"):
         c[r["status"]] = c.get(r["status"], 0) + r["n"]
-        if r["type"] == "funnel":
+        if r["type"] == "funnel" and r["status"] == "candidate":
             c["funnel"] += r["n"]
+        if r["type"] == "shopify" and r["status"] == "candidate":
+            c["shopify"] += r["n"]
     c["domains"] = sum(v for k, v in c.items() if k in ("candidate", "promoted", "discarded", "watchlist"))
+    c["unsearched"] = conn.execute("SELECT COUNT(*) FROM radar_domains WHERE status = 'candidate' AND searched_at IS NULL").fetchone()[0]
     return c
 
 
 def hook_yield(conn: sqlite3.Connection) -> list[dict]:
     """Per hook phrase: sweeps run, ads seen, landing domains, and how many of those domains were promoted /
-    are candidates / are funnels. A phrase with sweeps >= 2 and 0 promoted is flagged for deletion."""
+    are Shopify candidates / are funnels / were discarded. Every phrase that returned an ad gets credit for it
+    (radar_ad_hits), not only the first phrase that saw it. A phrase with sweeps >= 2 and 0 promoted is flagged."""
     out = []
     status = {r["domain"]: (r["status"], r["type"]) for r in conn.execute("SELECT domain, status, type FROM radar_domains")}
     for h in load_hooks():
         src = f"hook:{h}"
         sweeps = conn.execute("SELECT COUNT(*) FROM radar_runs WHERE kind = 'hook' AND query = ? AND note = ''", (h,)).fetchone()[0]
-        ads = conn.execute("SELECT COUNT(*) FROM radar_ads WHERE source = ?", (src,)).fetchone()[0]
-        doms = {r[0] for r in conn.execute("SELECT DISTINCT landing_domain FROM radar_ads WHERE source = ? AND landing_domain IS NOT NULL", (src,))}
+        ads = conn.execute("SELECT COUNT(DISTINCT ad_id) FROM radar_ad_hits WHERE source = ?", (src,)).fetchone()[0]
+        doms = {r[0] for r in conn.execute("SELECT DISTINCT landing_domain FROM radar_ad_hits WHERE source = ? AND landing_domain IS NOT NULL", (src,))}
         promoted = sum(1 for d in doms if status.get(d, ("", ""))[0] == "promoted")
-        cands = sum(1 for d in doms if status.get(d, ("", ""))[0] == "candidate" and status[d][1] != "funnel")
-        funnels = sum(1 for d in doms if status.get(d, ("", ""))[1] == "funnel")
+        cands = sum(1 for d in doms if status.get(d, ("", ""))[0] == "candidate" and status[d][1] == "shopify")
+        funnels = sum(1 for d in doms if status.get(d, ("", ""))[0] == "candidate" and status[d][1] == "funnel")
+        discarded = sum(1 for d in doms if status.get(d, ("", ""))[0] == "discarded")
         out.append({"hook": h, "sweeps": sweeps, "ads": ads, "domains": len(doms), "promoted": promoted, "candidates": cands,
-                    "funnels": funnels, "verdict": "delete?" if sweeps >= 2 and promoted == 0 else ("add siblings" if promoted >= 2 else "")})
+                    "funnels": funnels, "discarded": discarded,
+                    "verdict": "delete?" if sweeps >= 2 and promoted == 0 else ("add siblings" if promoted >= 2 else "")})
     out.sort(key=lambda r: (-r["promoted"], -r["candidates"], -r["domains"]))
     return out

@@ -497,55 +497,77 @@ after the Meta pass; on Sundays (`RADAR_SWEEP_WEEKDAY=6`) it also runs the weekl
 
 ### Triage (every new landing domain, then every Candidates row again daily)
 
-1. Is it a Shopify storefront? (`/products.json` answers with products.) If not, the lander's
-   outbound links (buy buttons, checkout, "shop now") are followed one hop; if one of them is a
-   Shopify store, that store is the candidate and the lander is remembered in `lander_domain`.
-   Still nothing: the domain is parked as `type=funnel` and its ads, pages and landing URLs are
-   tracked anyway (it stays on the Candidates tab and is re-checked daily).
+A sweep of 80 phrases returns a few thousand distinct landing domains, so triage is split into a cheap
+stage that runs on all of them and an expensive stage that runs only where it can change the verdict.
+
+**Stage 1, HTTP only, `RADAR_CHECK_WORKERS` (6) domains at a time:**
+
+1. Is it a Shopify storefront? (`/products.json` answers with products; `www.` and `shop.` variants are
+   tried too.) If not, the lander's outbound links (buy buttons, checkout, "shop now") are followed one
+   hop; if one of them is a Shopify store, that store is the candidate (`store_domain`) and the lander
+   is remembered in `lander_domain`.
+   Still nothing: it is a **funnel**. With `RADAR_FUNNEL_MIN_ADS` (3) or more sweep ads pointing at it,
+   it is parked as `type=funnel` and its ads, pages and landing URLs are tracked; with fewer it is
+   `discarded` (news sites, app stores, one-off landers) and comes back automatically the day a later
+   sweep brings its count to the threshold.
 2. Store age: `store_age_days` from the earliest product `created_at` (or the shop-id calibration
    when one exists; it is optional). `store_first_created` and `store_created_est` are both shown.
-3. Ad Library search for the domain: `active_ads`, distinct `pages`, `top page`, an example ad text,
-   and `hot new product` = a product published in the last 30 days with 3 or more ads pointing at it.
-4. **Promote** when `(store_age_days <= RADAR_MAX_AGE_DAYS (180) OR hot new product) AND active_ads >= RADAR_MIN_ACTIVE_ADS (10)`.
-   Promotion appends the store to `watchlist.csv` with the note `radar: <source> <date>` (plus
-   `via <lander>` when it was reached through a funnel page) and it gets its first Shopify snapshot on
-   the next morning run. On the Signals tab its rows carry `store_badge=NEW` for
-   `RADAR_NEW_BADGE_DAYS` (14) days.
-   Everything else is a **candidate**: re-triaged every day and promoted the day it crosses the
-   thresholds. To force one, type `Y` in the `promote` column of the Candidates tab; the next
-   `sync-sheets` reads the marks back and the next radar run promotes those domains.
+3. From the ads radar has already seen: `active_ads` (a lower bound until the domain is searched),
+   `ads_in_sweeps`, `pages`, `top page`, an example ad text, and `hot new product` = a product
+   published in the last 30 days with 3 or more ads pointing at it.
+
+**Stage 2, one Ad Library search per domain (minutes each), up to `RADAR_MAX_TRIAGE` (40) per run,
+most sweep ads first:** the store's top pages (up to 3, by `page_id`) are searched for all their
+active ads, or the domain as a keyword when no page is known. Only domains where the answer can change
+the verdict get one: Shopify stores that are young (`<= RADAR_MAX_AGE_DAYS`) or have a hot new product
+and are still under `RADAR_MIN_ACTIVE_ADS`, and funnels over the ad threshold. An old store without a
+hot product is parked without a search (nothing it could return would promote it) and is searched
+the week its catalogue refresh shows a new product. `searched_at` on the tab says when a domain was
+last searched; a domain is not searched again within `RADAR_RESEARCH_DAYS` (7).
+
+**Promote** when `(store_age_days <= RADAR_MAX_AGE_DAYS (180) OR hot new product) AND active_ads >= RADAR_MIN_ACTIVE_ADS (10)`.
+Promotion appends the store to `watchlist.csv` with the note `radar: <source> <date>` (plus
+`via <lander>` when it was reached through a funnel page) and it gets its first Shopify snapshot on
+the next morning run. On the Signals tab its rows carry `store_badge=NEW` for
+`RADAR_NEW_BADGE_DAYS` (14) days.
+Everything else is a **candidate**: every night its facts are recomputed (age moves, new sweep ads,
+`promote` marks) and it is promoted the day it crosses; Shopify candidates get their catalogue re-read
+every `RADAR_REFRESH_DAYS` (7) so a new product makes them eligible. To force one, type `Y` in the
+`promote` column of the Candidates tab; the next `sync-sheets` reads the marks back and the next
+radar run promotes those domains without waiting for a search.
 
 There is no copy-length filter anywhere.
 
 ### Candidates tab
 
 `domain, type (shopify / funnel), status (candidate / promoted), first_seen, store_age_days,
-store_created_est, store_first_created, products, active_ads, pages, top page, example ad text (200 chars),
-hot new product, source (hook:<phrase> / copycat:<store>/<handle> / web:<store>/<handle> / manual),
-lander_domain, last_checked, promote`. Candidates first (most active ads first), then promoted rows.
+store_created_est, store_first_created, products, active_ads, ads_in_sweeps, searched_at, pages, top page,
+example ad text (200 chars), hot new product, source (hook:<phrase> / copycat:<store>/<handle> /
+web:<store>/<handle> / manual), lander_domain, last_checked, promote`. Candidates first (most active
+ads first), then promoted rows. Discarded domains are kept in the database (`radar_domains`) but not shown.
 
-### Budget and schedule
+### Budget, resume and schedule
 
-One radar run is capped at `RADAR_MAX_MINUTES` (240). Sweeps stop when the budget is spent and the
-remaining phrases run next Sunday; triage handles up to `RADAR_MAX_TRIAGE` (40) new domains per run and
-defers the rest to the next night. Every search waits the same random 3-8 s as the Meta scraper and uses
-one browser. A full first sweep (80 hooks x up to 500 ads plus up to 60 copycat queries) takes most of the
-budget; if it keeps running out, halve the symptom group in `hooks.txt` first.
+One radar run is capped at `RADAR_MAX_MINUTES` (240); the sweeps stop `RADAR_TRIAGE_MINUTES` (60)
+before that so classification and searches always get their turn. A phrase searched successfully in
+the last `RADAR_RESWEEP_DAYS` (6) days is skipped, so a sweep that crashed, was interrupted or ran out
+of budget continues where it stopped when you run it again (and finishes next Sunday otherwise).
+Stage 1 checks every new domain; stage 2 searches are capped per run and the rest wait for the next
+night. Every search waits the same random 3-8 s as the Meta scraper and uses one browser. A first
+sweep of 80 phrases takes about 3.5 h at 500 ads per phrase; if it keeps running short, halve the
+symptom group in `hooks.txt` first or raise the budget.
 
-```powershell
-python tracker.py radar --sweep                # run the weekly sweeps now (and triage), ~3-4 h
-python tracker.py radar                        # triage only (unless it is Sunday), ~30 min
-python tracker.py radar --no-sweep             # triage only, even on Sunday
-python tracker.py radar --max-minutes 60       # smaller budget for a test
-python tracker.py radar-report                 # hook yield table, totals, recent runs, Candidates
-python tracker.py radar-add x.com https://y.com/products/z   # straight onto the watchlist (source=manual)
-```
+Radar shares `data/tracker.db` with the other commands. The connection waits up to 60 s for another
+tracker command to finish writing and retries a write that still finds the database locked, so
+running `run` or `sync-sheets` while a sweep is going is safe; a phrase whose ads could not be stored
+is logged and searched again next time.
 
 ### Hook yield (keeping `hooks.txt` honest)
 
 `radar-report` (and the end of every sweep) prints one row per phrase: sweeps run, ads seen, distinct
-landing domains, how many of those were promoted, how many are parked candidates, how many funnels,
-and a verdict. `delete` = zero promotable stores across two or more sweeps; `add siblings` = the top
+landing domains, how many of those were promoted, how many are parked Shopify candidates, how many
+funnels, how many discarded, and a verdict. A phrase gets credit for every ad it returned, even when
+another phrase returned the same ad first. `delete` = zero promotable stores across two or more sweeps; `add siblings` = the top
 producers. Edit `radar/hooks.txt` accordingly; the next sweep picks up the new list.
 
 ## Scheduling (Windows)

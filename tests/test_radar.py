@@ -1,4 +1,5 @@
 """Radar: query building, domain normalisation, lander following, triage decision, imports, the run, the tab."""
+import sqlite3
 import tempfile
 import unittest
 from datetime import date, timedelta
@@ -85,9 +86,12 @@ class RunTests(unittest.TestCase):
         return {"ad_id": aid, "page_id": page.lower().replace(" ", ""), "page_name": page, "landing_url": url,
                 "landing_domain": url.split("/")[2], "primary_text": text, "start_date": d(3), "is_active": True}
 
-    def search(self, browser, q, max_ads=None, search_type="keyword_unordered"):
-        self.searched.append(q)
-        return list(self.ads.get(q, []))
+    PAGE_OF = {"youngpage": "young.com", "secondpage": "young.com", "newssite": "brand.com", "oldpage": "oldstore.com"}
+
+    def search(self, browser, q, max_ads=None, search_type="keyword_unordered", page_id=None):
+        key = self.PAGE_OF.get(page_id, page_id) if page_id else q
+        self.searched.append(key)
+        return list(self.ads.get(key, []))
 
     def check(self, domain, session=None):
         self.checked.append(domain)
@@ -112,27 +116,27 @@ class RunTests(unittest.TestCase):
         def fetch(session, url):
             fetches.append(url)
             return url, '<a href="https://brand.com/products/x">Get it</a>', 200
-        real_follow = radar.follow_lander
-        radar.follow_lander = lambda conn, dom, sess, check=None: real_follow(conn, dom, sess, fetch=fetch, check=self.check)
         try:
             out = radar.run_radar(self.conn, None, TODAY, do_sweep=True, search=self.search, check=self.check, identity=self.identity,
-                                  web_search=lambda q, s: ["oldstore.com"], watchlist_path=self.wl, wait=lambda: None)
+                                  web_search=lambda q, s: ["oldstore.com"], watchlist_path=self.wl, wait=lambda: None, fetch=fetch, workers=2)
         finally:
             radar.HOOKS_PATH = old
-            radar.follow_lander = real_follow
         self.assertEqual(out["sweep"]["queries"], 1)
         self.assertIn("retinol night cream", self.searched)                       # copycat query from the hero product (brand word stripped)
         rows = {r["domain"]: dict(r) for r in self.conn.execute("SELECT * FROM radar_domains")}
-        # young.com: 20-day-old store (first product), 12 active ads -> promoted
-        self.assertEqual((rows["young.com"]["status"], rows["young.com"]["type"], rows["young.com"]["active_ads"]), ("promoted", "shopify", 14))   # 12 from the domain search + 2 hook ads
-        self.assertEqual(rows["young.com"]["pages"], 2)
+        # young.com: 20-day-old store (first product), 2 sweep ads -> eligible -> searched by its page -> 12 more ads -> promoted
+        self.assertEqual((rows["young.com"]["status"], rows["young.com"]["type"], rows["young.com"]["active_ads"]), ("promoted", "shopify", 14))   # 12 from the page search + 2 hook ads
+        self.assertEqual((rows["young.com"]["pages"], rows["young.com"]["ads_in_sweeps"], rows["young.com"]["searched_at"]), (2, 2, TODAY))
+        self.assertIn("young.com", self.searched)                                  # page search resolved through the fake's page map
+        self.assertNotIn("brand.com", self.searched)                               # old store, no hot product: no search spent on it
         self.assertEqual(rows["young.com"]["store_first_created"], d(20))
         # news.example is a lander whose CTA goes to brand.com (old store, 15 ads, no hot product) -> candidate
-        self.assertEqual((rows["news.example"]["type"], rows["news.example"]["lander_domain"], rows["news.example"]["status"]), ("shopify", "news.example", "candidate"))
+        self.assertEqual((rows["news.example"]["type"], rows["news.example"]["lander_domain"], rows["news.example"]["status"], rows["news.example"]["store_domain"]),
+                         ("shopify", "news.example", "candidate", "brand.com"))
         self.assertGreaterEqual(fetches and len(fetches), 1)
         # oldstore.com (web search): old store, but 'fresh' published 10 days ago... only 'retinol' has ads -> candidate
         self.assertEqual(rows["oldstore.com"]["status"], "candidate")
-        self.assertEqual((out["promoted"], out["parked"]), (1, 2))
+        self.assertEqual((out["found"], out["shopify"], out["promoted"], out["parked"], out["discarded"], out["searched"]), (3, 3, 1, 2, 0, 1))
         wl = self.wl.read_text(encoding="utf-8")
         self.assertIn("young.com", wl)
         self.assertIn("radar: hook:I'm a doctor", wl)
@@ -145,18 +149,74 @@ class RunTests(unittest.TestCase):
         self.assertEqual(radar.apply_promote_marks(self.conn, sheet_rows), 1)
         out2 = radar.run_radar(self.conn, None, d(-1), do_sweep=False, search=self.search, check=self.check, identity=self.identity,
                                web_search=None, watchlist_path=self.wl, wait=lambda: None)
-        self.assertEqual(out2["promoted_later"], 1)
+        self.assertEqual((out2["promoted_later"], out2["retriaged"], out2["searched"]), (1, 2, 0))   # promote=Y needs no search
         self.assertEqual(self.conn.execute("SELECT status FROM radar_domains WHERE domain = 'oldstore.com'").fetchone()[0], "promoted")
         self.assertIn("oldstore.com", self.wl.read_text(encoding="utf-8"))
 
-    def test_funnel_is_parked_and_tracked(self):
-        self.conn.execute("""INSERT INTO radar_ads (ad_id, query, source, page_id, page_name, landing_url, landing_domain, body_len, body_snippet, start_date, first_seen, last_seen, is_active)
-                             VALUES ('f1', 'q', 'hook:q', 'p', 'Funnel Page', 'https://funnel.example/offer', 'funnel.example', 50, 'offer', ?, ?, ?, 1)""", (d(2), TODAY, TODAY))
+    def _funnel_ads(self, n):
+        for i in range(n):
+            self.conn.execute("""INSERT OR IGNORE INTO radar_ads (ad_id, query, source, page_id, page_name, landing_url, landing_domain, body_len, body_snippet, start_date, first_seen, last_seen, is_active)
+                                 VALUES (?, 'q', 'hook:q', 'p', 'Funnel Page', 'https://funnel.example/offer', 'funnel.example', 50, 'offer', ?, ?, ?, 1)""", (f"f{i}", d(2), TODAY, TODAY))
+            self.conn.execute("INSERT OR IGNORE INTO radar_ad_hits (ad_id, source, query, landing_domain, seen) VALUES (?, 'hook:q', 'q', 'funnel.example', ?)", (f"f{i}", TODAY))
         self.conn.commit()
+
+    def test_funnel_is_parked_and_tracked(self):
+        self._funnel_ads(3)
         rec = radar.triage_domain(self.conn, None, "funnel.example", "hook:q", TODAY, search=self.search, check=self.check, identity=self.identity,
                                   follow=lambda c, dom, s: (None, []), watchlist_path=self.wl)
-        self.assertEqual((rec["type"], rec["status"], rec["active_ads"], rec["pages"], rec["top_page"]), ("funnel", "candidate", 1, 1, "Funnel Page"))
+        self.assertEqual((rec["type"], rec["status"], rec["active_ads"], rec["pages"], rec["top_page"], rec["ads_in_sweeps"]),
+                         ("funnel", "candidate", 3, 1, "Funnel Page", 3))
+        self.assertEqual(rec["searched_at"], TODAY)                                # 3+ sweep ads: its page was searched
         self.assertNotIn("funnel.example", self.wl.read_text(encoding="utf-8"))
+
+    def test_non_shopify_with_few_ads_is_discarded_then_revived(self):
+        self._funnel_ads(1)
+        rec = radar.triage_domain(self.conn, None, "funnel.example", "hook:q", TODAY, search=self.search, check=self.check, identity=self.identity,
+                                  follow=lambda c, dom, s: (None, []), watchlist_path=self.wl)
+        self.assertEqual((rec["status"], rec.get("searched_at")), ("discarded", None))
+        self.assertNotIn("funnel.example", [r[0] for r in radar.new_domains(self.conn, self.wl)])
+        self._funnel_ads(3)                                                          # a later sweep brings more ads
+        self.assertIn("funnel.example", [r[0] for r in radar.new_domains(self.conn, self.wl)])
+
+    def test_sweep_resumes_and_survives_a_locked_database(self):
+        old = radar.HOOKS_PATH
+        calls = {"n": 0}
+        real = radar.record_ads
+
+        def flaky(conn, ads, query, source, today):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise sqlite3.OperationalError("database is locked")
+            return real(conn, ads, query, source, today)
+        radar.record_ads = flaky
+        try:
+            out = radar.sweep(self.conn, None, [("I'm a doctor", "hook:I'm a doctor"), ("retinol night cream", "hook:retinol night cream")], TODAY,
+                              search=self.search, wait=lambda: None)
+        finally:
+            radar.record_ads = real
+            radar.HOOKS_PATH = old
+        self.assertEqual((out["queries"], out["ads"]), (2, 1))                       # first query lost its ads but the sweep went on
+        notes = {r[0]: r[1] for r in self.conn.execute("SELECT query, note FROM radar_runs")}
+        self.assertIn("db error", notes["I'm a doctor"])
+        self.assertEqual(notes["retinol night cream"], "")
+        # a re-run within RADAR_RESWEEP_DAYS skips the phrase that succeeded and repeats the one that failed
+        self.searched.clear()
+        out2 = radar.sweep(self.conn, None, [("I'm a doctor", "hook:I'm a doctor"), ("retinol night cream", "hook:retinol night cream")], TODAY,
+                           search=self.search, wait=lambda: None, skip_days=6)
+        self.assertEqual((out2["skipped"], self.searched), (1, ["I'm a doctor"]))
+
+    def test_every_phrase_gets_credit_for_a_shared_ad(self):
+        radar.record_ads(self.conn, self.ads["I'm a doctor"], "after 60", "hook:after 60", TODAY)
+        radar.record_ads(self.conn, self.ads["I'm a doctor"], "over 60", "hook:over 60", TODAY)
+        old = radar.HOOKS_PATH
+        hooks = self.tmp / "hooks.txt"
+        hooks.write_text("after 60\nover 60\n", encoding="utf-8")
+        radar.HOOKS_PATH = hooks
+        try:
+            y = {r["hook"]: r for r in radar.hook_yield(self.conn)}
+        finally:
+            radar.HOOKS_PATH = old
+        self.assertEqual((y["after 60"]["ads"], y["over 60"]["ads"], y["over 60"]["domains"]), (3, 3, 2))
 
     def test_manual_import_folder(self):
         folder = self.tmp / "imports"

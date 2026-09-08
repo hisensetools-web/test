@@ -911,15 +911,24 @@ def _radar_summary(conn, out: dict) -> None:
     c = radar.summary_counts(conn)
     if out.get("imports") and out["imports"]["files"]:
         console.print(f"imports: {out['imports']['files']} file(s): {len(out['imports']['added'])} added, {len(out['imports']['existing'])} already listed, {len(out['imports']['bad'])} unreadable")
-    if out.get("sweep"):
-        console.print(f"hook sweep: {out['sweep']['queries']} phrases, {out['sweep']['ads']} ads, {len(out['sweep']['domains'])} landing domains")
-    if out.get("copycat"):
-        console.print(f"copycat: {out['copycat']['queries']} product queries, {out['copycat']['ads']} ads, {len(out['copycat']['domains'])} landing domains")
+    for key, label in (("sweep", "hook sweep"), ("copycat", "copycat")):
+        sw = out.get(key)
+        if sw:
+            console.print(f"{label}: {sw['queries']} queries, {sw['ads']} ads, {len(sw['domains'])} landing domains"
+                          + (f"; {sw['skipped']} skipped (searched in the last {config.RADAR_RESWEEP_DAYS} days)" if sw.get("skipped") else "")
+                          + (f"; [yellow]{sw['deferred']} deferred to the next sweep (budget)[/]" if sw.get("deferred") else ""))
     if out.get("web"):
         console.print(f"web search: {out['web']['queries']} queries, {out['web']['domains']} domains")
-    console.print(f"triage: {out['found']} new domain(s) checked -> promoted {out['promoted']}, parked {out['parked']} "
-                  f"(of which funnels / non-Shopify {out['funnels']}); re-triaged {out['retriaged']} candidate(s), promoted {out['promoted_later']}")
-    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']}, promoted {c['promoted']}, manual {c['watchlist']}, funnels {c['funnel']}")
+    console.print(f"new landing domains: {out['found']} found -> Shopify stores {out['shopify']} (promoted {out['promoted']}, parked "
+                  f"{out['parked'] - out['funnels']}), funnels parked {out['funnels']}, discarded {out['discarded']} "
+                  f"(non-Shopify with < {config.RADAR_FUNNEL_MIN_ADS} ads)"
+                  + (f"; [yellow]{out['deferred_triage']} not checked yet (budget)[/]" if out.get("deferred_triage") else ""))
+    console.print(f"re-checked {out['retriaged']} candidate(s) from stored facts, refreshed {out['refreshed']} catalogue(s); "
+                  f"Ad Library searches run {out['searched']}"
+                  + (f", [yellow]{out['deferred_search']} waiting for the next run[/]" if out.get("deferred_search") else "")
+                  + f"; promoted later {out['promoted_later']}")
+    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']} (Shopify {c['shopify']}, funnels {c['funnel']}, "
+                  f"{c['unsearched']} not yet searched), promoted {c['promoted']}, manual {c['watchlist']}, discarded {c['discarded']}")
 
 
 def cmd_radar(args) -> int:
@@ -944,11 +953,16 @@ def cmd_radar(args) -> int:
 
 def _radar_table(conn, limit: int = 40) -> int:
     rows = radar.candidates_rows(conn)
-    t = Table(title="Candidates (what the Candidates tab shows; set promote=Y in the sheet to force one)")
-    for c in ("domain", "type", "status", "age d", "created est", "first product", "products", "ads", "pages", "top page", "hot new product", "source", "lander"):
-        t.add_column(c, justify="right" if c in ("age d", "products", "ads", "pages") else "left")
+    h = radar.CANDIDATES_HEADERS
+    show = ["domain", "type", "status", "store_age_days", "store_first_created", "products", "active_ads", "ads_in_sweeps", "searched_at",
+            "pages", "top page", "hot new product", "source", "lander_domain"]
+    idx = [h.index(c) for c in show]
+    t = Table(title="Candidates (what the Candidates tab shows; set promote=Y in the sheet to force one; "
+                    "active_ads before searched_at is set = ads seen in sweeps only)")
+    for c in show:
+        t.add_column(c.replace("store_", "").replace("_", " "), justify="right" if c in ("store_age_days", "products", "active_ads", "ads_in_sweeps", "pages") else "left")
     for r in rows[:limit]:
-        t.add_row(r[0], r[1], r[2], str(r[4]), r[5], r[6], str(r[7]), str(r[8]), str(r[9]), (r[10] or "")[:22], r[12], (r[13] or "")[:28], r[14])
+        t.add_row(*[(str(r[i])[:28] if c not in ("top page", "source") else str(r[i])[:22]) for i, c in zip(idx, show)])
     console.print(t)
     return 0
 
@@ -971,25 +985,37 @@ def _hook_table(conn) -> None:
     if not rows or not any(r["sweeps"] for r in rows):
         return
     t = Table(title="hook phrases by yield (delete a phrase with 0 promotable stores over 2 sweeps; add siblings to the top ones)")
-    for c in ("hook", "sweeps", "ads", "domains", "promoted", "candidates", "funnels", "verdict"):
+    for c in ("hook", "sweeps", "ads", "domains", "promoted", "shopify cands", "funnels", "discarded", "verdict"):
         t.add_column(c, justify="left" if c in ("hook", "verdict") else "right")
     for r in rows:
-        t.add_row(r["hook"], str(r["sweeps"]), str(r["ads"]), str(r["domains"]), str(r["promoted"]), str(r["candidates"]), str(r["funnels"]), r["verdict"])
+        t.add_row(r["hook"], str(r["sweeps"]), str(r["ads"]), str(r["domains"]), str(r["promoted"]), str(r["candidates"]), str(r["funnels"]),
+                  str(r["discarded"]), r["verdict"])
     console.print(t)
+
+
+def _local(iso: str | None) -> str:
+    """UTC timestamp from the database -> local wall clock, minute precision."""
+    if not iso:
+        return ""
+    try:
+        return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M")
+    except ValueError:
+        return iso[:16]
 
 
 def cmd_radar_report(args) -> int:
     conn = db.connect(args.db)
     _hook_table(conn)
     c = radar.summary_counts(conn)
-    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']}, promoted {c['promoted']}, manual {c['watchlist']}, funnels {c['funnel']}")
+    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']} (Shopify {c['shopify']}, funnels {c['funnel']}, "
+                  f"{c['unsearched']} not yet searched), promoted {c['promoted']}, manual {c['watchlist']}, discarded {c['discarded']}")
     runs = conn.execute("SELECT kind, query, started_at, ads_found, domains_found, note FROM radar_runs ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
     if runs:
         t = Table(title="recent radar runs")
         for col in ("kind", "query", "started", "ads", "domains", "note"):
             t.add_column(col)
         for r in runs:
-            t.add_row(r["kind"], (r["query"] or "")[:40], (r["started_at"] or "")[:16], str(r["ads_found"] or ""), str(r["domains_found"] or ""), (r["note"] or "")[:40])
+            t.add_row(r["kind"], (r["query"] or "")[:40], _local(r["started_at"]), str(r["ads_found"] or ""), str(r["domains_found"] or ""), (r["note"] or "")[:40])
         console.print(t)
     return _radar_table(conn, args.limit)
 

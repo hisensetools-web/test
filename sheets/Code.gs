@@ -43,9 +43,9 @@ var TABS = {
     keyCols: null, textCols: [0, 1, 2, 3, 5, 8], position: 5
   },
   Candidates: {
-    headers: ["domain", "type", "status", "first_seen", "store_age_days", "store_created_est", "store_first_created", "products", "active_ads", "pages", "top page", "example ad text", "hot new product", "source", "lander_domain", "last_checked", "promote"],
+    headers: ["domain", "type", "status", "first_seen", "store_age_days", "store_created_est", "store_first_created", "products", "active_ads", "ads_in_sweeps", "searched_at", "pages", "top page", "example ad text", "hot new product", "source", "lander_domain", "last_checked", "promote"],
     keyCols: null,                 // rewritten each sync AFTER the tracker has read the promote column back
-    textCols: [0, 1, 2, 3, 5, 6, 10, 11, 12, 13, 14, 15, 16], position: 6
+    textCols: [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 17, 18], position: 6
   },
   Products: {
     headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price", "available variants", "total variants", "collection position"],
