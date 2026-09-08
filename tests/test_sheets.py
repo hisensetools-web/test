@@ -261,3 +261,49 @@ class CodeGsContractTests(unittest.TestCase):
             self.assertEqual(json.loads(m.group(1)), headers, f"{name} headers differ between Code.gs and sheets.py")
             for i in json.loads(m.group(2)):
                 self.assertLess(i, len(headers), f"{name} textCols index {i} outside its {len(headers)} columns")
+
+
+class ReadBackTests(unittest.TestCase):
+    """The promote read-back: compact columns, redirect loops, login redirects."""
+
+    def test_compact_rows_apply_promote_marks(self):
+        from earlyscale import db, radar
+        conn = db.connect(":memory:")
+        conn.execute("INSERT INTO radar_domains (domain, status, first_seen) VALUES ('a.com', 'candidate', '2026-09-01'), ('b.com', 'candidate', '2026-09-01')")
+        conn.commit()
+        session = mock.Mock()
+        seen = {}
+
+        def get(url, params=None, **kw):
+            seen.update(params or {})
+            return _resp(200, json.dumps({"ok": True, "tab": "Candidates", "cols": ["domain", "promote"], "rows": [["a.com", "Y"], ["b.com", ""]]}))
+        session.get.side_effect = get
+        self.assertEqual(sheets.read_promote_marks(conn, "https://x/exec", session=session), 1)
+        self.assertEqual(seen.get("cols"), "domain,promote")
+        self.assertEqual(conn.execute("SELECT promote_flag FROM radar_domains WHERE domain = 'a.com'").fetchone()[0], "Y")
+        # an old deployment ignores cols and returns full rows: still works
+        full = [["a.com"] + [""] * (len(radar.CANDIDATES_HEADERS) - 2) + ["Y"]]
+        self.assertEqual(radar.apply_promote_marks(conn, full), 1)
+
+    def test_redirect_loop_is_retried_then_reported(self):
+        from earlyscale import db
+        conn = db.connect(":memory:")
+        session = mock.Mock()
+        r = _resp(302, "")
+        r.headers["Location"] = "https://script.googleusercontent.com/macros/echo?x=1"
+        session.get.return_value = r
+        with mock.patch("earlyscale.sheets.time.sleep") as sleep:
+            with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
+                self.assertEqual(sheets.read_promote_marks(conn, "https://x/exec", session=session, retries=2), 0)
+        self.assertEqual(sleep.call_count, 1)
+        self.assertIn("kept redirecting", logs.output[0])
+        self.assertIn("script.googleusercontent.com", logs.output[0])
+
+    def test_login_redirect_is_explained(self):
+        session = mock.Mock()
+        r = _resp(302, "")
+        r.headers["Location"] = "https://accounts.google.com/ServiceLogin?continue=x"
+        session.get.return_value = r
+        with self.assertRaises(sheets.SheetsSyncError) as cm:
+            sheets.get_json(session, "https://x/exec", {"tabs": "1"})
+        self.assertIn("Who has access", str(cm.exception))

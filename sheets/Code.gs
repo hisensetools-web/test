@@ -66,7 +66,8 @@ var TABS = {
  *  ?tabs=1            -> JSON {tab: rows} for every tab the script knows (rows exclude the header)
  *  ?tab=Products      -> JSON {tab, rows, maxRows}
  *  ?tab=Products&group=1 -> also {byValue: {value in column 1 (0-based): count}}, e.g. rows per store
- *  ?tab=Candidates&rows=1 -> also {rows: [[...]]} (the tracker reads the promote column back before rewriting) */
+ *  ?tab=Candidates&rows=1 -> also {rows: [[...]]} (the tracker reads the promote column back before rewriting);
+ *  add &cols=domain,promote to get only those columns (by header name) */
 function doGet(e) {
   var p = (e && e.parameter) || {};
   if (p.tabs) {
@@ -87,7 +88,16 @@ function doGet(e) {
       var n = Math.min(last - 1, 2000);
       var w = Math.min(sheet.getLastColumn(), 40);
       var vals2 = sheet.getRange(2, 1, n, w).getValues();
-      res.rows = vals2.map(function (r) { return r.map(function (v) { return v instanceof Date ? Utilities.formatDate(v, "UTC", "yyyy-MM-dd") : v; }); });
+      var fmt = function (r) { return r.map(function (v) { return v instanceof Date ? Utilities.formatDate(v, "UTC", "yyyy-MM-dd") : v; }); };
+      if (p.cols) {
+        // ?cols=domain,promote -> only those columns (by header name), keeps the read-back small
+        var head = sheet.getRange(1, 1, 1, w).getValues()[0].map(String);
+        var idx = String(p.cols).split(",").map(function (c) { return head.indexOf(c); });
+        res.cols = String(p.cols).split(",");
+        res.rows = vals2.map(function (r) { return fmt(idx.map(function (i) { return i >= 0 ? r[i] : ""; })); });
+      } else {
+        res.rows = vals2.map(fmt);
+      }
     }
     if (p.group !== undefined && last > 1) {
       var col = parseInt(p.group, 10) + 1;

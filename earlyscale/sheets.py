@@ -12,7 +12,7 @@ import logging
 import random
 import sqlite3
 import time
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -132,15 +132,23 @@ def candidates_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[
     return radar.candidates_rows(conn)
 
 
-def read_promote_marks(conn: sqlite3.Connection, url: str, session: requests.Session | None = None) -> int:
-    """Before rewriting the Candidates tab, read it back and honour any Y in its promote column."""
+def read_promote_marks(conn: sqlite3.Connection, url: str, session: requests.Session | None = None, retries: int = 3) -> int:
+    """Before rewriting the Candidates tab, read its domain + promote columns back and honour any Y."""
     session = session or requests.Session()
-    try:
-        data = get_json(session, url, {"tab": TAB_NAMES["candidates"], "rows": "1"})
-    except SheetsSyncError as e:
-        log.warning("sheets: could not read Candidates back (%s); promote marks not applied this time", e)
-        return 0
-    return radar.apply_promote_marks(conn, data.get("rows") or [])
+    last: Exception | None = None
+    for attempt in range(retries):
+        try:
+            data = get_json(session, url, {"tab": TAB_NAMES["candidates"], "rows": "1", "cols": "domain,promote"})
+            n = radar.apply_promote_marks(conn, data.get("rows") or [])
+            if n:
+                log.info("sheets: %d promote mark(s) read back from the Candidates tab", n)
+            return n
+        except SheetsSyncError as e:
+            last = e
+            if attempt < retries - 1:
+                time.sleep(5 * (attempt + 1))
+    log.warning("sheets: could not read Candidates back after %d tries (%s); promote marks not applied this time", retries, last)
+    return 0
 
 
 def pages_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
@@ -302,10 +310,19 @@ def get_json(session: requests.Session, url: str, params: dict) -> dict:
     """GET the web app (follows the same 302 hop as POST) and parse its JSON."""
     r = session.get(url, params=params, timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
     hops = 0
-    while r.status_code in (301, 302, 303, 307, 308) and hops < 5:
-        r = session.get(urljoin(r.url, r.headers.get("Location", "")), timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
+    chain = []
+    while r.status_code in (301, 302, 303, 307, 308) and hops < 10:
+        nxt = urljoin(r.url, r.headers.get("Location", ""))
+        chain.append(urlparse(nxt).netloc)
+        if "accounts.google" in nxt:
+            raise SheetsSyncError("Apps Script redirected to a Google login page: the deployment's 'Who has access' must be "
+                                  "'Anyone' (Deploy > Manage deployments > Edit), and the URL must be the /exec URL")
+        r = session.get(nxt, timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
         hops += 1
     text = r.text.strip()
+    if r.status_code in (301, 302, 303, 307, 308):
+        raise SheetsSyncError(f"Apps Script kept redirecting ({hops} hops via {', '.join(dict.fromkeys(chain))}); usually a temporary "
+                              "Google hiccup, sometimes a response too large for a GET")
     if r.status_code != 200 or not text.startswith("{"):
         raise SheetsSyncError(_explain_non_json(text, r.status_code) if not text.startswith("{") else f"HTTP {r.status_code}")
     data = json.loads(text)

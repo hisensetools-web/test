@@ -773,7 +773,8 @@ def apply_promote_marks(conn: sqlite3.Connection, sheet_rows: list[list]) -> int
     """Read the Candidates tab back: a Y in the promote column marks the domain for promotion on the next triage."""
     n = 0
     for row in sheet_rows:
-        if not row or len(row) < len(CANDIDATES_HEADERS):
+        # full tab rows (domain first, promote last) or the compact [domain, promote] pairs from ?cols=domain,promote
+        if not row or len(row) not in (2, len(CANDIDATES_HEADERS)):
             continue
         dom, flag = str(row[0]).strip().lower(), str(row[-1]).strip().upper()
         if dom and flag == "Y":
