@@ -16,6 +16,32 @@ Then:
 2. Paste `sheets\Code.gs` into your Apps Script project and deploy a new version. Needed whenever a tab gains columns; the sync tells you if the deployed script is stale.
 3. Optional, for engagement on ads: in Chrome open `chrome://extensions`, turn on Developer mode, Load unpacked, choose `tools\fb_observer`.
 
+## 1b. A whole day by hand (when you would rather run it yourself)
+
+Same order as the scheduled tasks. Run them one at a time in one PowerShell window; each finishes before the next starts.
+
+```powershell
+git pull                                               # 0. latest code (only if I said "pushed")
+python tracker.py run --no-ads                         # 1. Shopify pass: catalogue snapshot of every store + stock probe + Sheets sync (~15 min)
+python tracker.py ads --max-minutes 480                # 2. Meta pass: Ad Library for the least recently scraped stores, stops after 8 h (~7 min/store)
+python tracker.py radar                                # 3. new-domain pass: triage of new landing domains + daily re-check (~30 min; Sundays it also sweeps, ~4 h)
+python tracker.py sync-sheets                          # 4. push everything to the Google Sheet and verify it
+python tracker.py radar-report                         # 5. optional: hook yield + Candidates in the terminal
+```
+
+Shorter versions of the same steps:
+
+```powershell
+python tracker.py run --only x.com y.com               # Shopify pass for a few stores
+python tracker.py ads --only x.com y.com               # Meta pass for a few stores (~7 min each)
+python tracker.py ads --max-minutes 120                # Meta pass, but stop after 2 h (the rest continue next time)
+python tracker.py inventory --only x.com               # stock probe only
+python tracker.py radar --sweep                        # force the weekly discovery sweep now (~4 h); a re-run continues where it stopped
+python tracker.py radar --no-sweep                     # triage only, even on a Sunday
+```
+
+Nothing is lost if you stop a command with Ctrl+C: every pass writes as it goes, and the next run continues from what is stored.
+
 ## 2. Runs by itself (nothing to do)
 
 | when | task | what you get |
