@@ -654,7 +654,9 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
 - Before paginating, the host is resolved once: `GET /products.json?limit=1` following
   redirects, and the final origin (e.g. `https://www.store.com`) is reused for every later
   request. If the apex host is unreachable (connection error / timeout, seen on
-  tryterrastrike.com) the `www.` variant is tried before giving up.
+  tryterrastrike.com), or answers with a 404 / HTML page because a marketing site sits on the apex
+  (pipitea.com), the `www.` and then the `shop.` variant are tried (`shop.pipitea.com`) before giving up.
+  Keep the apex domain in the watchlist: ads landing on any subdomain of it join to the store.
 - Every request has a connect/read timeout and up to 3 retries with exponential backoff
   on connection errors, timeouts, HTTP 429/430 (Shopify rate limit) and 5xx.
 - 401/403 (password-protected), 406 (WAF), 404 (not Shopify) and HTML responses fail fast, no retry.

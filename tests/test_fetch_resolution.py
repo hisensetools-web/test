@@ -42,6 +42,37 @@ class ResolveBaseUrlTests(unittest.TestCase):
             shopify.resolve_base_url(session, "http://127.0.0.1:8001")
         self.assertEqual(session.get.call_count, 1)
 
+    def test_marketing_site_on_apex_falls_through_to_shop_subdomain(self):
+        """pipitea.com is a marketing site (HTML 404 on /products.json); the storefront is shop.pipitea.com."""
+        html = _json_resp(404, b"<!DOCTYPE html><html><body>Not found</body></html>", ctype="text/html",
+                          url="https://pipitea.com/products.json?limit=1")
+        www_html = _json_resp(200, b"<html><body>marketing</body></html>", ctype="text/html",
+                              url="https://www.pipitea.com/products.json?limit=1")
+        session = mock.Mock()
+        session.get.side_effect = [html, www_html, _json_resp(url="https://shop.pipitea.com/products.json?limit=1")]
+        self.assertEqual(shopify.resolve_base_url(session, "pipitea.com"), "https://shop.pipitea.com")
+        called = [c.args[0] for c in session.get.call_args_list]
+        self.assertEqual(called, ["https://pipitea.com/products.json", "https://www.pipitea.com/products.json",
+                                  "https://shop.pipitea.com/products.json"])
+
+    def test_no_storefront_anywhere_returns_first_answering_host(self):
+        session = mock.Mock()
+        session.get.side_effect = [
+            _json_resp(404, b"<html>no</html>", ctype="text/html", url="https://example.com/products.json?limit=1"),
+            requests.ConnectionError("no www"),
+            requests.ConnectionError("no shop"),
+        ]
+        # the caller then fetches https://example.com/products.json and reports the real error (404 / HTML)
+        self.assertEqual(shopify.resolve_base_url(session, "example.com"), "https://example.com")
+        self.assertEqual(session.get.call_count, 3)
+
+    def test_shop_variant_only_for_bare_domains(self):
+        self.assertEqual(shopify._shop_variant("https://pipitea.com"), "https://shop.pipitea.com")
+        self.assertIsNone(shopify._shop_variant("https://shop.pipitea.com"))
+        self.assertIsNone(shopify._shop_variant("https://www.pipitea.com"))
+        self.assertEqual(shopify._shop_variant("https://brand.co.uk"), "https://shop.brand.co.uk")
+        self.assertIsNone(shopify._shop_variant("http://127.0.0.1:8001"))
+
     def test_keeps_apex_when_it_answers(self):
         session = mock.Mock()
         session.get.return_value = _resp("https://example.com/products.json?limit=1")

@@ -46,11 +46,31 @@ def _origin(url: str) -> str:
 
 def _www_variant(base: str) -> str | None:
     """https://example.com -> https://www.example.com (None if it already has www or is an IP/port)."""
+    return _prefixed(base, "www.")
+
+
+def _shop_variant(base: str) -> str | None:
+    """https://example.com -> https://shop.example.com: marketing sites (Webflow, Wix) often keep the
+    Shopify storefront on a shop. subdomain. None for hosts that already carry a subdomain, or IP/port."""
+    return _prefixed(base, "shop.")
+
+
+def _prefixed(base: str, prefix: str) -> str | None:
     u = urlparse(base)
     host = u.netloc
-    if host.startswith("www.") or ":" in host or host.replace(".", "").isdigit() or host.count(".") < 1:
+    if host.startswith(("www.", "shop.")) or ":" in host or host.replace(".", "").isdigit() or host.count(".") < 1:
         return None
-    return f"{u.scheme}://www.{host}"
+    return f"{u.scheme}://{prefix}{host}"
+
+
+def _clearly_not_storefront(r: requests.Response) -> bool:
+    """A probe answered, but not with a products.json document (404, or an HTML page)."""
+    if r.status_code >= 400:
+        return True
+    try:
+        return _looks_like_html(r.text or "")
+    except Exception:
+        return False
 
 
 def resolve_base_url(session: requests.Session, store_domain: str) -> str:
@@ -59,13 +79,17 @@ def resolve_base_url(session: requests.Session, store_domain: str) -> str:
     Many stores redirect apex -> www (or the reverse), and some apex hosts don't
     answer at all (seen on tryterrastrike.com). We probe once, follow redirects,
     and reuse the final origin for every later request so pagination never
-    bounces through a redirect. If the apex host is unreachable we try www."""
+    bounces through a redirect. If the apex host is unreachable, or answers with
+    a 404 / HTML page (a marketing site in front of the shop), we try www. and
+    then shop. (pipitea.com -> shop.pipitea.com). If no candidate serves JSON the
+    first one that answered is returned so the caller reports the real error."""
     base = base_url(store_domain)
     candidates = [base]
-    alt = _www_variant(base)
-    if alt:
-        candidates.append(alt)
+    for alt in (_www_variant(base), _shop_variant(base)):
+        if alt:
+            candidates.append(alt)
     last_err: Exception | None = None
+    first_answer: str | None = None
     for cand in candidates:
         try:
             r = session.get(f"{cand}/products.json", params={"limit": 1}, timeout=config.REQUEST_TIMEOUT,
@@ -73,12 +97,18 @@ def resolve_base_url(session: requests.Session, store_domain: str) -> str:
         except (requests.ConnectionError, requests.Timeout) as e:
             last_err = e
             log.warning("%s unreachable (%s)%s", cand, type(e).__name__,
-                        "; trying www." if cand is not candidates[-1] else "")
+                        "; trying the next host" if cand is not candidates[-1] else "")
             continue
         final = _origin(r.url)
         if r.history:
             log.info("%s redirected to %s; using that host", cand, final)
-        return final
+        if not _clearly_not_storefront(r):
+            return final
+        first_answer = first_answer or final
+        if cand is not candidates[-1]:
+            log.info("%s/products.json is not a storefront (HTTP %s); trying the next host", final, r.status_code)
+    if first_answer:
+        return first_answer
     raise StoreFetchError(f"unreachable: {last_err}")
 
 

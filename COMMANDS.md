@@ -90,6 +90,7 @@ python tracker.py radar                                # triage new / parked dom
 
 ```powershell
 python tracker.py add-store x.com                      # add a store (finds its Facebook page)
+python tracker.py add-store pipitea.com                # use the apex domain even when the shop is on shop.pipitea.com (found automatically)
 python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
 ```
 
