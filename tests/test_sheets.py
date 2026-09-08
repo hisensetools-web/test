@@ -307,3 +307,35 @@ class ReadBackTests(unittest.TestCase):
         with self.assertRaises(sheets.SheetsSyncError) as cm:
             sheets.get_json(session, "https://x/exec", {"tabs": "1"})
         self.assertIn("Who has access", str(cm.exception))
+
+
+class EchoHiccupTests(unittest.TestCase):
+    """script.googleusercontent.com occasionally answers the one-time redirect with Google's generic 404 page."""
+    PAGE = "<!DOCTYPE html><html lang=\"th\"><head><script>window['ppConfig'] = {productName: 'x'}</script></head></html>"
+
+    def test_post_retries_a_404_error_page_from_the_echo_host(self):
+        session = mock.Mock()
+        session.post.return_value = _resp(302, "", location="https://script.googleusercontent.com/macros/echo?user_content_key=k")
+        session.get.side_effect = [_resp(404, self.PAGE, url="https://script.googleusercontent.com/macros/echo?user_content_key=k", ctype="text/html"),
+                                   _resp(200, json.dumps({"ok": True, "written": 1, "skipped": 0}), url="https://script.googleusercontent.com/macros/echo?user_content_key=k")]
+        with mock.patch("earlyscale.sheets.time.sleep") as sleep:
+            data = sheets.post_payload(session, "https://script.google.com/macros/s/x/exec", {"tab": "Signals", "rows": []})
+        self.assertEqual(data["written"], 1)
+        self.assertEqual(session.post.call_count, 2)
+        self.assertTrue(sleep.called)
+
+    def test_a_404_on_the_exec_url_itself_is_not_retried(self):
+        session = mock.Mock()
+        session.post.return_value = _resp(404, "nope", ctype="text/html")
+        with self.assertRaises(sheets.SheetsSyncError):
+            sheets.post_payload(session, "https://script.google.com/macros/s/x/exec", {"tab": "Signals", "rows": []})
+        self.assertEqual(session.post.call_count, 1)
+
+    def test_get_retries_the_echo_error_page(self):
+        session = mock.Mock()
+        session.get.side_effect = [_resp(302, "", location="https://script.googleusercontent.com/macros/echo?user_content_key=k"),
+                                   _resp(404, self.PAGE, url="https://script.googleusercontent.com/macros/echo?user_content_key=k", ctype="text/html"),
+                                   _resp(302, "", location="https://script.googleusercontent.com/macros/echo?user_content_key=k2"),
+                                   _resp(200, json.dumps({"ok": True, "tabs": {"Signals": 1}}), url="https://script.googleusercontent.com/macros/echo?user_content_key=k2")]
+        with mock.patch("earlyscale.sheets.time.sleep"):
+            self.assertEqual(sheets.get_json(session, "https://script.google.com/macros/s/x/exec", {"tabs": "1"})["tabs"]["Signals"], 1)

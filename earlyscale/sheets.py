@@ -272,6 +272,15 @@ def _explain_non_json(text: str, status: int) -> str:
     return f"{hint} (HTTP {status}; starts with: {head!r})"
 
 
+def _echo_hiccup(r, hops: int) -> bool:
+    """Google's script.googleusercontent.com response host sometimes answers the one-time redirect with its own
+    generic 404 error page (the body carries 'ppConfig'). That is not the script's answer and goes away on retry."""
+    if hops == 0 or "googleusercontent" not in urlparse(r.url).netloc:
+        return False
+    head = (r.text or "")[:2000]
+    return r.status_code == 404 or ("ppConfig" in head and not head.lstrip().startswith("{"))
+
+
 def post_payload(session: requests.Session, url: str, payload: dict, retries: int = 3) -> dict:
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     last_err: Exception | None = None
@@ -288,6 +297,8 @@ def post_payload(session: requests.Session, url: str, payload: dict, retries: in
                 hops += 1
             if r.status_code >= 500:
                 raise _Retryable(f"HTTP {r.status_code} from Apps Script")
+            if _echo_hiccup(r, hops):
+                raise _Retryable(f"HTTP {r.status_code} error page from Google's response host (transient)")
             if r.status_code != 200:
                 raise SheetsSyncError(f"HTTP {r.status_code} from {r.url}: {r.text.strip()[:200]!r}")
             text = r.text.strip()
@@ -306,7 +317,7 @@ def post_payload(session: requests.Session, url: str, payload: dict, retries: in
     raise SheetsSyncError(f"giving up after {retries + 1} attempts: {last_err}")
 
 
-def get_json(session: requests.Session, url: str, params: dict) -> dict:
+def get_json(session: requests.Session, url: str, params: dict, _retry: int = 0) -> dict:
     """GET the web app (follows the same 302 hop as POST) and parse its JSON."""
     r = session.get(url, params=params, timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
     hops = 0
@@ -319,6 +330,9 @@ def get_json(session: requests.Session, url: str, params: dict) -> dict:
                                   "'Anyone' (Deploy > Manage deployments > Edit), and the URL must be the /exec URL")
         r = session.get(nxt, timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
         hops += 1
+    if _echo_hiccup(r, hops) and _retry < 3:
+        time.sleep(5 * (_retry + 1))
+        return get_json(session, url, params, _retry=_retry + 1)
     text = r.text.strip()
     if r.status_code in (301, 302, 303, 307, 308):
         raise SheetsSyncError(f"Apps Script kept redirecting ({hops} hops via {', '.join(dict.fromkeys(chain))}); usually a temporary "
