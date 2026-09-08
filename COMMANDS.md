@@ -46,7 +46,7 @@ Nothing is lost if you stop a command with Ctrl+C: every pass writes as it goes,
 
 | when | task | what you get |
 |---|---|---|
-| 09:00 daily | Shopify snapshot, stock probe, Sheets sync | Signals, Families, Categories, Stores, Products tabs refreshed; ~15 min |
+| 09:00 daily | Shopify snapshot, stock probe, Sheets sync | Signals, Early, Families, Categories, Stores, Products tabs refreshed; ~15 min |
 | 22:00 daily | Meta Ad Library, least recently scraped stores first, up to 8 h, then Radar (triage; sweeps on Sundays, up to 4 h), then Sheets sync | ad columns on Signals, concepts, lineage, delivery, page likes, Pages tab, Candidates tab, new stores on the watchlist |
 
 The machine must be on and logged in at those times (the tracker keeps Windows awake while a pass runs; a closed lid still sleeps it). Logs: `logs\run_YYYY-MM-DD.log` and `logs\meta_YYYY-MM-DD.log`.
@@ -61,7 +61,12 @@ python tracker.py sync-sheets                # rewrite every tab from the databa
 python tracker.py sync-sheets --verify-only  # check only, send nothing
 ```
 
-Every sync ends with a "sheet vs database" table; every row should say `yes`.
+Every sync ends with a "sheet vs database" table; every row should say `yes`. A sync refuses to write when the
+deployed `Code.gs` has different columns than the code (it would put values under the wrong headers): paste
+`sheets\Code.gs` again and deploy a new version, then re-run.
+
+The **Early** tab is Signals reduced to products created in the last 90 days that have at least one ad,
+youngest first: the rows a reader that only takes the top of a tab must not lose.
 
 ## 3. Looking at the data
 
@@ -118,7 +123,14 @@ python tracker.py radar                                # triage new / parked dom
 python tracker.py add-store x.com                      # add a store (finds its Facebook page)
 python tracker.py add-store pipitea.com                # use the apex domain even when the shop is on shop.pipitea.com (found automatically)
 python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
+python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad (dead / non-Shopify)
+python tracker.py prune-dead --apply                   # ...and remove them from the watchlist
+python tracker.py find-page tryhappyharvest.com        # find the store's Facebook page (footer, then Ad Library search); shows candidates
+python tracker.py find-page tryhappyharvest.com --set 1   # save candidate 1;  --query "Happy Harvest" to search another name
+python tracker.py set-page getdovi.com --name "Dovi" --page-id 1234567890   # set it by hand
 ```
+
+A store without a Meta page name is searched by its domain, which finds nothing for most brands: set the page for every store that shows `ads_active` empty on the Stores tab after a night pass.
 
 The 17 domains that fail with 404 every run are not Shopify storefronts; removing them saves time.
 

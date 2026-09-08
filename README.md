@@ -118,6 +118,17 @@ From then on `python tracker.py run` syncs automatically at the end whenever
 `SHEETS_WEBHOOK_URL` is set (use `--no-sync` to skip). `run_daily.bat` needs no change: the
 tracker reads `.env` itself. Exit code 3 means the run succeeded but the sync failed.
 
+### Early tab and the header contract
+
+**Early** is Signals filtered to products created in the last 90 days (`EARLY_MAX_AGE_DAYS`) with at least
+one ad or launch this week, youngest by `created_at` first, with the columns that matter for an early call.
+Signals itself is never capped; Early exists so a reader that only takes the first rows of a tab still
+sees the early products instead of the biggest launchers.
+
+Every sync first asks the deployed `Code.gs` (`?tabs=1`) which headers it writes and refuses to send rows
+when they differ from this code's columns, naming the tabs, so a stale deployment can no longer put prices
+under `days_since_created`. An old deployment that does not report headers only gets a warning.
+
 ### Checking the sheet holds everything
 
 Every sync ends by reading row counts back from the sheet and comparing them with the database,

@@ -46,10 +46,16 @@ FAMILIES_HEADERS = ["store", "family", "title", "handles", "newest published_at"
 CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "families published 7d",
                       "store list", "example families"]
 
-TAB_ORDER = ("signals", "families", "categories", "stores", "pages", "candidates", "products", "alerts")
-TAB_NAMES = {"signals": "Signals", "families": "Families", "categories": "Categories",
+EARLY_HEADERS = ["store", "handle", "product family", "days_since_created", "created_at", "relaunch", "days_since_published",
+                 "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d",
+                 "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level",
+                 "units_per_day_7d", "ads_as_of", "store_badge"]
+EARLY_MAX_AGE_DAYS = 90
+
+TAB_ORDER = ("signals", "early", "families", "categories", "stores", "pages", "candidates", "products", "alerts")
+TAB_NAMES = {"signals": "Signals", "early": "Early", "families": "Families", "categories": "Categories",
              "stores": "Stores", "pages": "Pages", "candidates": "Candidates", "products": "Products", "alerts": "Alerts"}
-TAB_MODES = {"signals": "replace", "families": "replace", "categories": "replace",
+TAB_MODES = {"signals": "replace", "early": "replace", "families": "replace", "categories": "replace",
              "stores": "replace", "pages": "replace", "candidates": "replace", "products": "replace", "alerts": "append"}
 
 
@@ -228,6 +234,26 @@ def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[lis
     return rows
 
 
+def early_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
+    """The tab a truncating reader can rely on: every product created in the last EARLY_MAX_AGE_DAYS that has at
+    least one ad, youngest (by created_at) first, then most launches this week. A subset of Signals' columns."""
+    H = SIGNALS_HEADERS
+    idx = {h: H.index(h) for h in EARLY_HEADERS}
+    out = []
+    for r in signals_rows(conn, as_of):
+        created = r[idx["days_since_created"]]
+        ads = r[idx["ads_pointing_here"]]
+        launched = r[idx["ads_launched_7d"]]
+        if created == "" or created > EARLY_MAX_AGE_DAYS:
+            continue
+        if not ((isinstance(ads, int) and ads > 0) or (isinstance(launched, int) and launched > 0)):
+            continue
+        out.append([r[idx[h]] for h in EARLY_HEADERS])
+    ic, il = EARLY_HEADERS.index("days_since_created"), EARLY_HEADERS.index("ads_launched_7d")
+    out.sort(key=lambda r: (r[ic], -(r[il] if isinstance(r[il], int) else -1), r[0], r[1]))
+    return out
+
+
 def families_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     rows = [r for ctx in _contexts(conn, as_of) for r in signals.families_rows_for_store(ctx)]
     rows.sort(key=lambda r: (-r[6], -r[7], r[4] or "", r[0], r[1]))   # most 7d launches first
@@ -396,7 +422,7 @@ def verify(conn: sqlite3.Connection, url: str, as_of: str | None = None,
 # ---------------------------------------------------------------- orchestration
 
 def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = None) -> list[dict]:
-    builders = {"signals": signals_rows, "families": families_rows, "categories": categories_rows,
+    builders = {"signals": signals_rows, "early": early_rows, "families": families_rows, "categories": categories_rows,
                 "stores": stores_rows, "pages": pages_rows, "candidates": candidates_rows, "products": products_rows, "alerts": alerts_rows}
     plan = []
     _ctx_cache.clear()
@@ -414,12 +440,48 @@ def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = Non
     return plan
 
 
+def expected_headers() -> dict[str, list[str]]:
+    return {"Signals": SIGNALS_HEADERS, "Early": EARLY_HEADERS, "Families": FAMILIES_HEADERS, "Categories": CATEGORIES_HEADERS,
+            "Stores": STORES_HEADERS, "Pages": PAGES_HEADERS, "Candidates": radar.CANDIDATES_HEADERS,
+            "Products": PRODUCTS_HEADERS, "Alerts": ALERTS_HEADERS}
+
+
+def check_deployed_headers(session: requests.Session, url: str, tabs=TAB_ORDER) -> list[str]:
+    """Compare the headers the deployed Code.gs writes with the columns this code sends. Returns the names of
+    tabs that differ (a stale deployment would put every value under the wrong column). An old deployment
+    that does not report headers yields ['?'] so the caller can warn instead of writing blind."""
+    try:
+        data = get_json(session, url, {"tabs": "1"})
+    except SheetsSyncError as e:
+        raise SheetsSyncError(f"cannot read the deployed Code.gs ({e})") from e
+    deployed = data.get("headers")
+    if not isinstance(deployed, dict):
+        return ["?"]
+    want = expected_headers()
+    bad = []
+    for t in tabs:
+        name = TAB_NAMES[t]
+        if deployed.get(name) != want[name]:
+            bad.append(name)
+    return bad
+
+
 def sync(conn: sqlite3.Connection, url: str, tabs=TAB_ORDER, as_of: str | None = None,
-         session: requests.Session | None = None, dry_run: bool = False) -> list[dict]:
-    """POST every tab. Returns one summary dict per tab: tab, rows, chunks, written, skipped."""
+         session: requests.Session | None = None, dry_run: bool = False, check_headers: bool = True) -> list[dict]:
+    """POST every tab. Returns one summary dict per tab: tab, rows, chunks, written, skipped.
+    Refuses to write when the deployed Code.gs carries different headers than this code (column shift)."""
     if not url and not dry_run:
         raise SheetsSyncError("SHEETS_WEBHOOK_URL is not set (put it in .env)")
     session = session or requests.Session()
+    if url and not dry_run and check_headers:
+        bad = check_deployed_headers(session, url, tabs)
+        if bad == ["?"]:
+            log.warning("sheets: the deployed Code.gs does not report its headers (old version); cannot check for a column shift. "
+                        "Re-paste sheets/Code.gs and deploy a new version.")
+        elif bad:
+            raise SheetsSyncError(f"the deployed Code.gs writes different columns than this code for: {', '.join(bad)}. "
+                                  "Every value would land under the wrong header. Paste sheets/Code.gs into the Apps Script editor "
+                                  "and Deploy > Manage deployments > Edit > New version, then sync again.")
     if "candidates" in tabs and url and not dry_run:
         read_promote_marks(conn, url, session)
     summaries = []

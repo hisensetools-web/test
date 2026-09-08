@@ -7,7 +7,7 @@
  * Put the resulting /exec URL in .env as SHEETS_WEBHOOK_URL.
  *
  * Protocol (one POST per chunk, JSON body):
- *   { "tab": "Signals" | "Families" | "Categories" | "Stores" | "Pages" | "Candidates" | "Products" | "Alerts",
+ *   { "tab": "Signals" | "Early" | "Families" | "Categories" | "Stores" | "Pages" | "Candidates" | "Products" | "Alerts",
  *     "mode": "replace" | "append",
  *     "chunk": 1, "chunks": 3,          // 1-based; replace clears the tab on chunk 1
  *     "rows": [[...], [...]] }           // values in header order
@@ -24,28 +24,32 @@ var TABS = {
     headers: ["store", "product family", "handle", "channel tag", "days_since_published", "published_at", "days_since_created", "created_at", "relaunch", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"],
     keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 8, 10, 17, 18, 25, 28, 29, 34], position: 1
   },
+  Early: {
+    headers: ["store", "handle", "product family", "days_since_created", "created_at", "relaunch", "days_since_published", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d", "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level", "units_per_day_7d", "ads_as_of", "store_badge"],
+    keyCols: null, textCols: [0, 1, 2, 4, 5, 10, 15, 17, 21, 22], position: 2
+  },
   Families: {
     headers: ["store", "family", "title", "handles", "newest published_at", "oldest published_at", "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"],
-    keyCols: null, textCols: [0, 1, 2, 3, 4, 5, 10], position: 2
+    keyCols: null, textCols: [0, 1, 2, 3, 4, 5, 10], position: 3
   },
   Categories: {
     headers: ["category", "stores", "families", "newest published_at", "families published 7d", "store list", "example families"],
-    keyCols: null, textCols: [0, 3, 5, 6], position: 3
+    keyCols: null, textCols: [0, 3, 5, 6], position: 4
   },
   Stores: {
     headers: ["store", "meta page", "last status", "products", "sold-out variants", "new products 7d", "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date", "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow", "pages_per_domain", "pages_new_7d", "page_likes_slope_max", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
     keyCols: null,                 // fully overwritten each sync
     textCols: [0, 1, 2, 10, 11, 15, 21],   // keep dates / domains as text, not auto-parsed
-    position: 4
+    position: 5
   },
   Pages: {
     headers: ["store", "page name", "page_id", "first_seen", "active_ads", "last_delivered", "page_likes", "page_likes_7d_slope", "ads_as_of"],
-    keyCols: null, textCols: [0, 1, 2, 3, 5, 8], position: 5
+    keyCols: null, textCols: [0, 1, 2, 3, 5, 8], position: 6
   },
   Candidates: {
     headers: ["domain", "type", "status", "first_seen", "store_age_days", "store_created_est", "store_first_created", "products", "active_ads", "ads_in_sweeps", "searched_at", "pages", "top page", "example ad text", "hot new product", "source", "lander_domain", "last_checked", "promote"],
     keyCols: null,                 // rewritten each sync AFTER the tracker has read the promote column back
-    textCols: [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 17, 18], position: 6
+    textCols: [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 17, 18], position: 7
   },
   Products: {
     headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price", "available variants", "total variants", "collection position"],
@@ -58,7 +62,7 @@ var TABS = {
     headers: ["date", "store", "handle", "rule", "detail", "created_at"],
     keyCols: [0, 1, 2, 3, 4],      // date + store + handle + rule + detail (several alerts can share a rule)
     textCols: [0, 1, 2, 3, 4, 5],
-    position: 7
+    position: 9
   }
 };
 
@@ -72,12 +76,13 @@ function doGet(e) {
   var p = (e && e.parameter) || {};
   if (p.tabs) {
     var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var out = {};
+    var out = {}, heads = {};
     for (var name in TABS) {
       var sh = ss.getSheetByName(name);
       out[name] = sh ? Math.max(0, sh.getLastRow() - 1) : null;
+      heads[name] = TABS[name].headers;          // what this deployment writes; the tracker refuses to sync onto a stale set
     }
-    return json_({ ok: true, tabs: out });
+    return json_({ ok: true, tabs: out, headers: heads });
   }
   if (p.tab) {
     var sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(p.tab);

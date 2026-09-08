@@ -70,3 +70,23 @@ def remove_from_watchlist(domains: list[str], path: Path | None = None) -> tuple
             w.writeheader()
             w.writerows(keep)
     return removed, missing
+
+
+def update_watchlist_entry(domain: str, path: Path | None = None, **fields) -> bool:
+    """Set meta_page_name / meta_page_id / notes on one watchlist row. Returns False if the domain is not listed."""
+    path = path or config.WATCHLIST_PATH
+    target = normalise_domain(domain)
+    rows = read_watchlist(path)
+    hit = False
+    for r in rows:
+        if r["store_domain"] == target:
+            for k, v in fields.items():
+                if k in COLUMNS and v is not None:
+                    r[k] = v
+            hit = True
+    if hit:
+        with path.open("w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=COLUMNS)
+            w.writeheader()
+            w.writerows(rows)
+    return hit

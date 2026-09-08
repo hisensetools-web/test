@@ -152,17 +152,55 @@ class PostTests(unittest.TestCase):
         sleep.assert_not_called()
 
 
+def _tabs_session(headers=None, tabs=None):
+    """A fake web app: ?tabs=1 answers with counts (+ the deployed headers), POSTs say written."""
+    session = mock.Mock()
+    session.post.return_value = _resp(200, '{"ok":true,"written":1,"skipped":0}')
+
+    def get(url, params=None, **kw):
+        if params and params.get("tabs"):
+            body = {"ok": True, "tabs": tabs or {}}
+            if headers is not None:
+                body["headers"] = headers
+            return _resp(200, json.dumps(body))
+        if params and params.get("tab"):
+            return _resp(200, json.dumps({"ok": True, "tab": params["tab"], "rows": []}))
+        return _resp(404, "nope")
+    session.get.side_effect = get
+    return session
+
+
 class SyncTests(unittest.TestCase):
+    TABS = ["Signals", "Early", "Families", "Categories", "Stores", "Pages", "Candidates", "Products", "Alerts"]
+
     def test_sync_posts_every_tab_with_replace_then_append(self):
         conn = two_day_db()
-        session = mock.Mock()
-        session.post.return_value = _resp(200, '{"ok":true,"written":1,"skipped":0}')
+        session = _tabs_session(headers=sheets.expected_headers())
         out = sheets.sync(conn, "https://x/exec", session=session)
         payloads = [json.loads(c.kwargs["data"]) for c in session.post.call_args_list]
-        self.assertEqual([p["tab"] for p in payloads], ["Signals", "Families", "Categories", "Stores", "Pages", "Candidates", "Products", "Alerts"])
-        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 7 + ["append"])
-        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 8)
-        self.assertEqual([x["tab"] for x in out], ["Signals", "Families", "Categories", "Stores", "Pages", "Candidates", "Products", "Alerts"])
+        self.assertEqual([p["tab"] for p in payloads], self.TABS)
+        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 8 + ["append"])
+        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 9)
+        self.assertEqual([x["tab"] for x in out], self.TABS)
+
+    def test_stale_code_gs_refuses_to_write(self):
+        """A deployment with different columns would put every value under the wrong header: refuse, say what to do."""
+        conn = two_day_db()
+        stale = dict(sheets.expected_headers(), Signals=sheets.SIGNALS_HEADERS[:32])
+        session = _tabs_session(headers=stale)
+        with self.assertRaises(sheets.SheetsSyncError) as cm:
+            sheets.sync(conn, "https://x/exec", session=session)
+        self.assertIn("Signals", str(cm.exception))
+        self.assertIn("Deploy", str(cm.exception))
+        session.post.assert_not_called()
+
+    def test_old_deployment_without_headers_only_warns(self):
+        conn = two_day_db()
+        session = _tabs_session(headers=None)
+        with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
+            sheets.sync(conn, "https://x/exec", session=session)
+        self.assertTrue(any("does not report its headers" in x for x in logs.output))
+        self.assertEqual(session.post.call_count, 9)
 
     def test_dry_run_sends_nothing_and_missing_url_is_clear(self):
         conn = two_day_db()
@@ -251,9 +289,7 @@ class CodeGsContractTests(unittest.TestCase):
         import re
         from earlyscale import radar
         src = (Path(__file__).resolve().parent.parent / "sheets" / "Code.gs").read_text(encoding="utf-8")
-        expected = {"Signals": sheets.SIGNALS_HEADERS, "Families": sheets.FAMILIES_HEADERS, "Categories": sheets.CATEGORIES_HEADERS,
-                    "Stores": sheets.STORES_HEADERS, "Pages": sheets.PAGES_HEADERS, "Candidates": radar.CANDIDATES_HEADERS,
-                    "Products": sheets.PRODUCTS_HEADERS, "Alerts": sheets.ALERTS_HEADERS}
+        expected = sheets.expected_headers()
         for name, headers in expected.items():
             key = f'"{name}"' if " " in name else name
             m = re.search(r'  %s: \{\n    headers: (\[.*?\]),.*?textCols: (\[[^\]]*\])' % re.escape(key), src, re.S)

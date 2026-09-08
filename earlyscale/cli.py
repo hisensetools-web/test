@@ -14,7 +14,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, radar, scaling, sheets, shopify, store_age
-from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist
+from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist, update_watchlist_entry
 
 console = Console()
 log = logging.getLogger("earlyscale")
@@ -229,6 +229,141 @@ def cmd_remove_store(args) -> int:
         console.print(f"[yellow]not in watchlist[/] {d}")
     console.print(f"{len(removed)} removed, {len(missing)} not found. Snapshot history in the DB is kept.")
     return 0 if removed or not missing else 1
+
+
+def dead_stores(conn, stores: list[dict]) -> list[dict]:
+    """Watchlist stores that never returned a Shopify catalogue (no successful run) and never had an ad recorded:
+    non-Shopify domains, typos, dead sites. Each entry: store_domain, runs, last_error."""
+    out = []
+    for s in stores:
+        row = conn.execute("SELECT id FROM stores WHERE store_domain = ?", (s["store_domain"],)).fetchone()
+        if row is None:
+            continue
+        sid = row["id"]
+        ok = conn.execute("SELECT COUNT(*) FROM store_runs WHERE store_id = ? AND status = 'ok'", (sid,)).fetchone()[0]
+        products = conn.execute("SELECT COUNT(*) FROM products_daily WHERE store_id = ?", (sid,)).fetchone()[0]
+        ads = conn.execute("SELECT COUNT(*) FROM meta_ads WHERE store_id = ?", (sid,)).fetchone()[0]
+        if ok or products or ads:
+            continue
+        runs = conn.execute("SELECT COUNT(*) FROM store_runs WHERE store_id = ?", (sid,)).fetchone()[0]
+        last = conn.execute("SELECT error FROM store_runs WHERE store_id = ? ORDER BY run_id DESC LIMIT 1", (sid,)).fetchone()
+        out.append({"store_domain": s["store_domain"], "runs": runs, "last_error": (last["error"] if last else "") or ""})
+    return out
+
+
+def cmd_prune_dead(args) -> int:
+    conn = db.connect(args.db)
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    dead = dead_stores(conn, stores)
+    if not dead:
+        console.print("no dead stores: every watchlist domain has returned a catalogue or an ad at least once")
+        return 0
+    t = Table(title=f"{len(dead)} watchlist domain(s) that never returned Shopify or Meta data")
+    for c in ("store", "runs tried", "last error"):
+        t.add_column(c, justify="right" if c == "runs tried" else "left")
+    for d in dead:
+        t.add_row(d["store_domain"], str(d["runs"]), d["last_error"][:90])
+    console.print(t)
+    if args.apply:
+        removed, _ = remove_from_watchlist([d["store_domain"] for d in dead], Path(args.watchlist) if args.watchlist else None)
+        console.print(f"[green]removed {len(removed)} store(s) from the watchlist[/] (their rows in the database are kept)")
+    else:
+        console.print("dry run: add --apply to remove them from the watchlist (or remove-store <domain> for a subset)")
+    return 0
+
+
+def brand_query(domain: str) -> str:
+    """'tryhappyharvest.com' -> 'happyharvest': the label without shop/try/get prefixes, for an Ad Library search."""
+    label = re.sub(r"^https?://", "", domain).split("/")[0].lower()
+    label = re.sub(r"^(www|shop|store)\.", "", label).split(".")[0]
+    for pre in ("try", "get", "shop", "buy", "the", "my"):
+        if label.startswith(pre) and len(label) > len(pre) + 3:
+            label = label[len(pre):]
+            break
+    return label.replace("-", " ").strip()
+
+
+def page_candidates(ads: list[dict], store_domain: str) -> list[dict]:
+    """Group Ad Library results by page: ads, how many land on the store, example landing domain. Store-landing pages first."""
+    from collections import Counter
+    by: dict[str, dict] = {}
+    for a in ads:
+        key = str(a.get("page_id") or a.get("page_name") or "")
+        if not key:
+            continue
+        p = by.setdefault(key, {"page_id": a.get("page_id") or "", "page_name": a.get("page_name") or "", "ads": 0, "on_store": 0, "domains": Counter()})
+        p["ads"] += 1
+        dom = radar.normalise_landing_domain(a.get("landing_url") or a.get("landing_domain")) or ""
+        if dom:
+            p["domains"][dom] += 1
+        if ad_metrics.same_store(dom, re.sub(r"^https?://", "", store_domain)):
+            p["on_store"] += 1
+    out = list(by.values())
+    for p in out:
+        p["top_domain"] = p["domains"].most_common(1)[0][0] if p["domains"] else ""
+    out.sort(key=lambda p: (-p["on_store"], -p["ads"]))
+    return out
+
+
+def cmd_find_page(args) -> int:
+    """Find the Facebook page behind a store: footer link first, then an Ad Library search for the brand name."""
+    from playwright.sync_api import sync_playwright
+    domain = args.domain
+    console.print(f"looking for a Facebook page link on {domain} ...")
+    footer = shopify.discover_meta_page(domain)
+    console.print(f"  footer link: [bold]{footer or '(none)'}[/]")
+    query = args.query or brand_query(domain)
+    console.print(f"searching the Ad Library for [bold]{query}[/] (active ads, all countries) ...")
+    with sync_playwright() as pw:
+        handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
+        try:
+            url = meta_ads.build_search_url(query=query, country="ALL", search_type="keyword_unordered")
+            res = meta_ads.scrape_page(url, max_ads=args.max_ads, browser=handle.get())
+        finally:
+            handle.close()
+    if res.blocked:
+        console.print(f"[red]Ad Library blocked the search:[/] {res.note}")
+        return 3
+    cands = page_candidates(res.ads, domain)
+    if not cands:
+        console.print("no pages found. Try --query with the brand as written on the site (e.g. --query \"Happy Harvest\"), "
+                      "or set it by hand: python tracker.py set-page <domain> --name \"Page Name\"")
+        return 1
+    t = Table(title=f"pages advertising for '{query}' (pages whose ads land on {domain} first)")
+    for c in ("#", "page name", "page_id", "ads", "land on store", "top landing domain"):
+        t.add_column(c, justify="right" if c in ("#", "ads", "land on store") else "left")
+    for i, p in enumerate(cands[:15], start=1):
+        t.add_row(str(i), p["page_name"][:40], p["page_id"], str(p["ads"]), str(p["on_store"]), p["top_domain"][:40])
+    console.print(t)
+    pick = args.set
+    if pick is None and cands[0]["on_store"] > 0 and args.auto:
+        pick = 1
+    if pick:
+        p = cands[pick - 1]
+        _set_page(domain, p["page_name"], p["page_id"], args)
+    else:
+        console.print("pick one with:  python tracker.py find-page <domain> --set N   (or set-page <domain> --name \"...\" --page-id ...)")
+    return 0
+
+
+def _set_page(domain: str, name: str, page_id: str | None, args) -> None:
+    ok = update_watchlist_entry(domain, Path(args.watchlist) if args.watchlist else None, meta_page_name=name, meta_page_id=page_id or "")
+    conn = db.connect(args.db)
+    if page_id:
+        conn.execute("UPDATE stores SET meta_page_name = ?, meta_page_id = ? WHERE store_domain = ?", (name, page_id, domain))
+    else:
+        conn.execute("UPDATE stores SET meta_page_name = ? WHERE store_domain = ?", (name, domain))
+    conn.commit()
+    if ok:
+        console.print(f"[green]set[/] {domain}: meta_page_name={name!r} meta_page_id={page_id or ''!r} (watchlist.csv + database). "
+                      f"Next: python tracker.py ads --only {domain}")
+    else:
+        console.print(f"[yellow]{domain} is not in watchlist.csv[/]; the database row was updated. Add the store first (add-store).")
+
+
+def cmd_set_page(args) -> int:
+    _set_page(args.domain, args.name, args.page_id, args)
+    return 0
 
 
 def plan_meta_stores(conn, stores: list[dict], only: set[str] | None = None, scope: list[str] | None = None) -> list[dict]:
@@ -1548,6 +1683,28 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")
     s.add_argument("--no-verify", action="store_true", help="skip the read-back comparison after syncing")
     s.set_defaults(fn=cmd_sync_sheets)
+
+    s = sub.add_parser("prune-dead", help="list (and with --apply remove) watchlist domains that never returned a catalogue or an ad")
+    s.add_argument("--apply", action="store_true", help="remove them from watchlist.csv (history in the DB is kept)")
+    s.add_argument("--watchlist")
+    s.set_defaults(fn=cmd_prune_dead)
+
+    s = sub.add_parser("find-page", help="find a store's Facebook page: footer link, then an Ad Library search for the brand; --set N saves it")
+    s.add_argument("domain")
+    s.add_argument("--query", help="search this instead of the brand name derived from the domain")
+    s.add_argument("--set", type=int, metavar="N", help="save candidate N to watchlist.csv and the database")
+    s.add_argument("--auto", action="store_true", help="save the top candidate when its ads land on the store")
+    s.add_argument("--max-ads", type=int, default=150)
+    s.add_argument("--headed", action="store_true")
+    s.add_argument("--watchlist")
+    s.set_defaults(fn=cmd_find_page)
+
+    s = sub.add_parser("set-page", help="set a store's Meta page name (and id) by hand")
+    s.add_argument("domain")
+    s.add_argument("--name", required=True)
+    s.add_argument("--page-id")
+    s.add_argument("--watchlist")
+    s.set_defaults(fn=cmd_set_page)
 
     s = sub.add_parser("remove-store", help="remove one or more domains from watchlist.csv")
     s.add_argument("domains", nargs="+")
