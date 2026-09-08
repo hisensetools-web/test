@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS variants_daily (
     price               REAL,
     compare_at_price    REAL,
     available           INTEGER NOT NULL,   -- 0/1
+    inventory_management TEXT,              -- 'shopify' = stock is tracked (rung-1 cart probe applies); NULL = unknown/untracked
+    inventory_policy    TEXT,               -- deny (stop selling at 0) | continue (oversell allowed)
     PRIMARY KEY (snapshot_date, store_id, variant_id)
 );
 
@@ -418,6 +420,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
                    ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT")],
         "products_daily": [("unlisted", "INTEGER DEFAULT 0")],   # 1 = live product page not in products.json (found via ads)
+        "variants_daily": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
+        "hero_variants": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
         "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
                            ("engagement_per_day", "REAL"),
                            # reach curve (EU exact, UK exact or range) and the comment curve
@@ -518,11 +522,13 @@ def write_product_snapshot(conn: sqlite3.Connection, store_id: int, snapshot_dat
         # (write_product_snapshot only replaces the listed catalogue)
         conn.executemany(
             """INSERT INTO variants_daily
-               (snapshot_date, store_id, product_id, variant_id, title, sku, price, compare_at_price, available)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
+               (snapshot_date, store_id, product_id, variant_id, title, sku, price, compare_at_price, available,
+                inventory_management, inventory_policy)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 (snapshot_date, store_id, p["product_id"], v["variant_id"], v["title"], v["sku"],
-                 v["price"], v["compare_at_price"], 1 if v["available"] else 0)
+                 v["price"], v["compare_at_price"], 1 if v["available"] else 0,
+                 v.get("inventory_management"), v.get("inventory_policy"))
                 for p in products for v in p["variants"]
             ],
         )

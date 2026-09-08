@@ -259,6 +259,9 @@ def normalise_product(p: dict, collection_position: int | None = None) -> dict:
             "price": _to_float(v.get("price")),
             "compare_at_price": _to_float(v.get("compare_at_price")),
             "available": bool(v.get("available", False)),
+            # only some stores expose these in products.json; the .js product endpoint fills them in for hero variants
+            "inventory_management": v.get("inventory_management") or None,
+            "inventory_policy": v.get("inventory_policy") or None,
         })
     prices = [v["price"] for v in variants if v["price"] is not None]
     return {

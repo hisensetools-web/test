@@ -54,6 +54,13 @@ a missed day doesn't break the comparison. With one day of history the 2-day col
 sold-out / restocked products (with `(ALL)` when every variant is gone), price changes and
 removed handles, ordered by store score.
 
+**Freshness on the Signals tab.** `published_at` resets every time a product is unpublished and
+republished; `created_at` never does. Signals carries both: `days_since_published` / `published_at` and
+`days_since_created` / `created_at`. When the two differ by more than 30 days the row is flagged
+`relaunch` (an old product put back on sale, not a new one), and the youngest-first ordering uses
+`created_at`. Holior's wormwood, created in April and republished in August, reads as 5 months old
+with `relaunch`, not 26 days old.
+
 ## Google Sheets sync
 
 Pushes the latest snapshot and the report numbers into a Google Sheet through a Google
@@ -376,6 +383,21 @@ Library search scrape -> single-ad pages (A) -> boosted-post counts -> captured-
 Traffic tools see a store weeks late and the Ad Library gives no reach for US/UK advertisers,
 so the demand signal is read off the store itself: how fast its stock goes down.
 
+**Which variants can be counted.** Shopify exposes `inventory_management` per variant on the
+storefront `.js` product object (`/products/<handle>.js`; a few stores also carry it in `products.json`),
+and `inventory_policy` where present. The probe reads it once per hero handle and keeps it on
+`hero_variants` and the day's `variants_daily` row:
+
+| value | meaning | what the probe does |
+|---|---|---|
+| `shopify` + `deny` | stock is tracked and selling stops at 0 | rung-1 cart probe reads the count |
+| `shopify` + `continue` | tracked, but oversell allowed | the cart accepts any quantity; theme fallback, else `ads_only` with the reason in the message |
+| `none` (explicit null) | the store does not track this variant | no cart probe at all: theme fallback, else `ads_only` |
+| unknown (field absent) | older stores, `.js` unreachable | probed as before |
+
+A store whose latest `products.json` snapshot shows any variant with `inventory_management=shopify`
+joins the probe pool automatically, alongside `INVENTORY_STORES`.
+
 **Hero variants.** For every store in `INVENTORY_STORES` the daily run selects the top 15
 products of `/collections/all` (best-selling order) plus anything published in the last
 30 days, and skips shipping protection / package protection, warranties, insurance, gift
@@ -440,7 +462,7 @@ as blocked without another request, and the store is retried the next day.
 chain, then one row per hero variant with the raw `stock_level` reading for every day
 (`ads` = not tracked, `blk` = blocked, `-` = no reading), and the inventory alerts.
 
-**Rollout:** set `INVENTORY_STORES=neuro-bella.com,tryorgatics.com,metabolae.com` in `.env`
+**Rollout:** set `INVENTORY_STORES=neuro-bella.com,tryorgatics.com,metabolae.com,holior.com` in `.env`
 and the scheduled `python tracker.py run` probes those three after the Shopify pass, before
 the Meta pass and the Sheets sync. `INVENTORY=1` (or `run --inventory`) probes every watchlist store; do that
 only after the readings from the first stores look right. `--no-inventory` skips the pass.

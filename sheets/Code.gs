@@ -21,8 +21,8 @@
 
 var TABS = {
   Signals: {
-    headers: ["store", "product family", "handle", "channel tag", "days_since_published", "published_at", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"],
-    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 14, 15, 22, 25, 26, 31], position: 1
+    headers: ["store", "product family", "handle", "channel tag", "days_since_published", "published_at", "days_since_created", "created_at", "relaunch", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"],
+    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 8, 10, 17, 18, 25, 28, 29, 34], position: 1
   },
   Families: {
     headers: ["store", "family", "title", "handles", "newest published_at", "oldest published_at", "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"],

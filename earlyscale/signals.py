@@ -200,7 +200,7 @@ def _snapshot_on_or_before(conn: sqlite3.Connection, store_id: int, target: str)
 
 def load_store_products(conn: sqlite3.Connection, store_id: int, snapshot_date: str) -> list[dict]:
     return [dict(r) for r in conn.execute(
-        """SELECT product_id, handle, title, published_at, updated_at, min_price, variant_count,
+        """SELECT product_id, handle, title, created_at, published_at, updated_at, min_price, variant_count,
                   sold_out_variants, collection_position, COALESCE(unlisted, 0) AS unlisted
            FROM products_daily WHERE store_id = ? AND snapshot_date = ?""", (store_id, snapshot_date))]
 
@@ -260,6 +260,17 @@ def _blank(v):
     return "" if v is None else v
 
 
+RELAUNCH_GAP_DAYS = 30
+
+
+def relaunch_flag(days_since_created: int | None, days_since_published: int | None) -> str:
+    """'relaunch' when created_at (never reset by Shopify) and published_at (reset on every unpublish/publish)
+    are more than RELAUNCH_GAP_DAYS apart: an old product put back on sale, not a new one."""
+    if days_since_created is None or days_since_published is None:
+        return ""
+    return "relaunch" if abs(days_since_created - days_since_published) > RELAUNCH_GAP_DAYS else ""
+
+
 def signals_rows_for_store(ctx: dict) -> list[list]:
     as_of, fam = ctx["as_of"], ctx["families"]
     fam_new_7d: Counter = Counter()
@@ -276,6 +287,8 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
         iv = inv.get(p["handle"], {})
         pg = pages.get(p["handle"], {})
         days = _days_between(p["published_at"], as_of)
+        created = _days_between(p.get("created_at"), as_of)
+        relaunch = relaunch_flag(created, days)
         rank = None if p["collection_position"] is None else p["collection_position"] + 1
         old = ctx["rank_7d"].get(p["product_id"]) if ctx["rank_7d_date"] else None
         rank_delta = "" if (rank is None or old is None) else (old + 1) - rank   # positive = climbed
@@ -286,6 +299,7 @@ def signals_rows_for_store(ctx: dict) -> list[list]:
         rows.append([
             ctx["store"], fam[p["product_id"]], p["handle"], tag,
             "" if days is None else days, p["published_at"] or "",
+            "" if created is None else created, p.get("created_at") or "", relaunch,
             "" if p["min_price"] is None else p["min_price"], sold_out,
             "" if rank is None else rank, rank_delta, fam_new_7d[fam[p["product_id"]]],
             m.get("ads_pointing_here", ""), m.get("ads_launched_7d", ""), m.get("ads_launched_prev_7d", ""), m.get("ad_velocity_wow", ""),

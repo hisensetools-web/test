@@ -2,6 +2,7 @@
 units-sold maths (restocks excluded, gaps handled), alerts 9-11 and the Signals columns."""
 import json
 import unittest
+from unittest import mock
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -419,3 +420,61 @@ class ProbeHttpTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class InventoryFieldTests(unittest.TestCase):
+    """inventory_management / inventory_policy per variant: products.json when present, the .js product object otherwise."""
+
+    def test_parse_product_js(self):
+        js = '{"id": 1, "variants": [{"id": 10, "inventory_management": "shopify", "inventory_policy": "deny"}, {"id": 11, "inventory_management": null}, {"id": 12}]}'
+        got = inventory.parse_product_js(js)
+        self.assertEqual(got[10], {"inventory_management": "shopify", "inventory_policy": "deny"})
+        self.assertEqual(got[11], {"inventory_management": "none", "inventory_policy": None})   # explicit null = known untracked
+        self.assertNotIn(12, got)                                                                 # field absent = unknown
+        self.assertEqual(inventory.parse_product_js('{"product": {"variants": [{"id": 5, "inventory_policy": "continue"}]}}')[5]["inventory_policy"], "continue")
+        self.assertEqual(inventory.parse_product_js("<html>"), {})
+
+    def test_products_json_fields_are_stored_and_enrol_the_store(self):
+        from earlyscale import shopify, cli
+        raw = [{"id": 1, "handle": "wormwood", "title": "Wormwood", "created_at": ts(155), "published_at": ts(26), "updated_at": ts(1),
+                "variants": [{"id": 10, "title": "Default", "price": "29.00", "available": True, "inventory_management": "shopify", "inventory_policy": "deny"}]}]
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "holior.com")
+        db.write_product_snapshot(conn, sid, TODAY, shopify.normalise_products(raw))
+        row = conn.execute("SELECT inventory_management, inventory_policy FROM variants_daily WHERE variant_id = 10").fetchone()
+        self.assertEqual(tuple(row), ("shopify", "deny"))
+        stores = [{"store_domain": "holior.com"}, {"store_domain": "other.com"}]
+        with mock.patch.object(config, "INVENTORY_STORES", ["tryorgatics.com"]), mock.patch.object(config, "INVENTORY_ALL", False):
+            self.assertEqual([s["store_domain"] for s in cli.inventory_targets(stores, None, conn=conn)], ["holior.com"])
+            self.assertEqual(cli.inventory_targets(stores, None), [])            # without the DB only .env decides
+
+    def test_js_fields_steer_the_probe_chain(self):
+        ps = [prod(1, "tracked-deny", "Tracked", days_ago=5, pos=1),      # shopify/deny: cart probe counts
+              prod(2, "tracked-cont", "Oversell", days_ago=6, pos=2),     # shopify/continue: cart accepts anything -> message says so
+              prod(3, "untracked", "Untracked", days_ago=7, pos=3),       # explicit null: no cart probe at all
+              prod(4, "unknown", "Unknown", days_ago=8, pos=4)]           # .js says nothing: probed as before
+        conn = db.connect(":memory:")
+        sid = seed_store(conn, ps)
+        fake = FakeProbe({10: {"status": "count", "stock": 7, "message": "only add 7", "http": 422}})
+        js = {"tracked-deny": {10: {"inventory_management": "shopify", "inventory_policy": "deny"}},
+              "tracked-cont": {20: {"inventory_management": "shopify", "inventory_policy": "continue"}},
+              "untracked": {30: {"inventory_management": "none", "inventory_policy": None}}}
+        js_calls = []
+
+        def js_fetch(base, handle, session=None):
+            js_calls.append(handle)
+            return js.get(handle, {})
+        counts = inventory.probe_store(conn, sid, "shop.example.com", TODAY, probe=fake.probe, page_fetch=fake.page, pause=lambda: None,
+                                       resolve=NORES, js_fetch=js_fetch)
+        self.assertEqual(sorted(js_calls), ["tracked-cont", "tracked-deny", "unknown", "untracked"])   # one .js read per handle
+        self.assertEqual(fake.calls, [10, 20, 40])                                                     # the untracked variant was never cart-probed
+        rows = {r["variant_id"]: dict(r) for r in conn.execute("SELECT * FROM inventory_daily")}
+        self.assertEqual((rows[10]["stock_level"], rows[10]["signal_source"]), (7, "cart_probe"))
+        self.assertEqual(rows[20]["signal_source"], "ads_only")
+        self.assertIn("oversell allowed (policy continue)", rows[20]["raw_message"])
+        self.assertIn("inventory_management is null", rows[30]["raw_message"])
+        hv = {r["variant_id"]: dict(r) for r in conn.execute("SELECT * FROM hero_variants")}
+        self.assertEqual((hv[10]["inventory_management"], hv[10]["inventory_policy"], hv[30]["inventory_management"]), ("shopify", "deny", "none"))
+        vd = conn.execute("SELECT inventory_management FROM variants_daily WHERE variant_id = 20").fetchone()[0]
+        self.assertEqual(vd, "shopify")                                                                # copied onto the day's variant row
+        self.assertEqual(counts["cart_probe"], 1)

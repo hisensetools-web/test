@@ -15,9 +15,9 @@ def ts(days_ago: int) -> str:
     return (NOW - timedelta(days=days_ago)).isoformat()
 
 
-def prod(pid, handle, title, days_ago=100, pos=None, price=39.95, sold_out=0, variants=1):
+def prod(pid, handle, title, days_ago=100, pos=None, price=39.95, sold_out=0, variants=1, created_days_ago=None):
     return {"product_id": pid, "handle": handle, "title": title, "vendor": "", "product_type": None, "tags": [],
-            "created_at": ts(days_ago), "published_at": ts(days_ago), "updated_at": ts(days_ago),
+            "created_at": ts(days_ago if created_days_ago is None else created_days_ago), "published_at": ts(days_ago), "updated_at": ts(days_ago),
             "variant_count": variants, "sold_out_variants": sold_out, "min_price": price, "max_price": price,
             "collection_position": pos, "variants": [
                 {"variant_id": pid * 10 + i, "title": "x", "sku": None, "price": price, "compare_at_price": None,
@@ -119,23 +119,43 @@ class RowBuilderTests(unittest.TestCase):
 
     def test_signals_rows(self):
         rows = sheets.signals_rows(self.conn)
+        H = sheets.SIGNALS_HEADERS
+        c = H.index
         self.assertEqual([r[2] for r in rows], ["ceylon-cinnamon-fb", "ceylon-cinnamon-tt", "ceylon-cinnamon-google",
-                                                "ceylon-cinnamon", "oregano-oil"])  # days_since_published asc
+                                                "ceylon-cinnamon", "oregano-oil"])  # days_since_created asc
         by = {r[2]: r for r in rows}
-        self.assertEqual(len(by["ceylon-cinnamon"]), len(sheets.SIGNALS_HEADERS))
-        self.assertEqual(by["ceylon-cinnamon-tt"][3], "tiktok")
-        self.assertEqual(by["ceylon-cinnamon-tt"][4], 2)
-        self.assertEqual(by["ceylon-cinnamon-tt"][7], "Y")
-        self.assertEqual(by["ceylon-cinnamon"][7], "N")
-        self.assertEqual(by["ceylon-cinnamon"][8], 2)          # rank is 1-based
-        self.assertEqual(by["ceylon-cinnamon"][9], 4)          # was rank 6 a week ago -> climbed 4
-        self.assertEqual(by["oregano-oil"][9], -1)             # slipped one place
-        self.assertEqual(by["ceylon-cinnamon-fb"][8], "")      # no collection position
-        self.assertEqual(by["ceylon-cinnamon-fb"][9], "")
-        self.assertEqual(by["ceylon-cinnamon-tt"][9], "")      # didn't exist a week ago
-        self.assertEqual(by["ceylon-cinnamon"][10], 2)         # family launched 2 handles this week
-        self.assertEqual(by["oregano-oil"][10], 0)
-        self.assertEqual(by["ceylon-cinnamon"][11:], [""] * 21)  # Meta + velocity + pages + inventory + badge columns empty
+        self.assertEqual(len(by["ceylon-cinnamon"]), len(H))
+        self.assertEqual(by["ceylon-cinnamon-tt"][c("channel tag")], "tiktok")
+        self.assertEqual(by["ceylon-cinnamon-tt"][c("days_since_published")], 2)
+        self.assertEqual(by["ceylon-cinnamon-tt"][c("days_since_created")], 2)
+        self.assertEqual(by["ceylon-cinnamon-tt"][c("relaunch")], "")
+        self.assertEqual(by["ceylon-cinnamon-tt"][c("sold_out")], "Y")
+        self.assertEqual(by["ceylon-cinnamon"][c("sold_out")], "N")
+        self.assertEqual(by["ceylon-cinnamon"][c("collection_rank")], 2)          # rank is 1-based
+        self.assertEqual(by["ceylon-cinnamon"][c("collection_rank_delta_7d")], 4)  # was rank 6 a week ago -> climbed 4
+        self.assertEqual(by["oregano-oil"][c("collection_rank_delta_7d")], -1)     # slipped one place
+        self.assertEqual(by["ceylon-cinnamon-fb"][c("collection_rank")], "")       # no collection position
+        self.assertEqual(by["ceylon-cinnamon-fb"][c("collection_rank_delta_7d")], "")
+        self.assertEqual(by["ceylon-cinnamon-tt"][c("collection_rank_delta_7d")], "")   # didn't exist a week ago
+        self.assertEqual(by["ceylon-cinnamon"][c("variants_of_family_published_7d")], 2)   # family launched 2 handles this week
+        self.assertEqual(by["oregano-oil"][c("variants_of_family_published_7d")], 0)
+        self.assertEqual(by["ceylon-cinnamon"][c("ads_pointing_here"):], [""] * (len(H) - c("ads_pointing_here")))  # Meta + velocity + pages + inventory + badge empty
+
+    def test_relaunch_uses_created_at_for_freshness(self):
+        """Holior's wormwood: created 5 months ago, (re)published 26 days ago -> old product, flagged relaunch, ranked old."""
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "holior.com")
+        db.write_product_snapshot(conn, sid, "2026-09-06", [prod(1, "wormwood", "Wormwood", days_ago=26, created_days_ago=155, pos=0),
+                                                     prod(2, "fresh-drop", "Fresh Drop", days_ago=40, pos=1),
+                                                     prod(3, "tweaked", "Tweaked", days_ago=10, created_days_ago=30, pos=2)])
+        rows = sheets.signals_rows(conn)
+        H = sheets.SIGNALS_HEADERS
+        by = {r[2]: r for r in rows}
+        self.assertEqual((by["wormwood"][H.index("days_since_published")], by["wormwood"][H.index("days_since_created")], by["wormwood"][H.index("relaunch")]),
+                         (26, 155, "relaunch"))
+        self.assertEqual(by["wormwood"][H.index("created_at")][:10], "2026-04-04")
+        self.assertEqual(by["tweaked"][H.index("relaunch")], "")            # 20 days apart: within the 30-day gap
+        self.assertEqual([r[2] for r in rows], ["tweaked", "fresh-drop", "wormwood"])   # youngest by created_at first
 
     def test_families_and_categories_rows(self):
         fams = sheets.families_rows(self.conn)
@@ -153,7 +173,7 @@ class RowBuilderTests(unittest.TestCase):
         conn = db.connect(":memory:")
         sid = db.upsert_store(conn, "x.com")
         db.write_product_snapshot(conn, sid, "2026-09-06", [prod(1, "a", "A", pos=0)])
-        self.assertEqual(sheets.signals_rows(conn)[0][9], "")
+        self.assertEqual(sheets.signals_rows(conn)[0][sheets.SIGNALS_HEADERS.index("collection_rank_delta_7d")], "")
 
 
 if __name__ == "__main__":

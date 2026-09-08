@@ -195,7 +195,7 @@ class ProcessStoreTests(unittest.TestCase):
         H = sheets.SIGNALS_HEADERS
         r = rows["ceylon-cinnamon-google"]
         self.assertEqual([r[H.index("ads_pointing_here")], r[H.index("engagement_per_day")], r[H.index("days_running_max")]], [3, "", 27])
-        self.assertEqual(rows["ceylon-cinnamon"][11], "")
+        self.assertEqual(rows["ceylon-cinnamon"][H.index("ads_pointing_here")], "")
         # markdown
         import tempfile
         with tempfile.TemporaryDirectory() as d:
@@ -388,10 +388,11 @@ class UnlistedProductTests(unittest.TestCase):
         self.assertEqual(pd["turmeric-1000mg"]["unlisted"], 0)
         # Signals: own row, tagged unlisted, same family as the listed product (same title), ads attributed to it
         sig = {r[2]: r for r in sheets.signals_rows(conn)}
-        self.assertEqual(sig["turmeric-1-000mg-o2"][3], "variant+unlisted")
+        H = sheets.SIGNALS_HEADERS
+        self.assertEqual(sig["turmeric-1-000mg-o2"][H.index("channel tag")], "variant+unlisted")
         self.assertEqual(sig["turmeric-1-000mg-o2"][1], sig["turmeric-1000mg"][1])
-        self.assertEqual(sig["turmeric-1-000mg-o2"][11], 2)
-        self.assertEqual(sig["turmeric-1000mg"][11], 1)
+        self.assertEqual(sig["turmeric-1-000mg-o2"][H.index("ads_pointing_here")], 2)
+        self.assertEqual(sig["turmeric-1000mg"][H.index("ads_pointing_here")], 1)
         # a normal Shopify snapshot for the same day must not wipe the unlisted row
         db.write_product_snapshot(conn, sid, "2026-09-06", [_prod(1, "turmeric-1000mg", "Turmeric Curcumin Capsules (1,000mg)")])
         self.assertEqual(conn.execute("SELECT COUNT(*) FROM products_daily WHERE unlisted = 1").fetchone()[0], 1)

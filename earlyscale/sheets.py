@@ -33,6 +33,7 @@ PRODUCTS_HEADERS = ["date", "store", "handle", "title", "published_at", "updated
 ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 
 SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
+                   "days_since_created", "created_at", "relaunch",
                    "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
                    "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d",
                    "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d",
@@ -213,13 +214,15 @@ def _contexts(conn: sqlite3.Connection, as_of: str | None):
 
 def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     rows = [r for ctx in _contexts(conn, as_of) for r in signals.signals_rows_for_store(ctx)]
-    # what we compare: ads launched this week (desc), then ads pointing here (desc), then youngest product first
-    il, ip, idays = SIGNALS_HEADERS.index("ads_launched_7d"), SIGNALS_HEADERS.index("ads_pointing_here"), SIGNALS_HEADERS.index("days_since_published")
+    # what we compare: ads launched this week (desc), then ads pointing here (desc), then youngest product first,
+    # youngest by created_at (published_at resets on every relaunch; created_at never does)
+    il, ip = SIGNALS_HEADERS.index("ads_launched_7d"), SIGNALS_HEADERS.index("ads_pointing_here")
+    icreated, ipub = SIGNALS_HEADERS.index("days_since_created"), SIGNALS_HEADERS.index("days_since_published")
 
     def key(r):
         launched = r[il] if isinstance(r[il], int) else -1
         pointing = r[ip] if isinstance(r[ip], int) else -1
-        days = r[idays] if r[idays] != "" else 10**6
+        days = r[icreated] if r[icreated] != "" else (r[ipub] if r[ipub] != "" else 10**6)
         return (-launched, -pointing, days, r[0], r[2])
     rows.sort(key=key)
     return rows

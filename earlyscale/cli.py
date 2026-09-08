@@ -124,7 +124,7 @@ def cmd_run(args) -> int:
             console.print(f"posts: fetched {c['fetched']}, ok={c['ok']} gated={c['gated']} removed={c['removed']}")
         except Exception as e:  # noqa: BLE001
             console.print(f"[red]post engagement pass failed:[/] {e}")
-    inv_stores = inventory_targets(stores, only, args.inventory)
+    inv_stores = inventory_targets(stores, only, args.inventory, conn=conn)
     if inv_stores and not args.no_inventory:
         console.print(f"inventory probe pass ({len(inv_stores)} store(s), waits={config.INVENTORY_WAIT_MIN:.0f}-{config.INVENTORY_WAIT_MAX:.0f}s) ...")
         try:
@@ -344,16 +344,23 @@ def _post_process_store(conn, store_id: int, domain: str, snapshot_date: str, se
         return {}
 
 
-def inventory_targets(stores: list[dict], only: set[str] | None, force_all: bool = False) -> list[dict]:
-    """Stores to probe: INVENTORY_STORES from .env (or every store when INVENTORY=1 / --inventory)."""
+def inventory_targets(stores: list[dict], only: set[str] | None, force_all: bool = False, conn=None) -> list[dict]:
+    """Stores to probe: INVENTORY_STORES from .env (or every store when INVENTORY=1 / --inventory), plus any store
+    whose latest products.json snapshot shows a variant with inventory_management='shopify' (stock is tracked,
+    so the rung-1 cart probe can read it: straight into the pool)."""
     wanted = None if (force_all or config.INVENTORY_ALL) else set(config.INVENTORY_STORES)
+    managed = set()
+    if conn is not None and wanted is not None:
+        managed = {r[0] for r in conn.execute("""SELECT DISTINCT s.store_domain FROM variants_daily v JOIN stores s ON s.id = v.store_id
+                                                  WHERE v.inventory_management = 'shopify'
+                                                  AND v.snapshot_date = (SELECT MAX(snapshot_date) FROM variants_daily v2 WHERE v2.store_id = v.store_id)""")}
     out = []
     for s in stores:
         d = s["store_domain"]
         if only and d not in only:
             continue
         bare = re.sub(r"^www\.", "", d.split("//")[-1].lower())
-        if wanted is None or d.lower() in wanted or bare in wanted or f"www.{bare}" in wanted:
+        if wanted is None or d.lower() in wanted or bare in wanted or f"www.{bare}" in wanted or d in managed:
             out.append(s)
     return out
 
@@ -390,7 +397,7 @@ def cmd_inventory(args) -> int:
         return 2
     conn = db.connect(args.db)
     only = set(args.only) if args.only else None
-    targets = inventory_targets(stores, only, force_all=bool(only) or args.all)
+    targets = inventory_targets(stores, only, force_all=bool(only) or args.all, conn=conn)
     if not targets:
         console.print("[red]no stores selected.[/] Set INVENTORY_STORES=a.com,b.com in .env, or pass --only a.com b.com")
         return 2

@@ -225,6 +225,21 @@ def make_handler(products: list[dict], collection: list[dict], delay_first_page_
                 self.send_response(403)
                 self.end_headers()
                 return
+            elif u.path.startswith("/products/") and u.path.endswith(".js"):
+                # storefront .js product object: carries inventory_management per variant (products.json does not)
+                p = by_handle.get(u.path[len("/products/"):-3])
+                if p is None:
+                    self.send_response(404)
+                    self.end_headers()
+                    return
+                js = {"id": p["id"], "handle": p["handle"], "variants": []}
+                for v in p["variants"]:
+                    st = stock.get(v["id"], {})
+                    js["variants"].append({"id": v["id"], "title": v["title"], "price": int(float(v["price"]) * 100), "available": v["available"],
+                                           "inventory_management": "shopify" if st.get("mode") in ("cart", "theme") else None,
+                                           "inventory_policy": "deny" if st.get("mode") in ("cart", "theme") else None})
+                self._send_json(200, js)
+                return
             elif u.path.startswith("/products/") and u.path.endswith(".json"):
                 p = by_handle.get(u.path[len("/products/"):-5])
                 if p is None:

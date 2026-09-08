@@ -206,6 +206,61 @@ def theme_inventory_from_html(html: str, variant_id: int) -> int | None:
     return None
 
 
+def parse_product_js(text: str) -> dict[int, dict]:
+    """{variant_id: {inventory_management, inventory_policy}} from a /products/<handle>.js (or .json) body.
+    inventory_management is 'shopify' when stock is tracked; the value 'none' records an explicit null
+    (untracked) so it is not mistaken for 'unknown'."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    prod = data.get("product") if isinstance(data, dict) and "product" in data else data
+    out = {}
+    for v in (prod or {}).get("variants") or []:
+        try:
+            vid = int(v["id"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if "inventory_management" not in v and "inventory_policy" not in v:
+            continue
+        out[vid] = {"inventory_management": v.get("inventory_management") or "none",
+                    "inventory_policy": v.get("inventory_policy") or None}
+    return out
+
+
+def fetch_product_js(base_url: str, handle: str, session: requests.Session | None = None) -> dict[int, dict]:
+    """The storefront .js product object carries inventory_management per variant (products.json usually does not)."""
+    s = session or shopify.make_session()
+    try:
+        r = s.get(f"{base_url}/products/{handle}.js", timeout=config.REQUEST_TIMEOUT, headers={"Accept": "application/json"})
+    except requests.RequestException:
+        return {}
+    return parse_product_js(r.text) if r.status_code == 200 else {}
+
+
+def record_variant_inventory_fields(conn: sqlite3.Connection, store_id: int, today: str, fields: dict[int, dict]) -> None:
+    for vid, f in fields.items():
+        conn.execute("UPDATE hero_variants SET inventory_management = ?, inventory_policy = ? WHERE store_id = ? AND variant_id = ?",
+                     (f.get("inventory_management"), f.get("inventory_policy"), store_id, vid))
+        conn.execute("""UPDATE variants_daily SET inventory_management = ?, inventory_policy = ? WHERE store_id = ? AND variant_id = ?
+                        AND snapshot_date = (SELECT MAX(snapshot_date) FROM variants_daily v2 WHERE v2.store_id = ? AND v2.variant_id = ?)""",
+                     (f.get("inventory_management"), f.get("inventory_policy"), store_id, vid, store_id, vid))
+    conn.commit()
+
+
+def known_inventory_fields(conn: sqlite3.Connection, store_id: int) -> dict[int, dict]:
+    """Per hero variant: inventory_management / policy from hero_variants or the latest products.json snapshot."""
+    out = {}
+    for r in conn.execute("""SELECT v.variant_id, v.inventory_management, v.inventory_policy FROM variants_daily v
+                             WHERE v.store_id = ? AND v.inventory_management IS NOT NULL
+                             AND v.snapshot_date = (SELECT MAX(snapshot_date) FROM variants_daily v2 WHERE v2.store_id = v.store_id AND v2.variant_id = v.variant_id)""",
+                          (store_id,)):
+        out[r["variant_id"]] = {"inventory_management": r["inventory_management"], "inventory_policy": r["inventory_policy"]}
+    for r in conn.execute("SELECT variant_id, inventory_management, inventory_policy FROM hero_variants WHERE store_id = ? AND inventory_management IS NOT NULL", (store_id,)):
+        out[r["variant_id"]] = {"inventory_management": r["inventory_management"], "inventory_policy": r["inventory_policy"]}
+    return out
+
+
 def fetch_product_page(base_url: str, handle: str, session: requests.Session | None = None) -> str:
     s = session or shopify.make_session()
     r = s.get(f"{base_url}/products/{handle}", timeout=config.REQUEST_TIMEOUT,
@@ -282,7 +337,7 @@ def _resolve(store_domain: str) -> str:
 
 def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, today: str,
                 probe=probe_variant, page_fetch=fetch_product_page, pause=_pause, resolve=_resolve,
-                sleep=time.sleep) -> dict:
+                sleep=time.sleep, js_fetch=None) -> dict:
     """Walk the fallback chain for every hero variant of one store that has not been probed today.
 
     One session (one cart) per store: Shopify throttles an IP that keeps creating new carts, which
@@ -291,7 +346,22 @@ def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, toda
     and retries that variant once; a second 429 ends the store for today."""
     base = resolve(store_domain)
     session = fresh_session(base) if probe is probe_variant else None
+    if js_fetch is None:
+        js_fetch = fetch_product_js if probe is probe_variant else (lambda b, h, s=None: {})   # fakes: no network
     warmed: set[str] = set()
+    fields = known_inventory_fields(conn, store_id)
+    js_done: set[str] = set()
+
+    def inventory_fields_for(h) -> dict:
+        """inventory_management / policy for a hero variant; one .js fetch per handle when nothing is known."""
+        vid, handle = h["variant_id"], h.get("handle")
+        if vid not in fields and handle and handle not in js_done:
+            js_done.add(handle)
+            got = js_fetch(base, handle, session)
+            if got:
+                fields.update(got)
+                record_variant_inventory_fields(conn, store_id, today, got)
+        return fields.get(vid, {})
 
     def do_probe(h):
         handle = h.get("handle")
@@ -328,7 +398,15 @@ def probe_store(conn: sqlite3.Connection, store_id: int, store_domain: str, toda
             record_reading(conn, store_id, today, vid, h["product_id"], None, "ads_only", "not tracked (previous decision)")
             counts["ads_only"] += 1
             continue
-        res = do_probe(h)
+        inv = inventory_fields_for(h)
+        managed = inv.get("inventory_management")
+        if managed == "none":
+            # the store says this variant's stock is not tracked: no cart probe can count it; theme, then ads_only
+            res = {"status": "untracked", "stock": None, "message": "inventory_management is null (store does not track this variant)", "http": None}
+        else:
+            res = do_probe(h)
+            if res["status"] == "untracked" and managed == "shopify":
+                res["message"] = f"tracked (inventory_management=shopify) but oversell allowed (policy {inv.get('inventory_policy') or 'continue'}): cart accepts any quantity"
         if res["status"] == "throttled":
             wait = min(max(res.get("retry_after") or config.INVENTORY_THROTTLE_WAIT, 30), 300)
             log.info("%s: cart endpoint throttled (429); waiting %ds and retrying once", store_domain, wait)
