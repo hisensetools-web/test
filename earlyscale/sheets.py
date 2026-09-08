@@ -185,11 +185,22 @@ def alerts_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
     ]
 
 
+_ctx_cache: dict = {}      # only filled while build_plan runs, so a lone signals_rows() call is always fresh
+
+
 def _contexts(conn: sqlite3.Connection, as_of: str | None):
-    for s in _stores(conn):
-        ctx = signals.store_signal_context(conn, s["id"], s["store_domain"], as_of)
-        if ctx:
-            yield ctx
+    """Per-store signal context; built once per build_plan and shared by the Signals, Families and Categories
+    builders (it is the expensive part of a sync)."""
+    if not _ctx_cache.get("active"):
+        for s in _stores(conn):
+            ctx = signals.store_signal_context(conn, s["id"], s["store_domain"], as_of)
+            if ctx:
+                yield ctx
+        return
+    key = (id(conn), as_of)
+    if key not in _ctx_cache:
+        _ctx_cache[key] = [c for c in (signals.store_signal_context(conn, s["id"], s["store_domain"], as_of) for s in _stores(conn)) if c]
+    yield from list(_ctx_cache[key])
 
 
 def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
@@ -346,11 +357,18 @@ def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = Non
     builders = {"signals": signals_rows, "families": families_rows, "categories": categories_rows,
                 "stores": stores_rows, "pages": pages_rows, "candidates": candidates_rows, "products": products_rows, "alerts": alerts_rows}
     plan = []
+    _ctx_cache.clear()
+    _ctx_cache["active"] = True
     for tab in TAB_ORDER:
         if tab not in tabs:
             continue
+        t0 = time.monotonic()
         rows = builders[tab](conn, as_of)
+        took = time.monotonic() - t0
+        if took >= 5:
+            log.info("sheets: built %s (%d rows) in %.0fs", TAB_NAMES[tab], len(rows), took)
         plan.append({"tab": TAB_NAMES[tab], "mode": TAB_MODES[tab], "rows": rows, "chunks": chunk_rows(rows)})
+    _ctx_cache.clear()
     return plan
 
 

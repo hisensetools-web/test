@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS meta_ads (
     raw_json            TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_meta_ads_store ON meta_ads(store_id, last_seen_date);
+CREATE INDEX IF NOT EXISTS idx_meta_ads_handle ON meta_ads(store_id, product_handle);
 
 -- One row per ad per snapshot day. is_active=0 rows are written when a previously seen
 -- ad no longer appears in the active search (that is how disappearance is tracked).
@@ -122,6 +123,7 @@ CREATE TABLE IF NOT EXISTS meta_ads_daily (
     fetched_at          TEXT NOT NULL,
     PRIMARY KEY (snapshot_date, ad_id)
 );
+CREATE INDEX IF NOT EXISTS idx_meta_ads_daily_store ON meta_ads_daily(store_id, snapshot_date);
 
 -- One row per concept per day (concept = page + landing URL + launch dates within 1 day).
 CREATE TABLE IF NOT EXISTS meta_concepts_daily (
@@ -194,6 +196,7 @@ CREATE TABLE IF NOT EXISTS meta_page_likes_daily (
     fetched_at          TEXT NOT NULL,
     PRIMARY KEY (snapshot_date, page_id)
 );
+CREATE INDEX IF NOT EXISTS idx_page_likes_page ON meta_page_likes_daily(page_id, snapshot_date);
 CREATE TABLE IF NOT EXISTS meta_creatives (
     ad_id       TEXT NOT NULL,
     kind        TEXT NOT NULL,           -- image | video
