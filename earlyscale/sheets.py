@@ -281,7 +281,7 @@ def _echo_hiccup(r, hops: int) -> bool:
     return r.status_code == 404 or ("ppConfig" in head and not head.lstrip().startswith("{"))
 
 
-def post_payload(session: requests.Session, url: str, payload: dict, retries: int = 3) -> dict:
+def post_payload(session: requests.Session, url: str, payload: dict, retries: int = 5) -> dict:
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     last_err: Exception | None = None
     for attempt in range(retries + 1):
@@ -289,12 +289,20 @@ def post_payload(session: requests.Session, url: str, payload: dict, retries: in
             r = session.post(url, data=body, headers={"Content-Type": "application/json"},
                              timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
             hops = 0
-            while r.status_code in (301, 302, 303, 307, 308) and hops < 5:
+            chain = []
+            while r.status_code in (301, 302, 303, 307, 308) and hops < 10:
                 # Apps Script answers every POST with a 302 to a one-time googleusercontent URL
                 # that serves the script's response; that hop must be a GET.
                 loc = urljoin(r.url, r.headers.get("Location", ""))
+                chain.append(urlparse(loc).netloc)
+                if "accounts.google" in loc:
+                    raise SheetsSyncError("Apps Script redirected to a Google login page: the deployment's 'Who has access' must be "
+                                          "'Anyone' (Deploy > Manage deployments > Edit), and the URL must be the /exec URL")
                 r = session.get(loc, timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
                 hops += 1
+            if r.status_code in (301, 302, 303, 307, 308):
+                # the one-time response URL kept bouncing: its key is spent or Google hiccupped; a fresh POST gets a new one
+                raise _Retryable(f"Google's response host kept redirecting ({hops} hops via {', '.join(dict.fromkeys(chain))})")
             if r.status_code >= 500:
                 raise _Retryable(f"HTTP {r.status_code} from Apps Script")
             if _echo_hiccup(r, hops):
@@ -311,7 +319,7 @@ def post_payload(session: requests.Session, url: str, payload: dict, retries: in
         except (_Retryable, requests.ConnectionError, requests.Timeout) as e:
             last_err = e
         if attempt < retries:
-            wait = (2 ** attempt) * 2 + random.uniform(0, 1)
+            wait = min(60, (2 ** attempt) * 3) + random.uniform(0, 2)
             log.warning("sheets: retry %d/%d after %s (sleep %.1fs)", attempt + 1, retries, last_err, wait)
             time.sleep(wait)
     raise SheetsSyncError(f"giving up after {retries + 1} attempts: {last_err}")

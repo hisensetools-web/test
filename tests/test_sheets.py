@@ -339,3 +339,15 @@ class EchoHiccupTests(unittest.TestCase):
                                    _resp(200, json.dumps({"ok": True, "tabs": {"Signals": 1}}), url="https://script.googleusercontent.com/macros/echo?user_content_key=k2")]
         with mock.patch("earlyscale.sheets.time.sleep"):
             self.assertEqual(sheets.get_json(session, "https://script.google.com/macros/s/x/exec", {"tabs": "1"})["tabs"]["Signals"], 1)
+
+    def test_post_re_posts_when_the_echo_host_keeps_redirecting(self):
+        session = mock.Mock()
+        echo = "https://script.googleusercontent.com/macros/echo?user_content_key=k"
+        session.post.return_value = _resp(302, "", location=echo)
+        loop = _resp(302, "", url=echo, location=echo)
+        session.get.side_effect = [loop] * 10 + [_resp(200, json.dumps({"ok": True, "written": 1, "skipped": 0}), url=echo)]
+        with mock.patch("earlyscale.sheets.time.sleep"):
+            with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
+                data = sheets.post_payload(session, "https://script.google.com/macros/s/x/exec", {"tab": "Signals", "rows": []})
+        self.assertEqual((data["written"], session.post.call_count), (1, 2))
+        self.assertIn("kept redirecting", logs.output[0])
