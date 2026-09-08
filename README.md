@@ -564,7 +564,7 @@ with only 3.14 and no `py` launcher works, and the Microsoft Store `python` stub
 It then runs `tracker.py run` and appends stdout+stderr to `logs\run_YYYY-MM-DD.log`, with
 the chosen interpreter and version in the start line. If nothing qualifies it logs an error
 and exits with code 9009.
-Register it in Task Scheduler (09:00 daily by default; `-Time HH:MM` for another time, re-run to change it) from PowerShell in the project folder:
+Register it in Task Scheduler (09:00 daily by default; `-Time HH:MM` for another time, re-run to change it) from PowerShell in the project folder. The script also sets the tasks to run a missed start as soon as the machine is awake again, to wake it from sleep for the start, and to run on battery (a closed lid or a powered-off laptop still runs nothing):
 
 ```powershell
 .\register_task.ps1

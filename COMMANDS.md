@@ -64,8 +64,16 @@ python tracker.py sync-sheets --verify-only            # does the sheet hold wha
 python tracker.py sync-sheets                          # push everything to the sheet now
 python tracker.py inventory-probe x.com                # one live cart probe with status, headers, body
 python tracker.py ads-detail --ads <ad_id>             # one single-ad page, prints what was parsed
-schtasks /Query /TN "ShopifyTracker Daily" /V /FO LIST # is the task registered, when did it last run
+dir logs                                               # which days actually ran (no file = the task did not run that day)
+schtasks /Query /TN "ShopifyTracker Daily" /V /FO LIST | findstr /C:"Last Run Time" /C:"Last Result" /C:"Next Run Time"
+schtasks /Query /TN "ShopifyTracker Meta"  /V /FO LIST | findstr /C:"Last Run Time" /C:"Last Result" /C:"Next Run Time"
 ```
+
+`Cannot find path 'logs\run_<today>.log'` means the morning task has not run yet today: either it is not
+09:00 yet, or the laptop was asleep / off / on the lock screen at 09:00. The 22:00 task names its log by
+the day it *started*, so last night is `meta_<yesterday>.log`. `register_task.ps1` (re-run it once after
+`git pull`) tells Windows to run a missed start as soon as the machine is awake and to wake it from sleep
+for the start; a closed lid or a shut-down laptop still cannot run anything. "Last Result: 0" = ran fine.
 
 ## 5. Running a pass by hand (only when you do not want to wait for the schedule)
 

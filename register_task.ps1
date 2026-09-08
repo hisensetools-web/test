@@ -32,6 +32,24 @@ if ($NoMeta) {
   if ($LASTEXITCODE -ne 0) { throw "schtasks (meta) failed with exit code $LASTEXITCODE" }
 }
 
+# Missed-start behaviour. schtasks /Create cannot set these, so they are applied afterwards:
+#   StartWhenAvailable  run a missed 09:00 / 22:00 start as soon as the laptop is awake again
+#   WakeToRun           wake the machine from sleep for the start (not from a closed lid / shutdown)
+#   battery flags       do not skip or kill the run because the laptop is unplugged
+#   ExecutionTimeLimit  kill a stuck run after 14 h (the night task can legitimately take 12 h)
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+  -ExecutionTimeLimit (New-TimeSpan -Hours 14)
+$names = @("ShopifyTracker Daily")
+if (-not $NoMeta) { $names += "ShopifyTracker Meta" }
+foreach ($n in $names) {
+  try {
+    Set-ScheduledTask -TaskName $n -Settings $settings | Out-Null
+    Write-Host "Applied to '$n': run when missed, wake to run, allowed on battery."
+  } catch {
+    Write-Warning "Could not set missed-start options on '$n' ($($_.Exception.Message)). Open Task Scheduler > task > Settings and tick 'Run task as soon as possible after a scheduled start is missed' and Conditions > 'Wake the computer to run this task'."
+  }
+}
+
 Write-Host ""
 Write-Host "Registered. Verify with:   schtasks /Query /TN ""ShopifyTracker Daily"" /V /FO LIST   (and ""ShopifyTracker Meta"")"
 Write-Host "Run it now to test with:   schtasks /Run /TN ""ShopifyTracker Daily""   (then check logs\)"
