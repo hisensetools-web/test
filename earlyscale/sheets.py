@@ -23,7 +23,8 @@ log = logging.getLogger("earlyscale.sheets")
 
 STORES_HEADERS = ["store", "meta page", "platform", "last status", "products", "sold-out variants", "new products 7d",
                   "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date",
-                  "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow",
+                  "ads_scraped_on", "ads_active", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow",
+                  "ads_low_impressions", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow",
                   "pages_per_domain", "pages_new_7d", "page_likes_slope_max",
                   "ads_to_products", "products_with_ads", "ads_not_attached (why)"]
 PAGES_HEADERS = ["store", "page name", "page_id", "first_seen", "active_ads", "last_delivered", "page_likes",
@@ -35,7 +36,8 @@ ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
                    "days_since_created", "created_at", "relaunch",
                    "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
-                   "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d",
+                   "variants_of_family_published_7d", "ads_pointing_here", "ads_delivering", "ads_delivering_7d_ago",
+                   "delivering_velocity_wow", "ads_low_impressions", "concepts_delivering", "ads_launched_7d", "ads_launched_prev_7d",
                    "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d",
                    "engagement_per_day",
                    "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d",
@@ -47,7 +49,8 @@ CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "
                       "store list", "example families"]
 
 EARLY_HEADERS = ["store", "handle", "product family", "days_since_created", "created_at", "relaunch", "days_since_published",
-                 "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d",
+                 "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "concepts_delivering", "ads_pointing_here",
+                 "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d",
                  "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level",
                  "units_per_day_7d", "ads_as_of", "store_badge"]
 EARLY_MAX_AGE_DAYS = 90
@@ -112,11 +115,14 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
         if b["snapshot"]:
             v = ad_metrics.ad_velocity(conn, s["id"], b["snapshot"])
             pm = scaling.store_page_metrics(conn, s["id"], s["store_domain"], b["snapshot"])
-            age = [b["snapshot"], b["active"], v["new_ads_7d"], v["new_ads_prev_7d"], ad_metrics._wow_cell(v["ad_velocity_wow"]),
+            dm = ad_metrics.delivering_metrics(conn, s["id"], b["snapshot"]).get("__store__", {})
+            age = [b["snapshot"], b["active"], _blank(dm.get("ads_delivering")), _blank(dm.get("ads_delivering_7d_ago")),
+                   dm.get("delivering_velocity_wow", ""), _blank(dm.get("ads_low_impressions")),
+                   v["new_ads_7d"], v["new_ads_prev_7d"], ad_metrics._wow_cell(v["ad_velocity_wow"]),
                    _blank(pm["pages_per_domain"]), _blank(pm["pages_new_7d"]), _blank(pm["page_likes_slope_max"]),
                    b["to_products"], b["products"], ad_metrics.breakdown_summary(b)]
         else:
-            age = ["never", "", "", "", "", "", "", "", "", "", ""]
+            age = ["never"] + [""] * 14
         platform = s["platform"] or ""
         if d is None:
             rows.append([s["store_domain"], s["meta_page_name"] or "", platform, status, "", "", "", "", "", "", "", ""] + age)
@@ -221,23 +227,41 @@ def _contexts(conn: sqlite3.Connection, as_of: str | None):
 
 def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     rows = [r for ctx in _contexts(conn, as_of) for r in signals.signals_rows_for_store(ctx)]
-    # what we compare: ads launched this week (desc), then ads pointing here (desc), then youngest product first,
-    # youngest by created_at (published_at resets on every relaunch; created_at never does)
+    # what we compare: ads actually delivering (desc), their week-over-week trend (desc), then launches this week
+    # (testing volume), then youngest product first by created_at (published_at resets on every relaunch)
+    idl, iwow = SIGNALS_HEADERS.index("ads_delivering"), SIGNALS_HEADERS.index("delivering_velocity_wow")
     il, ip = SIGNALS_HEADERS.index("ads_launched_7d"), SIGNALS_HEADERS.index("ads_pointing_here")
     icreated, ipub = SIGNALS_HEADERS.index("days_since_created"), SIGNALS_HEADERS.index("days_since_published")
 
     def key(r):
+        deliv = r[idl] if isinstance(r[idl], int) else -1
+        wow = _wow_value(r[iwow])
         launched = r[il] if isinstance(r[il], int) else -1
         pointing = r[ip] if isinstance(r[ip], int) else -1
         days = r[icreated] if r[icreated] != "" else (r[ipub] if r[ipub] != "" else 10**6)
-        return (-launched, -pointing, days, r[0], r[2])
+        return (-deliv, -wow, -launched, -pointing, days, r[0], r[2])
     rows.sort(key=key)
     return rows
 
 
+def _wow_value(cell) -> float:
+    """Sort value of a week-over-week cell ('' -> -1, 'new' / inf -> very large, '2.1' -> 2.1)."""
+    if cell in ("", None):
+        return -1.0
+    if isinstance(cell, (int, float)):
+        return float(cell)
+    txt = str(cell).strip().lower().rstrip("x")
+    if txt in ("inf", "new", "∞"):
+        return 1e9
+    try:
+        return float(txt)
+    except ValueError:
+        return -1.0
+
+
 def early_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     """The tab a truncating reader can rely on: every product created in the last EARLY_MAX_AGE_DAYS that has at
-    least one ad, youngest (by created_at) first, then most launches this week. A subset of Signals' columns."""
+    least one ad, most delivering ads first, then their week-over-week trend, then youngest. A subset of Signals' columns."""
     H = SIGNALS_HEADERS
     idx = {h: H.index(h) for h in EARLY_HEADERS}
     out = []
@@ -251,7 +275,9 @@ def early_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]
             continue
         out.append([r[idx[h]] for h in EARLY_HEADERS])
     ic, il = EARLY_HEADERS.index("days_since_created"), EARLY_HEADERS.index("ads_launched_7d")
-    out.sort(key=lambda r: (r[ic], -(r[il] if isinstance(r[il], int) else -1), r[0], r[1]))
+    idl, iwow = EARLY_HEADERS.index("ads_delivering"), EARLY_HEADERS.index("delivering_velocity_wow")
+    out.sort(key=lambda r: (-(r[idl] if isinstance(r[idl], int) else -1), -_wow_value(r[iwow]),
+                            -(r[il] if isinstance(r[il], int) else -1), r[ic], r[0], r[1]))
     return out
 
 

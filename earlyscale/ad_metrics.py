@@ -544,8 +544,11 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
 
 
 def delivering(ad: dict) -> bool:
-    """Is this ad delivering today? The single-ad page's end_date (delivery_status) wins when we have it;
-    otherwise presence in the active search results."""
+    """Is this ad delivering today? The 'Low impression count' badge says no whatever else we know; then the
+    single-ad page's end_date (delivery_status) wins when we have it; otherwise presence in the active results.
+    An ad whose payload carried no badge field (low_impressions NULL) counts as delivering."""
+    if ad.get("low_impressions") == 1:
+        return False
     ds = ad.get("delivery_status")
     if ds == "on":
         return True
@@ -560,7 +563,7 @@ def write_concept_rows(conn: sqlite3.Connection, store_id: int, today: str) -> i
     search presence otherwise (survival_source = search)."""
     ads = [dict(r) for r in conn.execute(
         """SELECT a.ad_id, a.concept_id, a.page_name, a.landing_url, a.product_handle, a.page_handle, a.ad_start_date,
-                  a.first_seen_date, a.delivery_status, d.is_active
+                  a.first_seen_date, a.delivery_status, d.is_active, d.low_impressions
            FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id AND d.snapshot_date = ?
            WHERE a.store_id = ? AND COALESCE(a.page_ignored, 0) = 0 AND a.concept_id IS NOT NULL""", (today, store_id))]
     by_c: dict[str, list[dict]] = defaultdict(list)
@@ -571,7 +574,10 @@ def write_concept_rows(conn: sqlite3.Connection, store_id: int, today: str) -> i
         ever = conn.execute("SELECT COUNT(*) FROM meta_ads WHERE concept_id = ?", (cid,)).fetchone()[0] or len(members)
         active = sum(1 for m in members if m["is_active"])
         deliv = sum(1 for m in members if delivering(m))
-        source = "delivery" if any(m.get("delivery_status") for m in members) else "search"
+        if any(m.get("low_impressions") is not None for m in members):
+            source = "badge+delivery" if any(m.get("delivery_status") for m in members) else "badge"
+        else:
+            source = "delivery" if any(m.get("delivery_status") for m in members) else "search"
         launch = min((m["ad_start_date"] or m["first_seen_date"]) for m in members)
         m0 = members[0]
         conn.execute(
@@ -899,6 +905,66 @@ def ad_velocity(conn: sqlite3.Connection, store_id: int, today: str, product_han
     return {"new_ads_7d": new7, "new_ads_prev_7d": prev7, "ad_velocity_wow": wow}
 
 
+def _snapshot_on_or_before(conn: sqlite3.Connection, store_id: int, day: str) -> str | None:
+    return conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ? AND snapshot_date <= ?",
+                        (store_id, day)).fetchone()[0]
+
+
+def delivering_metrics(conn: sqlite3.Connection, store_id: int, today: str) -> dict:
+    """Ads that are actually delivering (active and without the 'Low impression count' badge, and not switched
+    off per the single-ad page), per product handle and for the store ('__store__'):
+      ads_delivering, ads_low_impressions, ads_badge_unknown, ads_delivering_7d_ago, delivering_velocity_wow,
+      concepts_delivering, ads_as_of. The week-ago count uses the nearest snapshot on/before today-7 and the same
+      badge rule; when that day carried no badge data at all the ratio is left blank rather than inflated."""
+    snap = _snapshot_on_or_before(conn, store_id, today)
+    if not snap:
+        return {}
+    prev_day = (date.fromisoformat(snap) - timedelta(days=7)).isoformat()
+    prev = _snapshot_on_or_before(conn, store_id, prev_day)
+
+    def counts(day: str) -> dict[str, dict]:
+        out: dict[str, dict] = defaultdict(lambda: {"active": 0, "delivering": 0, "low": 0, "unknown": 0})
+        for a in conn.execute(
+            """SELECT a.product_handle, a.delivery_status, d.is_active, d.low_impressions
+               FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
+               WHERE d.store_id = ? AND d.snapshot_date = ? AND d.is_active = 1 AND COALESCE(a.page_ignored, 0) = 0""", (store_id, day)):
+            rec = dict(a)
+            for key in (a["product_handle"], "__store__"):
+                if key is None:
+                    continue
+                c = out[key]
+                c["active"] += 1
+                c["low"] += 1 if a["low_impressions"] == 1 else 0
+                c["unknown"] += 1 if a["low_impressions"] is None else 0
+                c["delivering"] += 1 if delivering(rec) else 0
+        return out
+    now = counts(snap)
+    before = counts(prev) if prev and prev != snap else {}
+    prev_has_badge = any(c["low"] or c["unknown"] < c["active"] for c in before.values()) if before else False
+    concepts: dict[str, int] = defaultdict(int)
+    for r in conn.execute("""SELECT product_handle, COUNT(*) n FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ?
+                             AND COALESCE(ads_delivering, ads_active) > 0 GROUP BY product_handle""", (store_id, snap)):
+        concepts[r["product_handle"] or "__none__"] += r["n"]
+        concepts["__store__"] += r["n"]
+    out = {}
+    for key, c in now.items():
+        b = before.get(key)
+        prev_n = b["delivering"] if b else None
+        if prev_n is None:
+            wow = ""
+        elif b["unknown"] == b["active"] and c["unknown"] < c["active"]:
+            wow = ""                          # week-ago rows carried no badge data: not comparable
+        elif prev_n == 0:
+            wow = _wow_cell(float("inf")) if c["delivering"] else ""
+        else:
+            wow = _wow_cell(round(c["delivering"] / prev_n, 2))
+        out[key] = {"ads_delivering": c["delivering"], "ads_low_impressions": c["low"], "ads_badge_unknown": c["unknown"],
+                    "ads_active": c["active"], "ads_delivering_7d_ago": "" if prev_n is None else prev_n,
+                    "delivering_velocity_wow": wow, "concepts_delivering": concepts.get(key, 0), "ads_as_of": snap,
+                    "prev_as_of": prev or ""}
+    return out
+
+
 def _wow_cell(v):
     if v is None:
         return ""
@@ -943,6 +1009,14 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
                     "engagement_per_day": None if r["epd"] is None else round(r["epd"], 1),
                     "eu_reach_slope_7d": None if not r["slope_n"] else round(r["slope"], 1),
                     "comment_delta_1d": None if not r["cdelta_n"] else int(r["cdelta"])})
+    dm = delivering_metrics(conn, store_id, today)
+    for h, m in dm.items():
+        if h == "__store__":
+            continue
+        rec = out.setdefault(h, {"ads_as_of": snap, "ads_pointing_here": 0, "ads_launched_7d": 0, "ads_launched_prev_7d": 0,
+                                 "ad_velocity_wow": "", "days_running_max": None, "engagement_per_day": None, "concept_status": "",
+                                 "eu_reach_slope_7d": None, "comment_delta_1d": None})
+        rec.update({k: m[k] for k in ("ads_delivering", "ads_low_impressions", "ads_delivering_7d_ago", "delivering_velocity_wow", "concepts_delivering")})
     for r in conn.execute(
         """SELECT product_handle, COUNT(*) AS concepts, SUM(COALESCE(ads_delivering, ads_active) > 0) AS alive, MAX(days_running) AS oldest,
                   MAX(CASE WHEN COALESCE(ads_delivering, ads_active) = ads_ever THEN days_running END) AS oldest_intact

@@ -21,12 +21,12 @@
 
 var TABS = {
   Signals: {
-    headers: ["store", "product family", "handle", "channel tag", "days_since_published", "published_at", "days_since_created", "created_at", "relaunch", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"],
-    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 8, 10, 17, 18, 25, 28, 29, 34], position: 1
+    headers: ["store", "product family", "handle", "channel tag", "days_since_published", "published_at", "days_since_created", "created_at", "relaunch", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "ads_low_impressions", "concepts_delivering", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"],
+    keyCols: null, textCols: [0, 1, 2, 3, 5, 7, 8, 10, 17, 22, 23, 30, 33, 34, 39], position: 1
   },
   Early: {
-    headers: ["store", "handle", "product family", "days_since_created", "created_at", "relaunch", "days_since_published", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d", "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level", "units_per_day_7d", "ads_as_of", "store_badge"],
-    keyCols: null, textCols: [0, 1, 2, 4, 5, 10, 15, 17, 21, 22], position: 2
+    headers: ["store", "handle", "product family", "days_since_created", "created_at", "relaunch", "days_since_published", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "concepts_delivering", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d", "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level", "units_per_day_7d", "ads_as_of", "store_badge"],
+    keyCols: null, textCols: [0, 1, 2, 4, 5, 9, 14, 19, 21, 25, 26], position: 2
   },
   Families: {
     headers: ["store", "family", "title", "handles", "newest published_at", "oldest published_at", "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"],
@@ -37,9 +37,9 @@ var TABS = {
     keyCols: null, textCols: [0, 3, 5, 6], position: 4
   },
   Stores: {
-    headers: ["store", "meta page", "platform", "last status", "products", "sold-out variants", "new products 7d", "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date", "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow", "pages_per_domain", "pages_new_7d", "page_likes_slope_max", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
+    headers: ["store", "meta page", "platform", "last status", "products", "sold-out variants", "new products 7d", "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date", "ads_scraped_on", "ads_active", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "ads_low_impressions", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow", "pages_per_domain", "pages_new_7d", "page_likes_slope_max", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
     keyCols: null,                 // fully overwritten each sync
-    textCols: [0, 1, 2, 3, 11, 12, 16, 22],   // keep dates / domains as text, not auto-parsed
+    textCols: [0, 1, 2, 3, 11, 12, 16, 20, 26],   // keep dates / domains as text, not auto-parsed
     position: 5
   },
   Pages: {

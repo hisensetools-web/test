@@ -143,8 +143,11 @@ def make_handler(batches: int, block: bool, landing: str | None = None, handles:
                 pass
             doc = copy.deepcopy(base)
             results = doc["data"]["ad_library_main"]["search_results_connection"]["edges"][0]["node"]["collated_results"]
-            for r in results:
+            for i, r in enumerate(results):
                 r["ad_archive_id"] = str(int(r["ad_archive_id"]) + 100 * cursor)
+                # the 'Low impression count' badge: Meta's exact key is confirmed with `ads-fields`; the fake uses a
+                # plausible boolean so the whole chain (payload -> daily row -> delivering metrics) is exercised
+                r["is_low_impressions"] = (i % 3 == 2)
             doc["data"]["ad_library_main"]["search_results_connection"]["page_info"]["has_next_page"] = cursor + 1 < batches
             # Facebook-style multi-document body: main payload, then a deferred payload line.
             text = json.dumps(doc) + "\n" + json.dumps({"label": "deferred", "data": {}}) + "\n"

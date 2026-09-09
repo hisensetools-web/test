@@ -515,6 +515,35 @@ and bare `/<slug>.html` paths, not only `/products/<handle>`.
 **Radar** classifies any storefront platform, not only Shopify: the Candidates `type` column carries
 the platform name; `funnel` still means no catalogue found anywhere.
 
+## Delivering ads: the "Low impression count" badge
+
+Active is not delivering. Meta marks ads that are running but barely served with a "Low impression
+count" badge on the card; a product with 15 active ads and 11 badges has 4 ads actually spending.
+
+- Every scrape stores the badge per ad per day (`meta_ads_daily.low_impressions`: 1 badge, 0 no badge,
+  NULL the payload carried no such field). The key it was read from is kept on `meta_ads.low_impressions_key`.
+  Meta does not document the field, so the reader accepts any key containing `low_impression` (boolean or
+  label) and any label containing "low impression"; `python tracker.py ads-fields --grep impression` lists
+  the keys your stored payloads actually carry so the match can be confirmed, and `delivering-report` /
+  `ads-metrics` back-fill the badge from stored payloads for ads already scraped.
+- **Delivering** = active, no badge, and not switched off per the single-ad page (`delivery_status`). An
+  ad with no badge field counts as delivering.
+- Per product and per store: `ads_delivering`, `ads_low_impressions`, `ads_delivering_7d_ago` (the nearest
+  snapshot on or before 7 days earlier, same rule), `delivering_velocity_wow` (blank when the week-ago
+  snapshot carried no badge data, so an old scrape does not fake a drop), `concepts_delivering`.
+- Concept survival (`meta_concepts_daily.ads_delivering`, `survival_source` = badge / badge+delivery)
+  counts delivering ads only; `concept_status` on Signals follows.
+- **Ranking:** Signals and Early order by `ads_delivering`, then `delivering_velocity_wow`, then
+  `ads_launched_7d` (testing volume, kept as a secondary column), then youngest by `created_at`. Stores
+  carries the store-level `ads_delivering` / `ads_delivering_7d_ago` / `delivering_velocity_wow` / `ads_low_impressions`.
+
+```powershell
+python tracker.py delivering-report --handle calming-diffuser --handle probiotic-kombucha-gummy
+```
+
+prints, per matching product, active ads vs delivering ads, badge counts, the week-ago count and trend,
+concepts alive before (search presence) and after (delivering), and the active ads with their badge.
+
 ## Scaling columns: pages per domain, landing paths, page-likes slope
 
 Three "is this store scaling" measurements, all derived from ads already in the database (no

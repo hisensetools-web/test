@@ -246,6 +246,54 @@ def extract_post_url(node: dict) -> str | None:
     return None
 
 
+LOW_IMPR_KEY_RE = re.compile(r"low[_\-]?impression", re.I)
+LOW_IMPR_TEXT_RE = re.compile(r"low[ _\-]?impression", re.I)
+
+
+def extract_low_impressions(node: dict, max_depth: int = 6) -> tuple[int | None, str | None]:
+    """The 'Low impression count' badge from an ad's payload: (1 / 0 / None unknown, the key path it came from).
+
+    Meta does not document the field, so this looks for any key containing 'low_impression' (boolean or
+    label) anywhere in the record, then for any string label containing 'low impression'. A record that has
+    neither yields None (unknown), which the metrics treat as delivering. `ads-fields --grep impression` lists
+    the keys a store's payloads actually carry so the match can be confirmed."""
+    found: list[tuple[str, object]] = []
+
+    def walk(o, path, depth):
+        if depth > max_depth:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                kp = f"{path}.{k}" if path else str(k)
+                if LOW_IMPR_KEY_RE.search(str(k)):
+                    found.append((kp, v))
+                elif isinstance(v, str) and LOW_IMPR_TEXT_RE.search(v) and len(v) < 120:
+                    found.append((kp, v))
+                elif isinstance(v, (dict, list)):
+                    walk(v, kp, depth + 1)
+        elif isinstance(o, list):
+            for i, v in enumerate(o[:50]):
+                walk(v, f"{path}[{i}]", depth + 1)
+    walk(node, "", 0)
+    for kp, v in found:
+        if isinstance(v, bool):
+            return (1 if v else 0), kp
+        if isinstance(v, (int, float)):
+            return (1 if v else 0), kp
+        if isinstance(v, str):
+            low = v.strip().lower()
+            if low in ("true", "yes", "1"):
+                return 1, kp
+            if low in ("false", "no", "0", ""):
+                return 0, kp
+            if LOW_IMPR_TEXT_RE.search(v):
+                return 1, kp
+            return 1, kp        # any other label under a low_impression key: the badge is present
+        if isinstance(v, dict) and v:
+            return 1, kp
+    return None, None
+
+
 def normalise_ad(node: dict) -> dict:
     snap = node.get("snapshot") or {}
     cards = snap.get("cards") or []
@@ -280,6 +328,7 @@ def normalise_ad(node: dict) -> dict:
     # Meta gives every ad its own asset URL, so hashing the asset made every fingerprint unique.
     # Hash the copy instead: identical text+headline across ads/pages = same creative concept.
     fp_src = f"{(headline or '').lower().strip()}|{(body_text or '').lower()[:500]}"
+    low_impr, low_key = extract_low_impressions(node)
     social = {}
     for key in ("reactions", "comments", "shares"):
         for cand in (f"{key}_count", key, f"{key[:-1]}_count"):
@@ -317,6 +366,8 @@ def normalise_ad(node: dict) -> dict:
         "comments": social.get("comments"),
         "shares": social.get("shares"),
         "fingerprint": hashlib.sha1(fp_src.encode("utf-8")).hexdigest()[:16],
+        "low_impressions": low_impr,
+        "low_impressions_key": low_key,
         "raw_json": json.dumps(node, ensure_ascii=False)[:20000],
     }
 
@@ -563,22 +614,24 @@ def record_scrape(conn: sqlite3.Connection, store_id: int, snapshot_date: str, a
                      a["landing_url"], a["landing_domain"], a["asset_url"], a["raw_json"], a["ad_id"]))
             conn.execute(
                 """UPDATE meta_ads SET post_url = COALESCE(?, post_url), reach_keys = ?,
-                     engagement_type = CASE WHEN COALESCE(?, post_url) IS NULL THEN 'dark' ELSE 'boosted' END
+                     engagement_type = CASE WHEN COALESCE(?, post_url) IS NULL THEN 'dark' ELSE 'boosted' END,
+                     low_impressions_key = COALESCE(?, low_impressions_key)
                    WHERE ad_id = ?""",
-                (a.get("post_url"), a.get("reach_keys"), a.get("post_url"), a["ad_id"]))
+                (a.get("post_url"), a.get("reach_keys"), a.get("post_url"), a.get("low_impressions_key"), a["ad_id"]))
             prev = conn.execute("SELECT reactions, comments, shares, post_status FROM meta_ads_daily WHERE snapshot_date = ? AND ad_id = ?",
                                 (snapshot_date, a["ad_id"])).fetchone()
             conn.execute(
                 """INSERT OR REPLACE INTO meta_ads_daily
                    (snapshot_date, ad_id, store_id, is_active, position, eu_total_reach, uk_reach, reach_range_lower,
-                    reach_range_upper, reach_source, reactions, comments, shares, post_status, collation_count, fetched_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    reach_range_upper, reach_source, reactions, comments, shares, post_status, collation_count, fetched_at,
+                    low_impressions)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (snapshot_date, a["ad_id"], store_id, a["is_active"], pos, a["eu_total_reach"], a.get("uk_reach"),
                  a.get("reach_range_lower"), a.get("reach_range_upper"), a.get("reach_source"),
                  a["reactions"] if a["reactions"] is not None else (prev["reactions"] if prev else None),
                  a["comments"] if a["comments"] is not None else (prev["comments"] if prev else None),
                  a["shares"] if a["shares"] is not None else (prev["shares"] if prev else None),
-                 prev["post_status"] if prev else None, a["collation_count"], now))
+                 prev["post_status"] if prev else None, a["collation_count"], now, a.get("low_impressions")))
         # ads seen on an earlier day for this store that did not show up today -> inactive row
         gone = [r["ad_id"] for r in conn.execute(
             "SELECT ad_id FROM meta_ads WHERE store_id = ? AND last_seen_date < ?", (store_id, snapshot_date))
@@ -698,3 +751,68 @@ def fetch_boosted_engagement(conn: sqlite3.Connection, browser, store_id: int, s
             (counts.get("reactions"), counts.get("comments"), counts.get("shares"), status, snapshot_date, r["ad_id"]))
     conn.commit()
     return {"candidates": len(rows), "fetched": fetched, "with_counts": ok}
+
+
+def backfill_low_impressions(conn: sqlite3.Connection, store_id: int | None = None) -> dict:
+    """Read the badge out of the stored raw payload for ads whose latest daily row has no value yet (the payload
+    is the one from the ad's last scrape, so only that day's row is filled). Returns counts and the keys seen."""
+    from collections import Counter
+    sql = "SELECT ad_id, last_seen_date, raw_json FROM meta_ads WHERE raw_json IS NOT NULL"
+    args: list = []
+    if store_id is not None:
+        sql += " AND store_id = ?"
+        args.append(store_id)
+    keys: Counter = Counter()
+    n = flagged = unknown = 0
+    for r in conn.execute(sql, args).fetchall():
+        try:
+            node = json.loads(r["raw_json"])
+        except ValueError:
+            continue
+        val, key = extract_low_impressions(node)
+        if val is None:
+            unknown += 1
+            continue
+        keys[key] += 1
+        cur = conn.execute("UPDATE meta_ads_daily SET low_impressions = ? WHERE ad_id = ? AND snapshot_date = ? AND low_impressions IS NULL",
+                           (val, r["ad_id"], r["last_seen_date"]))
+        conn.execute("UPDATE meta_ads SET low_impressions_key = COALESCE(low_impressions_key, ?) WHERE ad_id = ?", (key, r["ad_id"]))
+        n += cur.rowcount
+        flagged += val
+    conn.commit()
+    return {"updated": n, "flagged": flagged, "no_field": unknown, "keys": dict(keys)}
+
+
+def payload_fields(conn: sqlite3.Connection, grep: str, store_id: int | None = None, limit_ads: int = 400) -> dict:
+    """{key path: (count, example value)} over stored payloads for keys matching `grep` (case-insensitive).
+    The way to find out what Meta calls a badge before hard-coding it."""
+    rx = re.compile(grep, re.I)
+    sql = "SELECT raw_json FROM meta_ads WHERE raw_json IS NOT NULL"
+    args: list = []
+    if store_id is not None:
+        sql += " AND store_id = ?"
+        args.append(store_id)
+    sql += " ORDER BY last_seen_date DESC LIMIT ?"
+    args.append(limit_ads)
+    out: dict[str, list] = {}
+
+    def walk(o, path, depth):
+        if depth > 7:
+            return
+        if isinstance(o, dict):
+            for k, v in o.items():
+                kp = f"{path}.{k}" if path else str(k)
+                if rx.search(str(k)) or (isinstance(v, str) and rx.search(v) and len(v) < 120):
+                    rec = out.setdefault(kp, [0, v if not isinstance(v, (dict, list)) else json.dumps(v)[:80]])
+                    rec[0] += 1
+                if isinstance(v, (dict, list)):
+                    walk(v, kp, depth + 1)
+        elif isinstance(o, list):
+            for v in o[:20]:
+                walk(v, path + "[]", depth + 1)
+    for r in conn.execute(sql, args):
+        try:
+            walk(json.loads(r["raw_json"]), "", 0)
+        except ValueError:
+            continue
+    return {k: (v[0], v[1]) for k, v in sorted(out.items(), key=lambda kv: -kv[1][0])}

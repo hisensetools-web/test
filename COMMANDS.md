@@ -82,6 +82,8 @@ python tracker.py ads-detail-report --days 7  # delivery (end_date) per day, pag
 python tracker.py inventory-report --raw      # stock readings per hero variant, fallback rung per store
 python tracker.py fb-report                   # captured Sponsored posts, matches, reactions over time
 python tracker.py radar-report                # hook phrases by yield, radar totals, recent searches, Candidates
+python tracker.py delivering-report --handle <handle>   # active vs delivering ads (low-impression badge) for a product, before/after
+python tracker.py ads-fields --grep impression          # which payload keys carry the badge (confirm Meta's field name)
 ```
 
 Alerts also land in `alerts\YYYY-MM-DD.md` and the Alerts tab.

@@ -1234,6 +1234,87 @@ def cmd_ads(args) -> int:
     return 1 if ok == 0 and failed else 0
 
 
+def cmd_ads_fields(args) -> int:
+    """Which keys the stored ad payloads carry that match --grep (to confirm what Meta calls a badge)."""
+    conn = db.connect(args.db)
+    sid = None
+    if args.store:
+        row = conn.execute("SELECT id FROM stores WHERE store_domain = ?", (args.store,)).fetchone()
+        if not row:
+            console.print(f"[red]unknown store[/] {args.store}")
+            return 2
+        sid = row["id"]
+    fields = meta_ads.payload_fields(conn, args.grep, sid, args.limit)
+    if not fields:
+        console.print(f"no key or label matching /{args.grep}/ in the last {args.limit} stored payloads")
+        return 1
+    t = Table(title=f"payload keys matching /{args.grep}/ (last {args.limit} ads{' of ' + args.store if args.store else ''})")
+    for c in ("key path", "ads", "example value"):
+        t.add_column(c, justify="right" if c == "ads" else "left")
+    for k, (n, ex) in list(fields.items())[:40]:
+        t.add_row(k, str(n), str(ex)[:70])
+    console.print(t)
+    return 0
+
+
+def cmd_delivering_report(args) -> int:
+    """Before/after for the delivering metric: active ads (old ranking) vs ads without the low-impression badge."""
+    conn = db.connect(args.db)
+    bf = meta_ads.backfill_low_impressions(conn)
+    console.print(f"badge backfill from stored payloads: {bf['updated']} daily rows filled, {bf['flagged']} flagged low, "
+                  f"{bf['no_field']} payloads without a badge field" + (f"; keys: {bf['keys']}" if bf["keys"] else ""))
+    like = [f"%{h}%" for h in args.handle] if args.handle else ["%"]
+    rows = []
+    for pat in like:
+        for r in conn.execute("""SELECT DISTINCT s.id AS store_id, s.store_domain, a.product_handle FROM meta_ads a JOIN stores s ON s.id = a.store_id
+                                 WHERE a.product_handle LIKE ? AND (? IS NULL OR s.store_domain LIKE ?) ORDER BY s.store_domain, a.product_handle""",
+                              (pat, args.store, f"%{args.store}%" if args.store else None)):
+            rows.append(dict(r))
+    if not rows:
+        console.print("no products match; the handle must be one an ad resolved to (see the Signals tab)")
+        return 1
+    seen = set()
+    for r in rows:
+        key = (r["store_id"], r["product_handle"])
+        if key in seen:
+            continue
+        seen.add(key)
+        snap = ad_metrics._snapshot_on_or_before(conn, r["store_id"], _parse_date(args.date) if args.date else "9999")
+        if not snap:
+            continue
+        ad_metrics.write_concept_rows(conn, r["store_id"], snap)          # survival recomputed on delivering ads
+        conn.commit()
+        dm = ad_metrics.delivering_metrics(conn, r["store_id"], snap).get(r["product_handle"], {})
+        cs = conn.execute("""SELECT COUNT(*) n, SUM(ads_active > 0) alive_search, SUM(COALESCE(ads_delivering, ads_active) > 0) alive_deliv
+                             FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ? AND product_handle = ?""",
+                          (r["store_id"], snap, r["product_handle"])).fetchone()
+        t = Table(title=f"{_short(r['store_domain'])} / {r['product_handle']}  (ads as of {snap}; week-ago snapshot {dm.get('prev_as_of') or 'none'})")
+        for c in ("metric", "before (active ads)", "after (delivering)"):
+            t.add_column(c)
+        t.add_row("ads", str(dm.get("ads_active", 0)), str(dm.get("ads_delivering", 0)))
+        t.add_row("of which low-impression badge", "-", str(dm.get("ads_low_impressions", 0)))
+        t.add_row("of which badge unknown (no field in payload)", "-", str(dm.get("ads_badge_unknown", 0)))
+        t.add_row("7 days ago", "-", str(dm.get("ads_delivering_7d_ago", "")))
+        t.add_row("week over week", "-", str(dm.get("delivering_velocity_wow", "")))
+        t.add_row("concepts alive / total", f"{cs['alive_search'] or 0}/{cs['n'] or 0}", f"{cs['alive_deliv'] or 0}/{cs['n'] or 0}")
+        console.print(t)
+        ads = conn.execute("""SELECT a.ad_id, a.ad_start_date, a.delivery_status, d.is_active, d.low_impressions, a.low_impressions_key, a.concept_id
+                              FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id AND d.snapshot_date = ?
+                              WHERE a.store_id = ? AND a.product_handle = ? AND d.is_active = 1
+                              ORDER BY d.low_impressions IS NULL, d.low_impressions, a.ad_start_date DESC LIMIT ?""",
+                           (snap, r["store_id"], r["product_handle"], args.limit)).fetchall()
+        t2 = Table(title=f"active ads for {r['product_handle']} (first {args.limit})")
+        for c in ("ad_id", "started", "badge", "badge key", "delivery (end_date)", "concept", "delivering"):
+            t2.add_column(c)
+        for a in ads:
+            badge = {1: "LOW", 0: "no"}.get(a["low_impressions"], "?")
+            t2.add_row(a["ad_id"], a["ad_start_date"] or "", badge, (a["low_impressions_key"] or "")[:28], a["delivery_status"] or "",
+                       (a["concept_id"] or "")[:10], "yes" if ad_metrics.delivering(dict(a)) else "no")
+        console.print(t2)
+    console.print("Signals and Early now rank on ads_delivering; run `python tracker.py sync-sheets` to push the recomputed columns.")
+    return 0
+
+
 def cmd_ads_metrics(args) -> int:
     """Recompute the landing join / concepts / lineage / alerts from stored ads (no scraping)."""
     snapshot_date = _parse_date(args.date) if args.date else None
@@ -1251,6 +1332,9 @@ def cmd_ads_metrics(args) -> int:
         stores = [s for s in stores if s["store_domain"] in set(args.only)]
     console.print(f"ads-metrics: snapshot_date={snapshot_date} stores={len(stores)} fetch_landings={not args.no_fetch} "
                   f"posts={args.posts}")
+    bf = meta_ads.backfill_low_impressions(conn)
+    if bf["updated"]:
+        console.print(f"low-impression badge filled from stored payloads for {bf['updated']} ad-day(s) ({bf['flagged']} flagged)")
     browser = pw = None
     if args.posts:
         from playwright.sync_api import sync_playwright
@@ -1704,6 +1788,19 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("fb-report", help="captured posts, matches and count history")
     s.add_argument("--date"); s.add_argument("--limit", type=int, default=60)
     s.set_defaults(fn=cmd_fb_report)
+
+    s = sub.add_parser("ads-fields", help="which keys the stored ad payloads carry that match --grep (find what Meta calls a badge)")
+    s.add_argument("--grep", default="impression")
+    s.add_argument("--store")
+    s.add_argument("--limit", type=int, default=400, help="most recently seen ads to scan")
+    s.set_defaults(fn=cmd_ads_fields)
+
+    s = sub.add_parser("delivering-report", help="before/after: active ads vs ads delivering (no low-impression badge) per product")
+    s.add_argument("--handle", action="append", help="product handle (substring); repeatable")
+    s.add_argument("--store")
+    s.add_argument("--date")
+    s.add_argument("--limit", type=int, default=20)
+    s.set_defaults(fn=cmd_delivering_report)
 
     s = sub.add_parser("ads-report", help="per-page status, products by ads, concepts, lineage, alerts (--raw for ad rows)")
     s.add_argument("--date", help="snapshot date (default: latest)")

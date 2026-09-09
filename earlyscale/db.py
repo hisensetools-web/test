@@ -432,7 +432,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
                      ("detail_fetched_date", "TEXT"), ("page_profile_id", "TEXT"), ("page_categories", "TEXT"),
                      ("creative_hash", "TEXT"), ("lineage_via", "TEXT"),
                      # part 2 (B): matched feed post and its latest counts
-                     ("post_id", "TEXT"), ("post_permalink", "TEXT")],
+                     ("post_id", "TEXT"), ("post_permalink", "TEXT"), ("low_impressions_key", "TEXT")],
         "meta_concepts_daily": [("ads_delivering", "INTEGER"), ("survival_source", "TEXT")],
         "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
                           ("store_domain", "TEXT")],
@@ -443,7 +443,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "variants_daily": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT"), ("stock", "INTEGER")],
         "products_daily": [("unlisted", "INTEGER DEFAULT 0"), ("url_path", "TEXT")],
         "hero_variants": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
-        "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
+        "meta_ads_daily": [("low_impressions", "INTEGER"),   # 1 = 'Low impression count' badge on the card, 0 = no badge, NULL = unknown
+                           ("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
                            ("engagement_per_day", "REAL"),
                            # reach curve (EU exact, UK exact or range) and the comment curve
                            ("uk_reach", "INTEGER"), ("reach_range_lower", "INTEGER"), ("reach_range_upper", "INTEGER"),
