@@ -99,10 +99,11 @@ class UploadFlowTests(unittest.TestCase):
         self.assertTrue(all(m["mediaContentType"] == "IMAGE" for m in create_media["media"]))
 
     def test_missing_credentials_is_a_clear_error(self):
-        with self.assertRaises(SystemExit):
-            shopify_admin.ShopifyAdmin(store="", token="")
-        with self.assertRaises(SystemExit):
-            shopify_admin.ShopifyAdmin(store="x.myshopify.com", token="", client_id="", client_secret="")
+        with mock.patch.multiple(shopify_admin.config, SHOPIFY_STORE="", SHOPIFY_ADMIN_TOKEN="", SHOPIFY_CLIENT_ID="", SHOPIFY_CLIENT_SECRET=""):
+            with self.assertRaises(SystemExit):
+                shopify_admin.ShopifyAdmin(store="", token="")
+            with self.assertRaises(SystemExit):
+                shopify_admin.ShopifyAdmin(store="x.myshopify.com", token="", client_id="", client_secret="")
 
     def test_client_credentials_mints_caches_and_reports_scopes(self):
         with tempfile.TemporaryDirectory() as d:
