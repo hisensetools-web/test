@@ -520,12 +520,14 @@ the platform name; `funnel` still means no catalogue found anywhere.
 Active is not delivering. Meta marks ads that are running but barely served with a "Low impression
 count" badge on the card; a product with 15 active ads and 11 badges has 4 ads actually spending.
 
-- Every scrape stores the badge per ad per day (`meta_ads_daily.low_impressions`: 1 badge, 0 no badge,
-  NULL the payload carried no such field). The key it was read from is kept on `meta_ads.low_impressions_key`.
-  Meta does not document the field, so the reader accepts any key containing `low_impression` (boolean or
-  label) and any label containing "low impression"; `python tracker.py ads-fields --grep impression` lists
-  the keys your stored payloads actually carry so the match can be confirmed, and `delivering-report` /
-  `ads-metrics` back-fill the badge from stored payloads for ads already scraped.
+- The search payload carries no badge field (`ads-fields --grep impression` on 51,000 stored payloads
+  found only the EU `impressions_with_index` block, empty for worldwide views), so the badge is read from
+  the rendered card: after the scroll loop (and every 5 scrolls) the scraper walks every card with a
+  "Library ID" line and records whether its text shows "Low impression count". Stored per ad per day
+  (`meta_ads_daily.low_impressions`: 1 badge, 0 card seen without it, NULL not seen), key
+  `card:Low impression count` on `meta_ads.low_impressions_key`. A payload key containing
+  `low_impression` is still honoured if Meta ever adds one. Ads scraped before this cannot be back-filled:
+  the badge starts with the next Meta pass.
 - **Delivering** = active, no badge, and not switched off per the single-ad page (`delivery_status`). An
   ad with no badge field counts as delivering.
 - Per product and per store: `ads_delivering`, `ads_low_impressions`, `ads_delivering_7d_ago` (the nearest
@@ -552,9 +554,12 @@ and stores each ad's 1-based position as `meta_ads_daily.impression_rank` for th
 
 **Is the sort informative?** For every store the sorted order is compared with the newest-first order of
 the same day (`rank_checks`: first `META_RANK_MIN_COMPARE` (20) ids, how many sit in the same position).
-Identical orders mean the sort carries no information for that store: `stores.sort_informative` = false
-(shown on the Stores tab), the store is re-checked weekly instead of daily, and its rank columns stay
-blank. `python tracker.py rank-check --only a.com b.com c.com d.com e.com` does the comparison for a few
+In the worldwide view Meta ignored the sort for all five stores checked (20/20 ids in the same position):
+impressions are only published for EU delivery. So the search is tried per country view in
+`META_RANK_COUNTRIES` (default `ALL,DE,NL`) and the first informative one is kept (`rank_checks.country`).
+Identical orders everywhere mean the sort carries no information for that store: `stores.sort_informative`
+= false (shown on the Stores tab), the store is re-checked weekly instead of daily, and its rank columns
+stay blank. `python tracker.py rank-check --only a.com b.com c.com d.com e.com` does the comparison for a few
 stores on demand and prints the verdict per store.
 
 Derived per ad: `rank_7d_ago`, `rank_delta_7d` (negative = climbing), `top5_days` (days the ad held a

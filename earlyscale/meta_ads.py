@@ -465,6 +465,7 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
     max_ads = config.META_MAX_ADS if max_ads is None else max_ads
     result = ScrapeResult(url=url)
     nodes: dict[str, dict] = {}
+    dom_badges: dict[str, bool] = {}
 
     def ingest(text: str) -> int:
         before = len(nodes)
@@ -512,6 +513,11 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
                 before = len(nodes)
                 page.evaluate("() => window.scrollTo(0, (document.scrollingElement || document.body || document.documentElement || {scrollHeight: 100000}).scrollHeight)")
                 result.scrolls += 1
+                if result.scrolls % 5 == 0:
+                    try:
+                        dom_badges.update(read_card_badges(page))
+                    except Exception:  # noqa: BLE001
+                        pass
                 _wait()
                 if (i + 1) % 5 == 0:
                     log.info("%s: scroll %d/%d, %d ads so far", _short(url), i + 1, max_scrolls, len(nodes))
@@ -527,6 +533,11 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
                     break
             else:
                 result.note = f"hit max_scrolls={max_scrolls}"
+            try:
+                page.wait_for_timeout(1500)            # let the last batch of cards render before the final read
+                dom_badges.update(read_card_badges(page))
+            except Exception as e:  # noqa: BLE001
+                log.debug("%s: card badge read failed: %s", _short(url), e)
         except PWTimeout as e:
             raise MetaScrapeError(f"navigation timeout: {e}") from None
         finally:
@@ -542,9 +553,55 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
             finally:
                 b.close()
     result.ads = [normalise_ad(n) for n in nodes.values()]
+    apply_card_badges(result.ads, dom_badges)
     if result.blocked:
         raise MetaBlocked(result.note or "blocked")
     return result
+
+
+CARD_BADGE_JS = """() => {
+  // Every result card carries a 'Library ID: <id>' line. Walk up from that text to the card container and
+  // report whether the card's text shows the 'Low impression count' badge.
+  const out = {};
+  const rx = /Library ID:?\s*(\d{3,20})/i;
+  const badge = /low[ _-]?impression/i;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  let node;
+  while ((node = walker.nextNode())) {
+    const m = rx.exec(node.nodeValue || "");
+    if (!m) continue;
+    let el = node.parentElement, card = null;
+    for (let i = 0; i < 14 && el && el !== document.body; i++, el = el.parentElement) {
+      const t = el.innerText || "";
+      const ids = (t.match(/Library ID/gi) || []).length;
+      if (ids > 1) break;                               // climbed past this card into the list
+      if (el.getBoundingClientRect().height >= 200 || /Sponsored/i.test(t)) card = el;
+    }
+    const text = (card || node.parentElement).innerText || "";
+    const id = m[1];
+    out[id] = out[id] || badge.test(text);
+  }
+  return out;
+}"""
+
+
+def read_card_badges(page) -> dict[str, bool]:
+    """{ad_id: has 'Low impression count' badge} for every result card rendered on the page."""
+    got = page.evaluate(CARD_BADGE_JS) or {}
+    return {str(k): bool(v) for k, v in got.items()}
+
+
+def apply_card_badges(ads: list[dict], badges: dict[str, bool]) -> int:
+    """The card wins over the payload (which has no badge field): 1 with the badge, 0 for a card seen without it."""
+    n = 0
+    for a in ads:
+        v = badges.get(str(a.get("ad_id")))
+        if v is None:
+            continue
+        a["low_impressions"] = 1 if v else 0
+        a["low_impressions_key"] = "card:Low impression count"
+        n += 1
+    return n
 
 
 def _short(url: str) -> str:
@@ -620,7 +677,7 @@ def record_scrape(conn: sqlite3.Connection, store_id: int, snapshot_date: str, a
                      low_impressions_key = COALESCE(?, low_impressions_key)
                    WHERE ad_id = ?""",
                 (a.get("post_url"), a.get("reach_keys"), a.get("post_url"), a.get("low_impressions_key"), a["ad_id"]))
-            prev = conn.execute("SELECT reactions, comments, shares, post_status FROM meta_ads_daily WHERE snapshot_date = ? AND ad_id = ?",
+            prev = conn.execute("SELECT reactions, comments, shares, post_status, low_impressions, impression_rank FROM meta_ads_daily WHERE snapshot_date = ? AND ad_id = ?",
                                 (snapshot_date, a["ad_id"])).fetchone()
             conn.execute(
                 """INSERT OR REPLACE INTO meta_ads_daily
@@ -633,7 +690,11 @@ def record_scrape(conn: sqlite3.Connection, store_id: int, snapshot_date: str, a
                  a["reactions"] if a["reactions"] is not None else (prev["reactions"] if prev else None),
                  a["comments"] if a["comments"] is not None else (prev["comments"] if prev else None),
                  a["shares"] if a["shares"] is not None else (prev["shares"] if prev else None),
-                 prev["post_status"] if prev else None, a["collation_count"], now, a.get("low_impressions")))
+                 prev["post_status"] if prev else None, a["collation_count"], now,
+                 a.get("low_impressions") if a.get("low_impressions") is not None else (prev["low_impressions"] if prev else None)))
+            if prev and prev["impression_rank"] is not None:
+                conn.execute("UPDATE meta_ads_daily SET impression_rank = ? WHERE snapshot_date = ? AND ad_id = ?",
+                             (prev["impression_rank"], snapshot_date, a["ad_id"]))
         # ads seen on an earlier day for this store that did not show up today -> inactive row
         gone = [r["ad_id"] for r in conn.execute(
             "SELECT ad_id FROM meta_ads WHERE store_id = ? AND last_seen_date < ?", (store_id, snapshot_date))

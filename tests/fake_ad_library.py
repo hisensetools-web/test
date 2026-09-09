@@ -33,7 +33,9 @@ async function load() {
   const first = JSON.parse(text.split('\\n')[0]);
   const ads = [];
   (function walk(o){ if (o && typeof o === 'object') { if (o.ad_archive_id) ads.push(o); else Object.values(o).forEach(walk); } })(first);
-  for (const a of ads) { const d = document.createElement('div'); d.className = 'ad'; d.textContent = a.ad_archive_id + ' ' + (a.snapshot.body && a.snapshot.body.text || ''); document.getElementById('list').appendChild(d); }
+  for (const a of ads) { const d = document.createElement('div'); d.className = 'ad';
+    d.innerHTML = '<div>Sponsored</div><div>Library ID: ' + a.ad_archive_id + '</div>' + (a.is_low_impressions ? '<div><span>Low impression count</span></div>' : '') + '<div>' + (a.snapshot.body && a.snapshot.body.text || '') + '</div>';
+    document.getElementById('list').appendChild(d); }
   batch += 1; if (!first.data.ad_library_main.search_results_connection.page_info.has_next_page) done = true;
   loading = false;
 }

@@ -1270,7 +1270,7 @@ def cmd_rank_check(args) -> int:
         console.print("[red]no stores selected[/]")
         return 2
     t = Table(title="impressions sort vs newest first")
-    for c in ("store", "query", "newest", "sorted", "compared", "same position", "sort_informative", "top 3 by impressions"):
+    for c in ("store", "query", "newest", "sorted", "compared", "same position", "sort_informative", "country", "top 3 by impressions"):
         t.add_column(c, justify="right" if c in ("newest", "sorted", "compared", "same position") else "left")
     with sync_playwright() as pw, meta_ads.KeepAwake():
         handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
@@ -1291,17 +1291,17 @@ def cmd_rank_check(args) -> int:
                     console.print(f"[red]{s['store_domain']}: blocked ({e}); stopping[/]")
                     break
                 except Exception as e:  # noqa: BLE001
-                    t.add_row(_short(s["store_domain"]), query, "", "", "", "", f"error: {str(e)[:40]}", "")
+                    t.add_row(_short(s["store_domain"]), query, "", "", "", "", f"error: {str(e)[:40]}", "", "")
                     continue
                 top = [r[0] for r in conn.execute("SELECT ad_id FROM meta_ads_daily WHERE store_id = ? AND snapshot_date = ? AND impression_rank IS NOT NULL ORDER BY impression_rank LIMIT 3", (sid, today))]
                 t.add_row(_short(s["store_domain"]), query[:24], str(len(base.ads)), str(rk["ranked"]), str(rk["n"]), str(rk["same_position"]),
-                          "[green]true[/]" if rk["informative"] else "[red]false[/]" if rk["informative"] is not None else "?", ", ".join(top))
+                          "[green]true[/]" if rk["informative"] else "[red]false[/]" if rk["informative"] is not None else "?", rk.get("country", ""), ", ".join(top))
                 _post_process_store(conn, sid, s["store_domain"], today, shopify.make_session(), fetch_landings=False)
         finally:
             handle.close()
     console.print(t)
-    console.print("false = the impressions-sorted search returned the same ads in the same order as newest-first: the sort carries no "
-                  "information for that store, and it is re-checked weekly instead of daily.")
+    console.print("false = every country view tried (META_RANK_COUNTRIES) returned the same ads in the same order as newest-first: the sort "
+                  "carries no information for that store, and it is re-checked weekly instead of daily. country = the view whose ranks were kept.")
     return 0
 
 

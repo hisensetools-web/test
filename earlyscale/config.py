@@ -76,6 +76,7 @@ LANDING_REFRESH_DAYS = int(os.environ.get("LANDING_REFRESH_DAYS", "7"))  # re-fe
 META_MAX_POSTS = int(os.environ.get("META_MAX_POSTS", "25"))     # boosted posts to fetch per store per run
 META_RANK = os.environ.get("META_RANK", "1").strip() not in ("0", "false", "no")   # impressions-sorted search per store per day
 META_RANK_SCROLLS = int(os.environ.get("META_RANK_SCROLLS", "8"))          # ~150 ads: only the top ranks matter
+META_RANK_COUNTRIES = [c.strip().upper() for c in os.environ.get("META_RANK_COUNTRIES", "ALL,DE,NL").split(",") if c.strip()]  # views tried until the sort is informative
 META_RANK_MIN_COMPARE = int(os.environ.get("META_RANK_MIN_COMPARE", "20")) # ids compared to decide whether the sort is informative
 META_DETAIL_MAX = int(os.environ.get("META_DETAIL_MAX", "30"))       # single-ad pages per store per day (~2.5 min)
 META_DETAIL_LIGHT = os.environ.get("META_DETAIL_LIGHT", "1").strip() not in ("0", "false", "no")   # block images/media/fonts/css/external js on single-ad pages

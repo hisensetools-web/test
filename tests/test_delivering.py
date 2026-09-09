@@ -31,6 +31,23 @@ class ExtractTests(unittest.TestCase):
         self.assertEqual((a["low_impressions"], a["low_impressions_key"]), (1, "is_low_impressions"))
 
 
+class CardBadgeTests(unittest.TestCase):
+    def test_card_badges_override_payload_and_survive_a_second_scrape(self):
+        ads = [{"ad_id": "1", "low_impressions": None}, {"ad_id": "2", "low_impressions": None}, {"ad_id": "3", "low_impressions": None}]
+        n = meta_ads.apply_card_badges(ads, {"1": True, "2": False})
+        self.assertEqual(n, 2)
+        self.assertEqual([a["low_impressions"] for a in ads], [1, 0, None])
+        self.assertEqual(ads[0]["low_impressions_key"], "card:Low impression count")
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        first = _ad("1", "B", "2026-09-01", "https://x.com/products/p", "c")
+        first["low_impressions"] = 1
+        meta_ads.record_scrape(conn, sid, TODAY, [first], "q")
+        again = _ad("1", "B", "2026-09-01", "https://x.com/products/p", "c")     # e.g. the impressions-sorted pass: no card read
+        meta_ads.record_scrape(conn, sid, TODAY, [again], "rank:q")
+        self.assertEqual(conn.execute("SELECT low_impressions FROM meta_ads_daily WHERE ad_id = '1'").fetchone()[0], 1)
+
+
 class DeliveringRuleTests(unittest.TestCase):
     def test_badge_beats_everything(self):
         self.assertFalse(ad_metrics.delivering({"is_active": 1, "delivery_status": "on", "low_impressions": 1}))

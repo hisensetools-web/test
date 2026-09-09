@@ -34,12 +34,12 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
-def rank_url(store: dict) -> tuple[str, str]:
-    """(url, query) for the store's Ad Library search sorted by impressions."""
+def rank_url(store: dict, country: str = "ALL") -> tuple[str, str]:
+    """(url, query) for the store's Ad Library search sorted by impressions, for one country view."""
     domain = store["store_domain"]
     query = store.get("meta_page_name") or domain.split("//")[-1]
     url = meta_ads.build_search_url(query=None if store.get("meta_page_id") else query, page_id=store.get("meta_page_id") or None,
-                                    sort="impressions")
+                                    sort="impressions", country=country)
     return url, query
 
 
@@ -80,15 +80,27 @@ def record_ranks(conn: sqlite3.Connection, store_id: int, today: str, sorted_ads
 
 
 def scrape_ranks(conn: sqlite3.Connection, browser, store: dict, store_id: int, today: str, default_ids: list[str],
-                 max_scrolls: int | None = None) -> dict:
-    """Run the impressions-sorted search for one store and record ranks + the comparison with the default order."""
-    url, query = rank_url(store)
-    res = meta_ads.scrape_page(url, max_scrolls=max_scrolls or config.META_RANK_SCROLLS, browser=browser)
-    if res.blocked:
-        raise meta_ads.MetaBlocked(res.note)
-    out = record_ranks(conn, store_id, today, res.ads, query, default_ids)
-    out["note"] = res.note
-    return out
+                 max_scrolls: int | None = None, countries: list[str] | None = None) -> dict:
+    """Run the impressions-sorted search for one store and record ranks + the comparison with the default order.
+    Meta ignores the sort in the worldwide view for most commercial ads (impressions are only published for EU
+    delivery), so when the order comes back identical the search is repeated per country in META_RANK_COUNTRIES
+    (EU views) and the first informative one is kept."""
+    countries = countries or config.META_RANK_COUNTRIES
+    last = None
+    for country in countries:
+        url, query = rank_url(store, country)
+        res = meta_ads.scrape_page(url, max_scrolls=max_scrolls or config.META_RANK_SCROLLS, browser=browser)
+        if res.blocked:
+            raise meta_ads.MetaBlocked(res.note)
+        out = record_ranks(conn, store_id, today, res.ads, query, default_ids)
+        out["note"], out["country"] = res.note, country
+        conn.execute("UPDATE rank_checks SET country = ? WHERE store_id = ? AND snapshot_date = ?", (country, store_id, today))
+        conn.commit()
+        last = out
+        if out["informative"] or not res.ads:
+            break
+        meta_ads._wait()
+    return last
 
 
 def sort_informative(conn: sqlite3.Connection, store_id: int) -> int | None:
