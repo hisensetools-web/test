@@ -280,6 +280,41 @@ def cmd_prune_dead(args) -> int:
     return 0
 
 
+def cmd_restore_stores(args) -> int:
+    """Put stores that are in the database but no longer in watchlist.csv back on it (undo of prune-dead / remove-store)."""
+    conn = db.connect(args.db)
+    wl_path = Path(args.watchlist) if args.watchlist else None
+    listed = {s["store_domain"] for s in read_watchlist(wl_path)}
+    rows = [dict(r) for r in conn.execute("SELECT store_domain, meta_page_name, meta_page_id, notes, platform FROM stores ORDER BY store_domain")
+            if r["store_domain"] not in listed]
+    if args.domains:
+        want = {d.strip().lower() for d in args.domains}
+        rows = [r for r in rows if r["store_domain"] in want or r["store_domain"].replace("www.", "") in want]
+    if not rows:
+        console.print("nothing to restore: every store in the database is on the watchlist")
+        return 0
+    t = Table(title=f"{len(rows)} store(s) in the database but not on the watchlist")
+    for c in ("store", "meta page", "platform", "notes"):
+        t.add_column(c)
+    for r in rows:
+        t.add_row(r["store_domain"], r["meta_page_name"] or "", r["platform"] or "", (r["notes"] or "")[:40])
+    console.print(t)
+    if not args.apply:
+        console.print("dry run: add --apply to put them back (or name domains: restore-stores --apply x.com y.com)")
+        return 0
+    n = 0
+    for r in rows:
+        if append_to_watchlist({"store_domain": r["store_domain"], "meta_page_name": r["meta_page_name"] or "",
+                                "meta_page_id": r["meta_page_id"] or "", "notes": r["notes"] or ""}, wl_path):
+            n += 1
+    conn.execute("UPDATE stores SET platform = NULL, platform_checked_at = NULL WHERE store_domain IN (%s)" % ",".join("?" * len(rows)),
+                 [r["store_domain"] for r in rows])
+    conn.commit()
+    console.print(f"[green]restored {n} store(s)[/]; their platform is detected afresh on the next run "
+                  "(python tracker.py run --only <domains> to do it now)")
+    return 0
+
+
 def brand_query(domain: str) -> str:
     """'tryhappyharvest.com' -> 'happyharvest': the label without shop/try/get prefixes, for an Ad Library search."""
     label = re.sub(r"^https?://", "", domain).split("/")[0].lower()
@@ -1702,6 +1737,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--apply", action="store_true", help="remove them from watchlist.csv (history in the DB is kept)")
     s.add_argument("--watchlist")
     s.set_defaults(fn=cmd_prune_dead)
+
+    s = sub.add_parser("restore-stores", help="put stores that are in the database but not on the watchlist back (undo prune-dead / remove-store)")
+    s.add_argument("domains", nargs="*", help="only these (default: every store missing from the watchlist)")
+    s.add_argument("--apply", action="store_true")
+    s.add_argument("--watchlist")
+    s.set_defaults(fn=cmd_restore_stores)
 
     s = sub.add_parser("find-page", help="find a store's Facebook page: footer link, then an Ad Library search for the brand; --set N saves it")
     s.add_argument("domain")

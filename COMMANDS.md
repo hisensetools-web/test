@@ -125,6 +125,7 @@ python tracker.py add-store pipitea.com                # use the apex domain eve
 python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
 python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad (dead / non-Shopify)
 python tracker.py prune-dead --apply                   # ...and remove them from the watchlist
+python tracker.py restore-stores --apply               # put removed stores back (all of them, or name domains after --apply)
 python tracker.py find-page tryhappyharvest.com        # find the store's Facebook page (footer, then Ad Library search); shows candidates
 python tracker.py find-page tryhappyharvest.com --set 1   # save candidate 1;  --query "Happy Harvest" to search another name
 python tracker.py set-page getdovi.com --name "Dovi" --page-id 1234567890   # set it by hand

@@ -25,6 +25,28 @@ class DeadStoreTests(unittest.TestCase):
         self.assertEqual((got[0]["runs"], got[0]["last_error"][:8]), (1, "HTTP 404"))
 
 
+class RestoreStoresTests(unittest.TestCase):
+    def test_restore_puts_db_stores_back_on_the_watchlist(self):
+        import argparse
+        with tempfile.TemporaryDirectory() as d:
+            wl = Path(d) / "w.csv"
+            append_to_watchlist({"store_domain": "kept.com"}, wl)
+            dbp = Path(d) / "t.db"
+            conn = db.connect(dbp)
+            db.upsert_store(conn, "kept.com")
+            db.upsert_store(conn, "gone.com", "Gone Page", None, "was pruned")
+            conn.execute("UPDATE stores SET platform = 'generic', platform_checked_at = '2026-09-01' WHERE store_domain = 'gone.com'")
+            conn.commit()
+            conn.close()
+            args = argparse.Namespace(db=dbp, watchlist=str(wl), domains=[], apply=True)
+            self.assertEqual(cli.cmd_restore_stores(args), 0)
+            rows = {r["store_domain"]: r for r in read_watchlist(wl)}
+            self.assertEqual(sorted(rows), ["gone.com", "kept.com"])
+            self.assertEqual((rows["gone.com"]["meta_page_name"], rows["gone.com"]["notes"]), ("Gone Page", "was pruned"))
+            conn = db.connect(dbp)
+            self.assertIsNone(conn.execute("SELECT platform FROM stores WHERE store_domain = 'gone.com'").fetchone()[0])   # re-detected next run
+
+
 class PageFinderTests(unittest.TestCase):
     def test_brand_query_strips_prefixes(self):
         self.assertEqual(cli.brand_query("tryhappyharvest.com"), "happyharvest")
