@@ -10,7 +10,24 @@ import os
 import re
 from pathlib import Path
 
-from earlyscale.config import ROOT, load_dotenv  # noqa: F401  (loads .env on import)
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def load_dotenv(path: Path = ROOT / ".env") -> None:
+    """Minimal .env loader: KEY=VALUE lines, '#' comments, no interpolation.
+    Existing environment variables win over the file."""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.split(" #", 1)[0].strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
 
 load_dotenv()
 
