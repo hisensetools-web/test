@@ -42,6 +42,9 @@ grant, valid 24 h, cached in `data/shopify_token.json`). One-time setup, about f
    dev.shopify.com/dashboard and sign in with the same account). If it asks you to create an organization, do so;
    the store and the app must live in the same organization.
 2. **Create app** > name it `pdp-uploader` (anything) > start from scratch / no template.
+   The script has no web interface, so the URL fields are formalities: **App URL** =
+   `https://shopify.dev/apps/default-app-home` (Shopify's own placeholder for apps without a UI), **Redirect URLs** =
+   the same value if the form insists on one, **Embedded in Shopify admin** = off. Webhooks API version = the latest.
 3. In the app: **Access** (or **Configuration > Access scopes**) > add `write_products` and `write_files` > save.
 4. **Release** a version (top right; name optional).
 5. **Home > Install app** > pick your store > **Install**.
