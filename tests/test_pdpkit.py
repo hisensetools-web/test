@@ -165,17 +165,41 @@ class HiggsfieldTests(unittest.TestCase):
         try:
             signed = f"http://127.0.0.1:{srv.server_port}/bucket/obj.png?X-Sig=a%2Fb%2Bc&X-Expires=60"
 
+            class FakeResp:
+                status_code = 200
+                def raise_for_status(self): pass
+                def json(self): return {"public_url": "https://cdn.example/obj.png", "upload_url": signed}
+
+            class FakeTransport:
+                def request(self, method, url, **kw): return FakeResp()
+
             class FakeClient:
-                def _get_upload_url(self, content_type):
-                    return "https://cdn.example/obj.png", signed
+                _transport = FakeTransport()
 
             url = higgsfield.upload_bytes(FakeClient(), b"png-bytes", "image/png")
             self.assertEqual(url, "https://cdn.example/obj.png")
-            self.assertEqual([c for _, c, _ in seen], ["image/png", None])       # first shape refused, second accepted
+            self.assertEqual([c for _, c, _ in seen], ["image/png", "image/png", None])   # with extras, plain, then no Content-Type
             self.assertTrue(all(p.endswith("?X-Sig=a%2Fb%2Bc&X-Expires=60") for p, _, _ in seen))   # no re-quoting
             self.assertEqual(seen[0][2], b"png-bytes")
         finally:
             srv.shutdown()
+
+    def test_upload_forwards_headers_and_tagging_from_response(self):
+        seen = {}
+
+        class FakeResp:
+            def raise_for_status(self): pass
+            def json(self): return {"public_url": "p", "upload_url": "u?X-Amz-SignedHeaders=content-type%3Bhost%3Bx-amz-tagging",
+                                    "headers": {"x-amz-tagging": "ttl=7d"}}
+
+        class FakeClient:
+            class _transport:
+                @staticmethod
+                def request(method, url, **kw): return FakeResp()
+
+        pub, up, extra = higgsfield.request_upload_url(FakeClient(), "image/png")
+        self.assertEqual(extra, {"x-amz-tagging": "ttl=7d"})
+        self.assertEqual(higgsfield._signed_headers(up), ["content-type", "host", "x-amz-tagging"])
 
     def test_upload_error_is_explained(self):
         msg = higgsfield.explain_error(higgsfield.UploadError("refused"), "m")

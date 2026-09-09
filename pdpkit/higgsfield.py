@@ -50,27 +50,65 @@ def _put_exact(url: str, data: bytes, headers: dict) -> requests.Response:
     return session.send(prep, timeout=(10, 180))
 
 
+def request_upload_url(client, content_type: str) -> tuple[str, str, dict]:
+    """POST /files/generate-upload-url. Returns (public_url, upload_url, extra headers to send).
+    Higgsfield may sign the upload URL for headers beyond Content-Type (seen: x-amz-tagging);
+    any header-like field in the response is forwarded to the PUT."""
+    from higgsfield_client.http.error import raise_for_status
+
+    resp = client._transport.request("POST", "/files/generate-upload-url", json={"content_type": content_type})
+    raise_for_status(resp)
+    body = resp.json()
+    log.debug("generate-upload-url response: %s", json.dumps({k: (v[:120] + "..." if isinstance(v, str) and len(v) > 120 else v) for k, v in body.items()}))
+    extra: dict = {}
+    for key in ("headers", "upload_headers", "required_headers"):
+        if isinstance(body.get(key), dict):
+            extra.update({str(k): str(v) for k, v in body[key].items()})
+    for key in ("x-amz-tagging", "tagging", "tags", "x_amz_tagging"):
+        val = body.get(key)
+        if isinstance(val, str):
+            extra["x-amz-tagging"] = val
+        elif isinstance(val, dict):
+            from urllib.parse import urlencode
+            extra["x-amz-tagging"] = urlencode(val)
+    return body["public_url"], body["upload_url"], extra
+
+
+def _signed_headers(upload_url: str) -> list[str]:
+    from urllib.parse import parse_qs, urlparse
+    q = parse_qs(urlparse(upload_url).query)
+    return q.get("X-Amz-SignedHeaders", [""])[0].split(";") if q.get("X-Amz-SignedHeaders") else []
+
+
 def upload_bytes(client, data: bytes, content_type: str) -> str:
     """Ask Higgsfield for a pre-signed upload URL, then PUT the bytes to it.
     Tries the header shapes buckets are commonly signed for; raises UploadError with the
     bucket's full answer (it names the signed headers) when every shape is refused."""
-    public_url, upload_url = client._get_upload_url(content_type)
+    public_url, upload_url, extra = request_upload_url(client, content_type)
     log.debug("upload url host=%s query=%s", upload_url.split("/")[2], upload_url.split("?", 1)[-1][:300])
-    attempts = (
-        ("Content-Type " + content_type, {"Content-Type": content_type}),
+    signed = _signed_headers(upload_url)
+    log.debug("signed headers: %s; extra headers from Higgsfield: %s", signed, extra)
+    base = {"Content-Type": content_type, **extra}
+    attempts = [
+        ("Content-Type + Higgsfield headers", base),
+        ("Content-Type only", {"Content-Type": content_type}),
         ("no Content-Type", {}),
-        ("Content-Type application/octet-stream", {"Content-Type": "application/octet-stream"}),
-    )
+    ]
+    if "x-amz-tagging" in signed and "x-amz-tagging" not in {k.lower() for k in base}:
+        # the URL was signed for a tagging header we were not told about: try the usual values
+        for tag in ("", "ttl=1d", "expires=1d", "type=input"):
+            attempts.insert(1, (f"x-amz-tagging={tag!r}", {**base, "x-amz-tagging": tag}))
     failures = []
     for label, headers in attempts:
         r = _put_exact(upload_url, data, headers)
         if 200 <= r.status_code < 300:
             log.debug("upload accepted with %s", label)
             return public_url
-        failures.append(f"[{label}] HTTP {r.status_code}: {r.text[:1500]}")
+        failures.append(f"[{label}] HTTP {r.status_code}: {r.text[:400]}")
         if r.status_code not in (400, 403):
             break
-    raise UploadError("pre-signed upload refused by the storage bucket:\n" + "\n".join(failures))
+    raise UploadError(f"pre-signed upload refused by the storage bucket (URL signed for headers {signed}; "
+                      f"Higgsfield supplied {extra or 'none'}):\n" + "\n".join(failures))
 
 
 def upload_references(client, refs: list[Path]) -> list[str]:
