@@ -37,10 +37,48 @@ def pick_references(competitor_dir: Path, max_refs: int | None = None, prefer: s
     return ordered[:max_refs]
 
 
+class UploadError(RuntimeError):
+    pass
+
+
+def _put_exact(url: str, data: bytes, headers: dict) -> requests.Response:
+    """PUT to a pre-signed URL without letting requests re-quote the query string:
+    the signature covers the URL byte for byte."""
+    session = requests.Session()
+    prep = requests.Request("PUT", "https://placeholder.invalid/", data=data, headers=headers).prepare()
+    prep.url = url
+    return session.send(prep, timeout=(10, 180))
+
+
+def upload_bytes(client, data: bytes, content_type: str) -> str:
+    """Ask Higgsfield for a pre-signed upload URL, then PUT the bytes to it.
+    Tries the header shapes buckets are commonly signed for; raises UploadError with the
+    bucket's full answer (it names the signed headers) when every shape is refused."""
+    public_url, upload_url = client._get_upload_url(content_type)
+    log.debug("upload url host=%s query=%s", upload_url.split("/")[2], upload_url.split("?", 1)[-1][:300])
+    attempts = (
+        ("Content-Type " + content_type, {"Content-Type": content_type}),
+        ("no Content-Type", {}),
+        ("Content-Type application/octet-stream", {"Content-Type": "application/octet-stream"}),
+    )
+    failures = []
+    for label, headers in attempts:
+        r = _put_exact(upload_url, data, headers)
+        if 200 <= r.status_code < 300:
+            log.debug("upload accepted with %s", label)
+            return public_url
+        failures.append(f"[{label}] HTTP {r.status_code}: {r.text[:1500]}")
+        if r.status_code not in (400, 403):
+            break
+    raise UploadError("pre-signed upload refused by the storage bucket:\n" + "\n".join(failures))
+
+
 def upload_references(client, refs: list[Path]) -> list[str]:
     urls = []
     for p in refs:
-        url = client.upload_file(str(p))
+        import mimetypes
+        ctype = mimetypes.guess_type(p.name)[0] or "image/jpeg"
+        url = upload_bytes(client, p.read_bytes(), ctype)
         log.info("uploaded %s -> %s", p.name, url)
         urls.append(url)
     return urls
@@ -155,10 +193,11 @@ def check_credentials(sample: Path | None = None) -> str:
 
     client = higgsfield_client.SyncClient(timeout=60.0)
     if sample and sample.exists():
-        return client.upload_file(str(sample))
+        import mimetypes
+        return upload_bytes(client, sample.read_bytes(), mimetypes.guess_type(sample.name)[0] or "image/jpeg")
     # 1x1 PNG so the check needs no file on disk
     png = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")
-    return client.upload(io.BytesIO(png).getvalue(), "image/png")
+    return upload_bytes(client, io.BytesIO(png).getvalue(), "image/png")
 
 
 def _status_code(e: Exception) -> int | None:
@@ -173,6 +212,9 @@ def explain_error(e: Exception, model: str) -> str:
     import httpx
 
     text = str(e)
+    if isinstance(e, UploadError):
+        return (f"{text}\nHiggsfield accepted the key (it issued the upload URL); the bucket then refused the upload. "
+                "Run again with `python pdp.py -v hf-check` and send me the output, it names the headers the URL was signed for.")
     if isinstance(e, (httpx.TransportError, ConnectionError, OSError)):
         return (f"could not reach platform.higgsfield.ai ({type(e).__name__}: {text[:120]}). This is the network, not the key: "
                 "check VPN / proxy / firewall, then retry.")

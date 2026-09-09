@@ -144,6 +144,43 @@ class HiggsfieldTests(unittest.TestCase):
         self.assertIn("HIGGSFIELD_IMAGE_ARG", higgsfield.explain_error(client_error(422, "image_urls field required"), "m"))
         self.assertIn("credits", higgsfield.explain_error(client_error(402, "Insufficient balance"), "m"))
 
+    def test_upload_bytes_tries_header_shapes_and_keeps_url_exact(self):
+        import http.server, threading
+        seen = []
+
+        class Bucket(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_PUT(self):
+                body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                seen.append((self.path, self.headers.get("Content-Type"), body))
+                ok = self.headers.get("Content-Type") is None and "X-Sig=a%2Fb%2Bc" in self.path
+                self.send_response(200 if ok else 403)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Bucket)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            signed = f"http://127.0.0.1:{srv.server_port}/bucket/obj.png?X-Sig=a%2Fb%2Bc&X-Expires=60"
+
+            class FakeClient:
+                def _get_upload_url(self, content_type):
+                    return "https://cdn.example/obj.png", signed
+
+            url = higgsfield.upload_bytes(FakeClient(), b"png-bytes", "image/png")
+            self.assertEqual(url, "https://cdn.example/obj.png")
+            self.assertEqual([c for _, c, _ in seen], ["image/png", None])       # first shape refused, second accepted
+            self.assertTrue(all(p.endswith("?X-Sig=a%2Fb%2Bc&X-Expires=60") for p, _, _ in seen))   # no re-quoting
+            self.assertEqual(seen[0][2], b"png-bytes")
+        finally:
+            srv.shutdown()
+
+    def test_upload_error_is_explained(self):
+        msg = higgsfield.explain_error(higgsfield.UploadError("refused"), "m")
+        self.assertIn("accepted the key", msg)
+
     def test_generated_dir_name(self):
         self.assertEqual(config.generated_dir_name("Glow Neck Massager!"), "glow-neck-massager_shopify_PDP_imgs")
 
