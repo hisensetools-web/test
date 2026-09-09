@@ -161,6 +161,20 @@ def cmd_hf_check(args) -> int:
     return 0
 
 
+def cmd_shopify_check(args) -> int:
+    """Mint/verify the Admin API token and confirm the app has the scopes `upload` needs."""
+    from . import shopify_admin
+    admin = shopify_admin.ShopifyAdmin()
+    info = admin.whoami()
+    print(f"store  : {info['shop']['name']} ({info['shop']['myshopifyDomain']})")
+    print(f"scopes : {', '.join(info['scopes']) or '(none)'}")
+    if info["missing"]:
+        print(f"MISSING: {', '.join(info['missing'])} -> add them under the app's Access scopes in the Dev Dashboard, release a new version, and reinstall the app on the store")
+        return 1
+    print("OK: write_products and write_files present; `upload` will work")
+    return 0
+
+
 def cmd_list(args) -> int:
     root = config.OUTPUT_ROOT
     if not root.exists():
@@ -243,6 +257,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sample", help="api backend: upload this image instead of a 1x1 placeholder")
     s.add_argument("--backend", choices=("api", "cli"))
     s.set_defaults(func=cmd_hf_check)
+
+    s = sub.add_parser("shopify-check", help="verify the Shopify app credentials and scopes (mints the token if needed)")
+    s.set_defaults(func=cmd_shopify_check)
 
     s = sub.add_parser("list", help="what has been grabbed / generated / uploaded")
     s.set_defaults(func=cmd_list)

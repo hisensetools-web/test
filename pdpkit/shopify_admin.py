@@ -1,9 +1,14 @@
 """Upload the generated images to Shopify via the Admin GraphQL API.
 
-Needs a custom app on your store (Settings > Apps and sales channels > Develop apps) with the
-`write_products` and `write_files` scopes. Put in .env:
+Needs a custom app with the `write_products` and `write_files` scopes. Since January 2026 custom apps
+are created in the Shopify Dev Dashboard (dev.shopify.com), which gives a Client ID + Client secret
+instead of a token; the Admin API token is minted here with the client credentials grant
+(POST /admin/oauth/access_token, grant_type=client_credentials) and lasts 24 hours, so it is cached
+and refreshed automatically. Put in .env:
     SHOPIFY_STORE=my-brand.myshopify.com
-    SHOPIFY_ADMIN_TOKEN=shpat_...
+    SHOPIFY_CLIENT_ID=...
+    SHOPIFY_CLIENT_SECRET=...
+Legacy admin-created apps (token shpat_... shown once) still work: set SHOPIFY_ADMIN_TOKEN instead.
 
 Flow: stagedUploadsCreate (one staged target per file) -> POST the bytes to the staged URL ->
 productCreateMedia with the returned resourceUrl. If no product id is given, a DRAFT product is
@@ -47,22 +52,76 @@ mutation productCreateMedia($productId: ID!, $media: [CreateMediaInput!]!) {
   }
 }"""
 
+WHOAMI = """
+query whoami {
+  shop { name myshopifyDomain }
+  currentAppInstallation { accessScopes { handle } }
+}"""
+
 PRODUCT_BY_HANDLE = """
 query productByHandle($handle: String!) {
   productByHandle(handle: $handle) { id title status }
 }"""
 
 
+def mint_token(store: str, client_id: str, client_secret: str, *, scheme: str = "https", cache: Path | None = None) -> str:
+    """Client credentials grant for a Dev Dashboard app. Returns a cached token while it has
+    more than 10 minutes left; otherwise requests a new 24-hour one and caches it."""
+    cache = cache or config.SHOPIFY_TOKEN_CACHE
+    now = time.time()
+    if cache.exists():
+        try:
+            saved = json.loads(cache.read_text())
+            if saved.get("store") == store and saved.get("client_id") == client_id and saved.get("expires_at", 0) - now > 600:
+                return saved["access_token"]
+        except (ValueError, KeyError):
+            pass
+    r = requests.post(f"{scheme}://{store}/admin/oauth/access_token",
+                      data={"grant_type": "client_credentials", "client_id": client_id, "client_secret": client_secret},
+                      headers={"Content-Type": "application/x-www-form-urlencoded"}, timeout=config.REQUEST_TIMEOUT)
+    if r.status_code != 200:
+        hint = ""
+        if r.status_code in (400, 401, 404) or "application_cannot_be_found" in r.text:
+            hint = (" Check SHOPIFY_STORE is the *.myshopify.com domain, the Client ID / secret are from the app's "
+                    "Settings page in the Dev Dashboard, the app is installed on this store, and the store and the app "
+                    "are in the same Dev Dashboard organization (client credentials only work inside one organization).")
+        raise SystemExit(f"Shopify token request failed: HTTP {r.status_code} {r.text[:300]}.{hint}")
+    body = r.json()
+    token = body["access_token"]
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps({"store": store, "client_id": client_id, "access_token": token,
+                                 "expires_at": now + int(body.get("expires_in", 86399)), "scope": body.get("scope", "")}))
+    try:
+        cache.chmod(0o600)
+    except OSError:
+        pass
+    return token
+
+
 class ShopifyAdmin:
-    def __init__(self, store: str | None = None, token: str | None = None, version: str | None = None):
-        self.store = (store or config.SHOPIFY_STORE).replace("https://", "").strip("/")
-        self.token = token or config.SHOPIFY_ADMIN_TOKEN
+    def __init__(self, store: str | None = None, token: str | None = None, version: str | None = None,
+                 client_id: str | None = None, client_secret: str | None = None, scheme: str = "https"):
+        self.store = (store or config.SHOPIFY_STORE).replace("https://", "").replace("http://", "").strip("/")
         self.version = version or config.SHOPIFY_API_VERSION
-        if not self.store or not self.token:
-            raise SystemExit("SHOPIFY_STORE and SHOPIFY_ADMIN_TOKEN must be set in .env for `upload`")
-        self.endpoint = f"https://{self.store}/admin/api/{self.version}/graphql.json"
+        client_id = client_id if client_id is not None else config.SHOPIFY_CLIENT_ID
+        client_secret = client_secret if client_secret is not None else config.SHOPIFY_CLIENT_SECRET
+        if not self.store:
+            raise SystemExit("SHOPIFY_STORE (your-store.myshopify.com) must be set in .env")
+        self.token = token or config.SHOPIFY_ADMIN_TOKEN
+        if not self.token and client_id and client_secret:
+            self.token = mint_token(self.store, client_id, client_secret, scheme=scheme)
+        if not self.token:
+            raise SystemExit("set SHOPIFY_CLIENT_ID + SHOPIFY_CLIENT_SECRET (Dev Dashboard app) or SHOPIFY_ADMIN_TOKEN (legacy app) in .env")
+        self.endpoint = f"{scheme}://{self.store}/admin/api/{self.version}/graphql.json"
         self.session = requests.Session()
         self.session.headers.update({"X-Shopify-Access-Token": self.token, "Content-Type": "application/json"})
+
+    def whoami(self) -> dict:
+        """Shop name + the scopes this token actually has; flags the ones `upload` needs."""
+        data = self.gql(WHOAMI)
+        scopes = sorted(s["handle"] for s in (data.get("currentAppInstallation") or {}).get("accessScopes", []))
+        missing = [s for s in config.SHOPIFY_REQUIRED_SCOPES if s not in scopes]
+        return {"shop": data["shop"], "scopes": scopes, "missing": missing}
 
     def gql(self, query: str, variables: dict | None = None) -> dict:
         for attempt in range(config.REQUEST_RETRIES):

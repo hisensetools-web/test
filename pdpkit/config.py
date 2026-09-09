@@ -51,8 +51,14 @@ HIGGSFIELD_CLI_EXTRA = os.environ.get("HIGGSFIELD_CLI_EXTRA", "")               
 
 # --- Shopify Admin API ------------------------------------------------------
 SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "").strip()             # e.g. my-brand.myshopify.com
-SHOPIFY_ADMIN_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", "").strip()  # shpat_... from a custom app
+# Dev Dashboard app (the only kind you can create since Jan 2026): Client ID + Client secret; pdp.py mints
+# the 24-hour Admin API token itself (client credentials grant) and caches it in SHOPIFY_TOKEN_CACHE.
+SHOPIFY_CLIENT_ID = os.environ.get("SHOPIFY_CLIENT_ID", "").strip()
+SHOPIFY_CLIENT_SECRET = os.environ.get("SHOPIFY_CLIENT_SECRET", "").strip()
+SHOPIFY_ADMIN_TOKEN = os.environ.get("SHOPIFY_ADMIN_TOKEN", "").strip()  # shpat_... from a legacy admin-created app (still works)
 SHOPIFY_API_VERSION = os.environ.get("SHOPIFY_API_VERSION", "2025-07")
+SHOPIFY_TOKEN_CACHE = Path(os.environ.get("SHOPIFY_TOKEN_CACHE", ROOT / "data" / "shopify_token.json"))
+SHOPIFY_REQUIRED_SCOPES = ("write_products", "write_files")
 
 # --- Guide ------------------------------------------------------------------
 PDP_TEMPLATE = os.environ.get("PDP_TEMPLATE", "").strip()   # default reference PDP template path

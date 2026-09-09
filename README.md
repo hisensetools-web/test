@@ -17,7 +17,7 @@ launch our own version of that page. One folder per product under `pdp_output/<s
 | every image on the competitor page (gallery first, then page images, size suffixes stripped so you get the originals) | `competitor_imgs/` + `manifest.json` (source URL, alt text, kind) | `grab` |
 | summary of the competitor page (title, price/compare-at, variants, copy, headings in order, bullets, FAQ, trust lines, reviews) | `product_summary.md` + `product_summary.json` | `grab` |
 | new images rendered by Higgsfield from your prompt, with the competitor images as references | `<product name>_shopify_PDP_imgs/` + `generation_log.json` | `generate` |
-| those images uploaded to a **draft** Shopify product | `shopify_upload.json` | `upload` |
+| those images uploaded to a **draft** Shopify product | `shopify_upload.json` | `upload` (`shopify-check` first) |
 | PDF build instructions for Fudge, merged from our reference PDP template + the summary | `<slug>_fudge_guide.pdf` (+ `.md`) | `guide` |
 
 ```bash
@@ -31,9 +31,27 @@ python pdp.py list                                            # what has been gr
 ```
 
 Keys in `.env` (see `.env.example`): `ANTHROPIC_API_KEY` (summary brief + guide text; without it you get the
-raw-facts summary and a mechanical guide), Higgsfield credentials (below), `SHOPIFY_STORE` +
-`SHOPIFY_ADMIN_TOKEN` from a custom app with `write_products` and `write_files` (`upload`), `PDP_TEMPLATE` for the
-default template.
+raw-facts summary and a mechanical guide), Higgsfield credentials (below), Shopify app credentials (below),
+`PDP_TEMPLATE` for the default template.
+
+**Shopify app (for `upload`).** Since January 2026 custom apps are created in the Shopify Dev Dashboard and hand
+you a Client ID + Client secret instead of a token; `pdp.py` mints the Admin API token itself (client credentials
+grant, valid 24 h, cached in `data/shopify_token.json`). One-time setup, about five minutes:
+
+1. Shopify admin > **Settings > Apps and sales channels > Develop apps > Build apps in Dev Dashboard** (or go to
+   dev.shopify.com/dashboard and sign in with the same account). If it asks you to create an organization, do so;
+   the store and the app must live in the same organization.
+2. **Create app** > name it `pdp-uploader` (anything) > start from scratch / no template.
+3. In the app: **Access** (or **Configuration > Access scopes**) > add `write_products` and `write_files` > save.
+4. **Release** a version (top right; name optional).
+5. **Home > Install app** > pick your store > **Install**.
+6. **Settings** (left panel) > copy **Client ID** and **Client secret** into `.env` as `SHOPIFY_CLIENT_ID` /
+   `SHOPIFY_CLIENT_SECRET`, plus `SHOPIFY_STORE=your-store.myshopify.com` (the myshopify domain, not the custom domain).
+7. `python pdp.py shopify-check` prints the store name and the scopes the token carries, and says exactly which
+   scope is missing if any (add it under Access, release again, reinstall).
+
+An older admin-created app whose `shpat_...` token you still have keeps working: put it in `SHOPIFY_ADMIN_TOKEN`
+and leave the client id/secret empty.
 
 **Higgsfield: two backends.** `generate --backend cli` (or `HIGGSFIELD_BACKEND=cli`) drives the official
 `higgsfield` CLI on your normal account: install it once with

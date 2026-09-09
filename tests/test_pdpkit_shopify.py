@@ -5,6 +5,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from pdpkit import shopify_admin
 
@@ -26,12 +27,23 @@ class FakeShopify(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("Content-Length", 0))
         raw = self.rfile.read(length)
+        if self.path == "/admin/oauth/access_token":
+            from urllib.parse import parse_qs
+            form = {k: v[0] for k, v in parse_qs(raw.decode()).items()}
+            CALLS.append(("oauth", form))
+            if form.get("client_secret") != "shhh":
+                return self._send(401, {"error": "invalid_client"})
+            return self._send(200, {"access_token": "shpat_minted", "expires_in": 86399, "scope": "write_products,write_files"})
         if self.path.startswith("/staged/"):
             CALLS.append(("staged", self.path, len(raw), self.headers.get("Content-Type", "")[:19]))
             return self._send(201, b"", "text/plain")
         body = json.loads(raw)
         q, v = body["query"], body.get("variables", {})
         CALLS.append(("gql", q.split("(")[0].split()[-1], v, self.headers.get("X-Shopify-Access-Token")))
+        if "currentAppInstallation" in q:
+            scopes = ["read_products", "write_products", "write_files"] if self.headers.get("X-Shopify-Access-Token") == "shpat_minted" else ["read_products"]
+            return self._send(200, {"data": {"shop": {"name": "Glow Store", "myshopifyDomain": "glow.myshopify.com"},
+                                             "currentAppInstallation": {"accessScopes": [{"handle": h} for h in scopes]}}})
         if "productByHandle" in q:
             return self._send(200, {"data": {"productByHandle": None}})
         if "productCreate(" in q:
@@ -61,8 +73,8 @@ class UploadFlowTests(unittest.TestCase):
 
     def setUp(self):
         CALLS.clear()
-        self.admin = shopify_admin.ShopifyAdmin(store=f"127.0.0.1:{self.port}", token="shpat_test", version="2025-07")
-        self.admin.endpoint = f"http://127.0.0.1:{self.port}/admin/api/2025-07/graphql.json"   # http for the fake
+        self.store = f"127.0.0.1:{self.port}"
+        self.admin = shopify_admin.ShopifyAdmin(store=self.store, token="shpat_test", version="2025-07", scheme="http")
 
     def test_creates_draft_and_attaches_every_image(self):
         with tempfile.TemporaryDirectory() as d:
@@ -89,6 +101,31 @@ class UploadFlowTests(unittest.TestCase):
     def test_missing_credentials_is_a_clear_error(self):
         with self.assertRaises(SystemExit):
             shopify_admin.ShopifyAdmin(store="", token="")
+        with self.assertRaises(SystemExit):
+            shopify_admin.ShopifyAdmin(store="x.myshopify.com", token="", client_id="", client_secret="")
+
+    def test_client_credentials_mints_caches_and_reports_scopes(self):
+        with tempfile.TemporaryDirectory() as d:
+            cache = Path(d) / "tok.json"
+            with mock.patch.object(shopify_admin.config, "SHOPIFY_TOKEN_CACHE", cache):
+                admin = shopify_admin.ShopifyAdmin(store=self.store, token="", client_id="cid", client_secret="shhh", scheme="http")
+                self.assertEqual(admin.token, "shpat_minted")
+                info = admin.whoami()
+                self.assertEqual(info["shop"]["name"], "Glow Store")
+                self.assertEqual(info["missing"], [])
+                # second construction reuses the cached token: no new oauth call
+                shopify_admin.ShopifyAdmin(store=self.store, token="", client_id="cid", client_secret="shhh", scheme="http")
+                self.assertEqual(sum(1 for c in CALLS if c[0] == "oauth"), 1)
+                self.assertEqual(CALLS[0][1]["grant_type"], "client_credentials")
+                self.assertEqual(json.loads(cache.read_text())["access_token"], "shpat_minted")
+                # wrong secret -> clear SystemExit with the org/install hint
+                with self.assertRaises(SystemExit) as cm:
+                    shopify_admin.mint_token(self.store, "cid", "wrong", scheme="http", cache=Path(d) / "other.json")
+                self.assertIn("same Dev Dashboard organization", str(cm.exception))
+
+    def test_whoami_flags_missing_scopes(self):
+        info = self.admin.whoami()   # shpat_test only has read_products in the fake
+        self.assertEqual(info["missing"], ["write_products", "write_files"])
 
 
 if __name__ == "__main__":
