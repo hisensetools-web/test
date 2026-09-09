@@ -168,12 +168,12 @@ MARKERS = [
 ]
 
 
-def detect(session: requests.Session, domain: str) -> dict:
+def detect(session: requests.Session, domain: str, quiet: bool = False) -> dict:
     """{platform, base, myshopify, evidence}. Tries the Shopify JSON first (cheapest), then one homepage GET."""
     base = shopify.base_url(domain)
     # 1. a Shopify storefront answers /products.json with products (resolve_base_url tries www. and shop.)
     try:
-        resolved = shopify.resolve_base_url(session, domain)
+        resolved = shopify.resolve_base_url(session, domain, quiet=quiet)
         r = _get(session, f"{resolved}/products.json?limit=1", accept=config.JSON_ACCEPT)
         if r.status_code == 200 and r.text.lstrip().startswith("{") and "products" in r.text[:200]:
             return {"platform": "shopify", "base": resolved, "myshopify": None, "evidence": "products.json"}
@@ -704,20 +704,20 @@ def catalogue_generic(session: requests.Session, base: str, platform: str, conn:
 
 def fetch_catalogue(domain: str, session: requests.Session | None = None, conn: sqlite3.Connection | None = None,
                     store_id: int | None = None, today: str | None = None, platform_hint: dict | None = None,
-                    page_budget: int | None = None) -> Catalogue:
+                    page_budget: int | None = None, quiet: bool = False) -> Catalogue:
     """Detect the platform (cached on stores.platform for CATALOGUE_REDETECT_DAYS) and fetch the catalogue with its adapter.
     A platform whose adapter fails falls back to the generic sitemap adapter, and finally to re-detection."""
     session = session or shopify.make_session()
     today = today or date.today().isoformat()
     info = platform_hint or (_cached_platform(conn, store_id, today) if conn is not None and store_id is not None else None)
     if info is None:
-        info = detect(session, domain)
+        info = detect(session, domain, quiet=quiet)
     try:
         cat = _run_adapter(session, domain, info, conn, store_id, today, page_budget)
     except (PlatformError, shopify.StoreFetchError, requests.RequestException, ValueError) as e:
         if info["platform"] in ("generic", "bigcommerce", "wix"):
             raise
-        log.warning("%s: %s adapter failed (%s); trying the generic sitemap adapter", domain, info["platform"], e)
+        (log.debug if quiet else log.warning)("%s: %s adapter failed (%s); trying the generic sitemap adapter", domain, info["platform"], e)
         cat = catalogue_generic(session, domain if not info.get("base") else info["base"], "generic", conn, store_id, today, page_budget)
         cat.note = f"{info['platform']} adapter failed: {str(e)[:80]}; " + cat.note
         cat.platform = info["platform"]           # keep what the site is, even if the catalogue came the generic way
@@ -781,7 +781,7 @@ def is_store(domain: str, session: requests.Session | None = None, page_budget: 
     Used by Radar triage: the generic adapter reads only `page_budget` product pages here (enough to confirm a store)."""
     session = session or shopify.make_session()
     try:
-        cat = fetch_catalogue(domain, session, today=date.today().isoformat(), page_budget=page_budget)
+        cat = fetch_catalogue(domain, session, today=date.today().isoformat(), page_budget=page_budget, quiet=True)
     except (PlatformError, shopify.StoreFetchError, requests.RequestException, ValueError) as e:
         log.debug("%s: not a store (%s)", domain, e)
         return None, []

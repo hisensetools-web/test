@@ -28,6 +28,12 @@ class PureTests(unittest.TestCase):
         self.assertEqual(radar.distinctive_words("BioRoot Ceylon Cinnamon Softgels 7200mg with MCT Oil - 60 Capsules", bw), "ceylon cinnamon mct")
         self.assertEqual(radar.distinctive_words("Premium Formula", bw), "")
 
+    def test_junk_landing_domains_are_dropped(self):
+        for junk in ("https://fonts.googleapis.com/css", "salest.php", "https://stcdn.leadconnectorhq.com/x", "image.jpg", "https://d1abc.cloudfront.net/p"):
+            self.assertIsNone(radar.normalise_landing_domain(junk), junk)
+        self.assertEqual(radar.normalise_landing_domain("https://learn.algo-retail.com/x"), "learn.algo-retail.com")
+        self.assertEqual(radar.normalise_landing_domain("http://127.0.0.1:8282/products/x"), "http://127.0.0.1:8282")
+
     def test_landing_domain(self):
         self.assertEqual(radar.normalise_landing_domain("https://www.Shop.com/products/x?utm=1"), "shop.com")
         self.assertEqual(radar.normalise_landing_domain("shop.com"), "shop.com")

@@ -73,7 +73,7 @@ def _clearly_not_storefront(r: requests.Response) -> bool:
         return False
 
 
-def resolve_base_url(session: requests.Session, store_domain: str) -> str:
+def resolve_base_url(session: requests.Session, store_domain: str, quiet: bool = False) -> str:
     """Find the origin that actually serves the storefront.
 
     Many stores redirect apex -> www (or the reverse), and some apex hosts don't
@@ -90,23 +90,25 @@ def resolve_base_url(session: requests.Session, store_domain: str) -> str:
             candidates.append(alt)
     last_err: Exception | None = None
     first_answer: str | None = None
+    say = log.debug if quiet else log.info
+    warn = log.debug if quiet else log.warning
     for cand in candidates:
         try:
             r = session.get(f"{cand}/products.json", params={"limit": 1}, timeout=config.REQUEST_TIMEOUT,
                             allow_redirects=True, headers={"Accept": config.JSON_ACCEPT})
         except (requests.ConnectionError, requests.Timeout) as e:
             last_err = e
-            log.warning("%s unreachable (%s)%s", cand, type(e).__name__,
-                        "; trying the next host" if cand is not candidates[-1] else "")
+            warn("%s unreachable (%s)%s", cand, type(e).__name__,
+                 "; trying the next host" if cand is not candidates[-1] else "")
             continue
         final = _origin(r.url)
         if r.history:
-            log.info("%s redirected to %s; using that host", cand, final)
+            say("%s redirected to %s; using that host", cand, final)
         if not _clearly_not_storefront(r):
             return final
         first_answer = first_answer or final
         if cand is not candidates[-1]:
-            log.info("%s/products.json is not a storefront (HTTP %s); trying the next host", final, r.status_code)
+            say("%s/products.json is not a storefront (HTTP %s); trying the next host", final, r.status_code)
     if first_answer:
         return first_answer
     raise StoreFetchError(f"unreachable: {last_err}")

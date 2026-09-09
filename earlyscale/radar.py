@@ -47,7 +47,15 @@ formula supplement supplements capsules capsule tablets tablet softgels softgel 
 kit set size count ct oz mg ml x per day daily plus pro max ultra advanced complete support health care""".split())
 SKIP_DOMAINS = ("facebook.com", "fb.com", "instagram.com", "fbcdn.net", "google.com", "youtube.com", "amazon.com", "amzn.to",
                 "tiktok.com", "bit.ly", "linktr.ee", "apple.com", "play.google.com", "shopify.com", "myshopify.com",
-                "walmart.com", "ebay.com", "etsy.com", "wikipedia.org", "reddit.com", "duckduckgo.com")
+                "walmart.com", "ebay.com", "etsy.com", "wikipedia.org", "reddit.com", "duckduckgo.com",
+                # CDNs, fonts, tag managers, funnel builders' shared hosts: never a store of their own
+                "googleapis.com", "gstatic.com", "cloudfront.net", "cloudflare.com", "akamaihd.net", "leadconnectorhq.com",
+                "msgsndr.com", "hubspot.com", "hsforms.com", "typeform.com", "calendly.com", "zoom.us", "youtu.be",
+                "whatsapp.com", "wa.me", "t.me", "telegram.me", "twitter.com", "x.com", "linkedin.com", "pinterest.com",
+                "snapchat.com", "spotify.com", "apps.apple.com", "onelink.me", "app.link", "page.link")
+TLD_RE = re.compile(r"^[a-z]{2,24}$")
+FILE_EXTS = {"php", "jpg", "jpeg", "png", "gif", "webp", "svg", "js", "css", "json", "xml", "html", "htm", "pdf", "mp4", "txt", "ico",
+             "woff", "woff2", "zip", "aspx", "asp", "jsp", "cgi"}
 
 
 def _utcnow() -> str:
@@ -138,6 +146,9 @@ def normalise_landing_domain(url_or_domain: str | None) -> str | None:
             host = "http://" + host      # keep the explicit scheme the mock needs (watchlist does the same)
     if any(host == d or host.endswith("." + d) for d in SKIP_DOMAINS):
         return None
+    tld = host.rsplit(".", 1)[-1]
+    if not port and (not TLD_RE.match(tld) or tld in FILE_EXTS):
+        return None                      # "salest.php", "image.jpg": a path fragment, not a host
     return host
 
 
@@ -368,7 +379,8 @@ def classify_domain(domain: str, urls: list[str], session=None, check=is_shopify
 
 def classify_many(conn: sqlite3.Connection, domains: list[str], check=is_shopify, fetch=ad_metrics.fetch_landing,
                   workers: int | None = None, deadline: float | None = None):
-    """Yield (domain, classification) for many domains, checked concurrently (each on its own HTTP session)."""
+    """Yield (domain, classification) for many domains, checked concurrently (each on its own HTTP session).
+    Per-hop resolution chatter is silenced (thousands of dead hosts); a progress line every 50 domains instead."""
     from concurrent.futures import ThreadPoolExecutor
     urls = {d: landing_urls(conn, d) for d in domains}
     workers = workers or config.RADAR_CHECK_WORKERS
@@ -377,14 +389,23 @@ def classify_many(conn: sqlite3.Connection, domains: list[str], check=is_shopify
         try:
             return d, classify_domain(d, urls[d], shopify.make_session(), check=check, fetch=fetch)
         except Exception as e:  # noqa: BLE001
-            log.warning("radar: classify %s failed: %s", d, e)
+            log.debug("radar: classify %s failed: %s", d, e)
             return d, {"type": "funnel", "store_domain": d, "products": [], "lander_domain": None}
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+    done = 0
+    stores = 0
+    pool = ThreadPoolExecutor(max_workers=max(1, workers))
+    try:
         for i in range(0, len(domains), workers * 4):          # small batches so a spent budget stops quickly
             if deadline is not None and time.monotonic() > deadline:
                 return
             for d, cls in pool.map(one, domains[i:i + workers * 4]):
+                done += 1
+                stores += 1 if cls["type"] != "funnel" else 0
+                if done % 50 == 0 or done == len(domains):
+                    log.info("radar: checked %d/%d landing domains (%d storefronts so far)", done, len(domains), stores)
                 yield d, cls
+    finally:
+        pool.shutdown(wait=False, cancel_futures=True)
 
 
 def domain_ads(conn: sqlite3.Connection, domain: str, products: list[dict], today: str) -> dict:

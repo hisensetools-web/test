@@ -1807,4 +1807,7 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args)
     except KeyboardInterrupt:
         console.print("\n[yellow]interrupted[/] - everything recorded so far is in the database; the next run continues from there")
-        return 130
+        import os
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(130)      # skip interpreter shutdown: worker threads mid-request and Playwright's loop would otherwise hang or spew
