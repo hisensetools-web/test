@@ -115,7 +115,10 @@ def generate(product_dir: Path, product_name: str, prompts: list[str], *, refs: 
                           "arguments": build_arguments(prompts[0], ["<uploaded-url>"] * len(refs), num_images=num_images)}, indent=2))
         return out
 
-    ref_urls = upload_references(client, refs)
+    try:
+        ref_urls = upload_references(client, refs)
+    except Exception as e:  # noqa: BLE001
+        raise SystemExit(explain_error(e, model)) from e
     for i, prompt in enumerate(prompts, 1):
         args = build_arguments(prompt, ref_urls, num_images=num_images)
         log.info("prompt %d/%d -> %s", i, len(prompts), model)
@@ -123,7 +126,7 @@ def generate(product_dir: Path, product_name: str, prompts: list[str], *, refs: 
         try:
             result = client.subscribe(model, arguments=args)
         except Exception as e:  # noqa: BLE001 - one bad prompt must not lose the others
-            log.error("generation failed for prompt %d: %s", i, e)
+            log.error("generation failed for prompt %d: %s", i, explain_error(e, model))
             entries.append({"prompt": prompt, "model": model, "error": str(e), "at": datetime.now(timezone.utc).isoformat()})
             log_path.write_text(json.dumps(entries, indent=2))
             continue
@@ -141,3 +144,50 @@ def generate(product_dir: Path, product_name: str, prompts: list[str], *, refs: 
                         "at": datetime.now(timezone.utc).isoformat()})
         log_path.write_text(json.dumps(entries, indent=2))
     return out
+
+
+def check_credentials(sample: Path | None = None) -> str:
+    """Upload one small image to Higgsfield and return its public URL. Proves HF_KEY works
+    and that the network path is open, without spending generation credits."""
+    import io
+
+    import higgsfield_client
+
+    client = higgsfield_client.SyncClient(timeout=60.0)
+    if sample and sample.exists():
+        return client.upload_file(str(sample))
+    # 1x1 PNG so the check needs no file on disk
+    png = bytes.fromhex("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d49444154789c6360000002000154a24f5d0000000049454e44ae426082")
+    return client.upload(io.BytesIO(png).getvalue(), "image/png")
+
+
+def _status_code(e: Exception) -> int | None:
+    """HTTP status behind a HiggsfieldClientError (chained from httpx.HTTPStatusError)."""
+    cause = e.__cause__
+    resp = getattr(cause, "response", None)
+    return getattr(resp, "status_code", None)
+
+
+def explain_error(e: Exception, model: str) -> str:
+    """Turn the SDK's errors into the next thing to try."""
+    import httpx
+
+    text = str(e)
+    if isinstance(e, (httpx.TransportError, ConnectionError, OSError)):
+        return (f"could not reach platform.higgsfield.ai ({type(e).__name__}: {text[:120]}). This is the network, not the key: "
+                "check VPN / proxy / firewall, then retry.")
+    if isinstance(e, KeyError):
+        return f"unexpected response shape from Higgsfield (missing {text}); run with -v and share the log."
+    code = _status_code(e)
+    low = text.lower()
+    if code in (401, 403) or "unauthorized" in low or "invalid api key" in low:
+        return "Higgsfield rejected the credentials: check HF_KEY=<key>:<secret> in .env (from cloud.higgsfield.ai > API keys)."
+    if code == 404 or "not found" in low:
+        return (f"model id '{model}' not found on platform.higgsfield.ai. Open the model's page on cloud.higgsfield.ai, copy the id from its "
+                "API example, and set HIGGSFIELD_MODEL in .env (and HIGGSFIELD_IMAGE_ARG if its reference field is not 'image_urls').")
+    if code in (400, 422) or "validation" in low:
+        return (f"Higgsfield rejected the arguments for '{model}': {text[:300]}. Compare with the model's API example on cloud.higgsfield.ai; "
+                "adjust HIGGSFIELD_IMAGE_ARG / HIGGSFIELD_ASPECT / HIGGSFIELD_RESOLUTION or drop fields with HIGGSFIELD_EXTRA_ARGS.")
+    if code == 402 or "credit" in low or "balance" in low:
+        return "Higgsfield reports no credits left on this key."
+    return text

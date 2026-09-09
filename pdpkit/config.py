@@ -41,6 +41,13 @@ HIGGSFIELD_ASPECT = os.environ.get("HIGGSFIELD_ASPECT", "1:1")
 HIGGSFIELD_RESOLUTION = os.environ.get("HIGGSFIELD_RESOLUTION", "2K")
 HIGGSFIELD_NUM_IMAGES = int(os.environ.get("HIGGSFIELD_NUM_IMAGES", "4"))
 HIGGSFIELD_EXTRA_ARGS = os.environ.get("HIGGSFIELD_EXTRA_ARGS", "")   # JSON object merged into every request
+# Backend: "api" = platform.higgsfield.ai with HF_KEY (higgsfield-client); "cli" = the `higgsfield` CLI on your
+# normal account (`higgsfield auth login`). Default: api when HF_KEY is set, otherwise cli.
+_HF_KEY_SET = bool(os.environ.get("HF_KEY") or (os.environ.get("HF_API_KEY") and os.environ.get("HF_API_SECRET")))
+HIGGSFIELD_BACKEND = os.environ.get("HIGGSFIELD_BACKEND", "api" if _HF_KEY_SET else "cli").strip().lower()
+HIGGSFIELD_CLI = os.environ.get("HIGGSFIELD_CLI", "higgsfield")                  # executable name / path
+HIGGSFIELD_CLI_MODEL = os.environ.get("HIGGSFIELD_CLI_MODEL", "nano_banana_2")   # `higgsfield model list --json` for ids
+HIGGSFIELD_CLI_EXTRA = os.environ.get("HIGGSFIELD_CLI_EXTRA", "")                # extra flags appended verbatim
 
 # --- Shopify Admin API ------------------------------------------------------
 SHOPIFY_STORE = os.environ.get("SHOPIFY_STORE", "").strip()             # e.g. my-brand.myshopify.com

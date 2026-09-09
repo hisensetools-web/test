@@ -61,11 +61,17 @@ def cmd_grab(args) -> int:
 
 
 def cmd_generate(args) -> int:
-    from . import higgsfield
     pdir = _product_dir(args.product)
     name = _product_name(pdir, args.name)
     refs = [Path(r) for r in args.ref] if args.ref else None
-    out = higgsfield.generate(pdir, name, _prompts(args), refs=refs, num_images=args.num, model=args.model, dry_run=args.dry_run)
+    backend = args.backend or ("cli" if args.photoshoot else config.HIGGSFIELD_BACKEND)
+    if backend == "cli":
+        from . import higgsfield_cli
+        out = higgsfield_cli.generate(pdir, name, _prompts(args), refs=refs, num_images=args.num, model=args.model,
+                                      photoshoot_mode=args.photoshoot, dry_run=args.dry_run)
+    else:
+        from . import higgsfield
+        out = higgsfield.generate(pdir, name, _prompts(args), refs=refs, num_images=args.num, model=args.model, dry_run=args.dry_run)
     print(f"generated images folder: {out}")
     return 0
 
@@ -133,6 +139,28 @@ def cmd_run(args) -> int:
     return 0
 
 
+def cmd_hf_check(args) -> int:
+    """Prove the Higgsfield backend works without spending credits."""
+    from . import higgsfield, higgsfield_cli
+    backend = args.backend or config.HIGGSFIELD_BACKEND
+    if backend == "cli":
+        print("backend: cli  (higgsfield on PATH:", higgsfield_cli.cli_path() or "NO", ")")
+        print(higgsfield_cli.check())
+        print(f"model in .env: {config.HIGGSFIELD_CLI_MODEL}; or `generate --photoshoot product_shot` for the product-photoshoot command")
+        return 0
+    try:
+        url = higgsfield.check_credentials(Path(args.sample) if args.sample else None)
+    except SystemExit:
+        raise
+    except Exception as e:  # noqa: BLE001
+        print("FAILED:", higgsfield.explain_error(e, config.HIGGSFIELD_MODEL))
+        return 1
+    print("Higgsfield credentials OK. Uploaded test image ->", url)
+    print(f"model in .env: {config.HIGGSFIELD_MODEL}  (reference field: {config.HIGGSFIELD_IMAGE_ARG})")
+    print("next: python pdp.py generate <product> --prompt \"...\" --num 1   (one image, to confirm the model id)")
+    return 0
+
+
 def cmd_list(args) -> int:
     root = config.OUTPUT_ROOT
     if not root.exists():
@@ -164,7 +192,9 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--prompt-file", help="text file, prompts separated by blank lines")
         sp.add_argument("--ref", action="append", help="explicit reference image path (repeat); default: first gallery images")
         sp.add_argument("--num", type=int, help=f"images per prompt (default {config.HIGGSFIELD_NUM_IMAGES})")
-        sp.add_argument("--model", help=f"Higgsfield model id (default {config.HIGGSFIELD_MODEL})")
+        sp.add_argument("--model", help=f"Higgsfield model id (api default {config.HIGGSFIELD_MODEL}; cli default {config.HIGGSFIELD_CLI_MODEL})")
+        sp.add_argument("--backend", choices=("api", "cli"), help=f"api = HF_KEY on platform.higgsfield.ai, cli = `higgsfield` CLI (default {config.HIGGSFIELD_BACKEND})")
+        sp.add_argument("--photoshoot", metavar="MODE", help="use `higgsfield product-photoshoot create --mode MODE` (cli backend): product_shot, lifestyle_scene, hero_banner, ...")
 
     def add_upload_opts(sp):
         sp.add_argument("--handle", help="attach to the existing Shopify product with this handle")
@@ -208,6 +238,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--template")
     s.add_argument("--dry-run", action="store_true")
     s.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("hf-check", help="verify HF_KEY by uploading one tiny image (no credits spent)")
+    s.add_argument("--sample", help="api backend: upload this image instead of a 1x1 placeholder")
+    s.add_argument("--backend", choices=("api", "cli"))
+    s.set_defaults(func=cmd_hf_check)
 
     s = sub.add_parser("list", help="what has been grabbed / generated / uploaded")
     s.set_defaults(func=cmd_list)

@@ -127,6 +127,23 @@ class HiggsfieldTests(unittest.TestCase):
         self.assertEqual(args["num_images"], 2)
         self.assertEqual(higgsfield.result_image_urls({"images": [{"url": "https://a"}, {"url": "https://a"}], "image": {"url": "https://b"}}), ["https://a", "https://b"])
 
+    def test_explain_error_classifies_by_status_not_text(self):
+        import httpx
+        from higgsfield_client.exceptions import HiggsfieldClientError
+
+        def client_error(code, body):
+            req = httpx.Request("POST", "https://platform.higgsfield.ai/x")
+            resp = httpx.Response(code, request=req, text=body)
+            err = HiggsfieldClientError(body)
+            err.__cause__ = httpx.HTTPStatusError("x", request=req, response=resp)
+            return err
+
+        self.assertIn("network", higgsfield.explain_error(httpx.ProxyError("403 Forbidden"), "m"))
+        self.assertIn("credentials", higgsfield.explain_error(client_error(401, "Unauthorized"), "m"))
+        self.assertIn("HIGGSFIELD_MODEL", higgsfield.explain_error(client_error(404, "Not Found"), "some/model"))
+        self.assertIn("HIGGSFIELD_IMAGE_ARG", higgsfield.explain_error(client_error(422, "image_urls field required"), "m"))
+        self.assertIn("credits", higgsfield.explain_error(client_error(402, "Insufficient balance"), "m"))
+
     def test_generated_dir_name(self):
         self.assertEqual(config.generated_dir_name("Glow Neck Massager!"), "glow-neck-massager_shopify_PDP_imgs")
 

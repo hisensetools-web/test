@@ -31,16 +31,27 @@ python pdp.py list                                            # what has been gr
 ```
 
 Keys in `.env` (see `.env.example`): `ANTHROPIC_API_KEY` (summary brief + guide text; without it you get the
-raw-facts summary and a mechanical guide), `HF_KEY` from cloud.higgsfield.ai (`generate`), `SHOPIFY_STORE` +
+raw-facts summary and a mechanical guide), Higgsfield credentials (below), `SHOPIFY_STORE` +
 `SHOPIFY_ADMIN_TOKEN` from a custom app with `write_products` and `write_files` (`upload`), `PDP_TEMPLATE` for the
-default template. `HIGGSFIELD_MODEL` / `HIGGSFIELD_IMAGE_ARG` pick the Higgsfield model and the request field that
-carries the reference-image URLs (default `bytedance/seedream/v4/edit` / `image_urls`; `generate --dry-run` prints the
-exact request without sending it). Shopify pages are read through `/products/<handle>.json`; other platforms fall back
+default template.
+
+**Higgsfield: two backends.** `generate --backend cli` (or `HIGGSFIELD_BACKEND=cli`) drives the official
+`higgsfield` CLI on your normal account: install it once with
+`curl -fsSL https://raw.githubusercontent.com/higgsfield-ai/cli/main/install.sh | sh` and run `higgsfield auth login`.
+This is the recommended route for product pages because `generate --photoshoot product_shot` (or `lifestyle_scene`,
+`hero_banner`, `closeup_product_with_person`, `ad_creative_pack`, ...) uses Higgsfield's `product-photoshoot` command,
+whose backend prompt enhancer is built for exactly this; without `--photoshoot` it runs `generate create <model>`
+with every reference passed as `--image` (default model `nano_banana_2`, change with `HIGGSFIELD_CLI_MODEL` or `--model`).
+`generate --backend api` uses the developer API on platform.higgsfield.ai with `HF_KEY=key:secret` from
+cloud.higgsfield.ai; `HIGGSFIELD_MODEL` / `HIGGSFIELD_IMAGE_ARG` pick the model and the request field that carries the
+reference-image URLs (default `bytedance/seedream/v4/edit` / `image_urls`). `python pdp.py hf-check [--backend cli|api]`
+verifies the credentials without spending credits, and `generate --dry-run` prints the exact request or command.
+Shopify pages are read through `/products/<handle>.json`; other platforms fall back
 to HTML parsing and, when the page is JavaScript-rendered, a headless Chromium pass (`grab --browser` forces it).
 Useful flags: `generate --ref path.jpg` (choose references by hand), `--num`, `--prompt-file` (blank-line separated
 prompts), `upload --handle x` / `--product-id N` (attach to an existing product), `upload --with-description`,
 `--dry-run` on `generate` and `upload`. A starter template is in `templates/pdp_template.example.md`.
-Tests: `python -m unittest tests.test_pdpkit tests.test_pdpkit_shopify`.
+Tests: `python -m unittest tests.test_pdpkit tests.test_pdpkit_shopify tests.test_pdpkit_higgsfield_cli`.
 
 ## Setup
 
