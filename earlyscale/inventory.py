@@ -317,6 +317,28 @@ def refresh_hero_variants(conn: sqlite3.Connection, store_id: int, today: str) -
     return heroes
 
 
+def record_platform_stock(conn: sqlite3.Connection, store_id: int, today: str, products: list[dict]) -> int:
+    """Platforms that publish a stock count per variant (Squarespace qtyInStock, WooCommerce low_stock_remaining,
+    Magento only_x_left_in_stock) give the day's reading without a probe. Heroes are (re)selected as usual."""
+    stock = {v["variant_id"]: v.get("stock") for p in products for v in p.get("variants") or [] if v.get("stock") is not None}
+    if not stock:
+        return 0
+    heroes = refresh_hero_variants(conn, store_id, today)
+    n = 0
+    for h in heroes:
+        vid = h["variant_id"]
+        if vid not in stock:
+            continue
+        record_reading(conn, store_id, today, vid, h["product_id"], int(stock[vid]), "platform_json", "stock count published by the platform")
+        conn.execute("""UPDATE hero_variants SET signal_source = 'platform_json', inventory_tracked = 1, last_probe_date = ?,
+                        consecutive_failures = 0 WHERE store_id = ? AND variant_id = ?""", (today, store_id, vid))
+        n += 1
+    if n:
+        conn.commit()
+        compute_sales(conn, store_id, today)
+    return n
+
+
 def record_reading(conn: sqlite3.Connection, store_id: int, today: str, variant_id: int, product_id: int,
                    stock: int | None, source: str, message: str | None) -> None:
     conn.execute(
@@ -540,7 +562,7 @@ def product_rows(conn: sqlite3.Connection, store_id: int, as_of: str) -> dict[st
             if r[col] is not None:
                 p[key] = (p[key] or 0) + r[col]
     for p in out.values():
-        order = ["cart_probe", "theme_inventory", "blocked", "ads_only"]
+        order = ["cart_probe", "platform_json", "theme_inventory", "blocked", "ads_only"]
         p["signal_source"] = next((s for s in order if s in p["sources"]), "") or ""
         p["units_per_day_wow"] = round(p["upd_7d"] / p["upd_prev"], 2) if p["upd_7d"] is not None and p["upd_prev"] else None
     return out

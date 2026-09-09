@@ -55,12 +55,16 @@ def same_store(landing_domain: str | None, store_domain: str) -> bool:
 
 # ---------------------------------------------------------------- landing URL -> product (pure)
 
+GENERIC_PRODUCT_RE = re.compile(r"/(?:product|shop/p|p|item|items|store/p|producto|produkt|artikel)/([a-z0-9][a-z0-9\-_.%]*)", re.I)
+
+
 def handle_from_url(url: str | None) -> tuple[str | None, str | None]:
-    """(product_handle, page_handle) straight from the URL path, if present."""
+    """(product_handle, page_handle) straight from the URL path, if present. Shopify's /products/<handle> and the
+    product paths of the other platforms (/product/<slug>, /shop/p/<slug>, /p/<slug>, ...)."""
     if not url:
         return None, None
     path = urlparse(url).path
-    m = PRODUCT_RE.search(path)
+    m = PRODUCT_RE.search(path) or GENERIC_PRODUCT_RE.search(path)
     if m:
         return clean_handle(m.group(1)), None
     m = PAGE_RE.search(path)
@@ -95,6 +99,11 @@ def handles_from_html(html: str, variant_to_handle: dict[int, str] | None = None
         h = clean_handle(m.group(1))
         if h and h not in ("json", "js"):
             counts[h] += 1
+    if not counts:
+        for m in GENERIC_PRODUCT_RE.finditer(html):
+            h = clean_handle(m.group(1))
+            if h:
+                counts[h] += 1
     if variant_to_handle:
         for m in VARIANT_RE.finditer(html):
             h = variant_to_handle.get(int(m.group(1)))
@@ -167,6 +176,11 @@ def resolve_landing(conn: sqlite3.Connection, store_id: int, store_domain: str, 
     if not url:
         return out
     ph, pg = handle_from_url(url)
+    if not ph and same_store(ad.get("landing_domain"), store_domain):
+        # platforms with bare product paths (/wormwood-tincture.html, /<slug>): the last path segment is the handle
+        slug = _path_slug(url)
+        if slug and match_handle(slug, known):
+            ph = slug
     if ph and same_store(ad.get("landing_domain"), store_domain):
         m = match_handle(ph, known)
         if m:
@@ -181,6 +195,17 @@ def resolve_landing(conn: sqlite3.Connection, store_id: int, store_domain: str, 
     if hit.get("page_handle") and not out["page_handle"]:
         out["page_handle"] = hit["page_handle"]
     return out
+
+
+def _path_slug(url: str) -> str | None:
+    segs = [x for x in urlparse(url).path.split("/") if x]
+    if not segs:
+        return None
+    slug = unquote(segs[-1]).lower()
+    for ext in (".html", ".htm", ".php"):
+        if slug.endswith(ext):
+            slug = slug[: -len(ext)]
+    return slug or None
 
 
 def _fresh(row, today: str) -> bool:

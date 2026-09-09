@@ -1,0 +1,235 @@
+"""Catalogue adapters for non-Shopify platforms: parsers, detection, each adapter against a mock store, dates,
+the daily pass end to end, the landing join and Radar on a WooCommerce store."""
+import json
+import threading
+import unittest
+from http.server import HTTPServer
+from unittest import mock
+
+from earlyscale import ad_metrics, config, db, inventory, platforms, radar, sheets, shopify
+from earlyscale.cli import run_products_pass
+from tests import mock_platforms
+
+TODAY = "2026-09-08"
+
+
+def serve(platform):
+    srv = HTTPServer(("127.0.0.1", 0), mock_platforms.make_handler(platform))
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv, f"http://127.0.0.1:{srv.server_address[1]}"
+
+
+class PureParserTests(unittest.TestCase):
+    def test_product_page_json_ld(self):
+        html = ('<html><head><script type="application/ld+json">{"@context":"https://schema.org","@type":"Product","name":"Glow Serum",'
+                '"sku":"GS1","brand":{"@type":"Brand","name":"Acme"},"offers":[{"@type":"Offer","price":"39.00","availability":"https://schema.org/InStock"},'
+                '{"@type":"Offer","price":"99.00","sku":"GS3","availability":"http://schema.org/OutOfStock"}]}</script></head></html>')
+        f = platforms.parse_product_page(html, "/product/glow-serum/")
+        self.assertEqual((f["title"], f["brand"], f["path"]), ("Glow Serum", "Acme", "/product/glow-serum"))
+        self.assertEqual([(v["price"], v["available"]) for v in f["variants"]], [("39.00", True), ("99.00", False)])
+
+    def test_product_page_opengraph_only(self):
+        html = '<meta property="og:type" content="product"><meta property="og:title" content="Tea &amp; Co Sampler"><meta property="product:price:amount" content="19.5"><meta property="product:availability" content="instock">'
+        f = platforms.parse_product_page(html, "/p/tea-sampler")
+        self.assertEqual((f["title"], f["variants"][0]["price"], f["variants"][0]["available"]), ("Tea & Co Sampler", "19.5", True))
+
+    def test_non_product_page_is_none(self):
+        self.assertIsNone(platforms.parse_product_page("<html><body>About us</body></html>", "/about"))
+
+    def test_sitemap_parsing_and_product_url_filter(self):
+        idx = '<?xml version="1.0"?><sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><sitemap><loc>https://x.com/a.xml</loc></sitemap></sitemapindex>'
+        subs, urls = platforms.parse_sitemap(idx)
+        self.assertEqual((subs, urls), (["https://x.com/a.xml"], []))
+        um = '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://x.com/product/a</loc><lastmod>2026-09-01</lastmod></url><url><loc>https://x.com/collections/all</loc></url></urlset>'
+        subs, urls = platforms.parse_sitemap(um)
+        self.assertEqual(urls, [("https://x.com/product/a", "2026-09-01"), ("https://x.com/collections/all", None)])
+        self.assertTrue(platforms.is_product_url("https://x.com/product/a"))
+        self.assertTrue(platforms.is_product_url("https://x.com/shop/p/glow"))
+        self.assertTrue(platforms.is_product_url("https://x.com/en-us/products/glow"))
+        self.assertFalse(platforms.is_product_url("https://x.com/collections/all"))
+        self.assertFalse(platforms.is_product_url("https://x.com/blog/post"))
+        self.assertTrue(platforms.is_product_url("https://x.com/glow-serum.html", "sitemap-products.xml"))   # bare paths count inside a product sitemap
+        self.assertFalse(platforms.is_product_url("https://x.com/glow-serum.html", "sitemap.xml"))
+
+    def test_make_product_ids_are_stable_and_dates_normalised(self):
+        from datetime import datetime, timezone
+        ms = int(datetime(2026, 9, 8, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        a = platforms.make_product("/product/glow/", "Glow", [{"price": "10", "sku": "A"}], created_at=ms)
+        b = platforms.make_product("/product/glow", "Glow", [{"price": "10", "sku": "A"}])
+        self.assertEqual((a["product_id"], a["handle"], a["url_path"]), (b["product_id"], "glow", "/product/glow"))
+        self.assertEqual(a["variants"][0]["variant_id"], b["variants"][0]["variant_id"])
+        self.assertEqual(a["created_at"], "2026-09-08T12:00:00+00:00")
+        self.assertEqual(platforms._iso("2026-09-01 10:00:00"), "2026-09-01T10:00:00+00:00")
+        self.assertEqual(platforms._iso("Mon, 07 Sep 2026 10:00:00 +0000"), "2026-09-07T10:00:00+00:00")
+        self.assertIsNone(platforms._iso("soon"))
+
+
+class DetectAndAdapterTests(unittest.TestCase):
+    def _run(self, platform):
+        srv, base = serve(platform)
+        try:
+            session = shopify.make_session()
+            info = platforms.detect(session, base)
+            cat = platforms.fetch_catalogue(base, session, platform_hint=info, today=TODAY)
+            return info, cat, srv.RequestHandlerClass.stats
+        finally:
+            srv.shutdown()
+
+    def test_woocommerce(self):
+        info, cat, _ = self._run("woocommerce")
+        self.assertEqual((info["platform"], cat.platform), ("woocommerce", "woocommerce"))
+        by = {p["handle"]: p for p in cat.products}
+        self.assertEqual(sorted(by), ["magnesium-glycinate", "tart-cherry-sleep-gummies", "wormwood-tincture"])
+        p = by["tart-cherry-sleep-gummies"]
+        self.assertEqual((p["url_path"], p["min_price"], p["variant_count"], p["sold_out_variants"]), ("/product/tart-cherry-sleep-gummies", 34.0, 1, 0))
+        self.assertEqual(p["created_at"][:10], "2026-08-27")                         # wp/v2 date_gmt
+        self.assertEqual(by["wormwood-tincture"]["sold_out_variants"], 1)
+        self.assertEqual([p["collection_position"] for p in cat.products], [0, 1, 2])   # popularity order
+
+    def test_squarespace_with_stock(self):
+        info, cat, _ = self._run("squarespace")
+        self.assertEqual(cat.platform, "squarespace")
+        by = {p["handle"]: p for p in cat.products}
+        v = by["tart-cherry-sleep-gummies"]["variants"][0]
+        self.assertEqual((v["stock"], v["inventory_management"], v["price"], v["available"]), (120, "shopify", 34.0, True))
+        self.assertIsNone(by["magnesium-glycinate"]["variants"][0]["stock"])          # unlimited
+        self.assertEqual(by["wormwood-tincture"]["sold_out_variants"], 1)
+        self.assertEqual(by["tart-cherry-sleep-gummies"]["created_at"][:10], "2026-08-27")
+
+    def test_magento_graphql(self):
+        info, cat, _ = self._run("magento")
+        self.assertEqual(cat.platform, "magento")
+        by = {p["handle"]: p for p in cat.products}
+        self.assertEqual(by["wormwood-tincture"]["url_path"], "/wormwood-tincture.html")
+        self.assertEqual(by["wormwood-tincture"]["variants"][0]["available"], False)
+        self.assertEqual(by["tart-cherry-sleep-gummies"]["variants"][0]["stock"], 120)
+        self.assertEqual(by["tart-cherry-sleep-gummies"]["created_at"][:10], "2026-08-27")
+
+    def test_generic_sitemap_json_ld_with_budget_and_cache(self):
+        srv, base = serve("generic")
+        try:
+            conn = db.connect(":memory:")
+            sid = db.upsert_store(conn, base)
+            session = shopify.make_session()
+            with mock.patch.object(config, "CATALOGUE_MAX_PAGES", 2):
+                cat = platforms.fetch_catalogue(base, session, conn, sid, TODAY)
+            self.assertEqual((cat.platform, cat.partial, len(cat.products)), ("generic", True, 3))
+            read = [p for p in cat.products if p["variant_count"]]
+            self.assertEqual(len(read), 2)                                              # budget: two pages read, one placeholder
+            self.assertEqual(srv.RequestHandlerClass.stats["product_pages"], 2)
+            placeholder = next(p for p in cat.products if not p["variant_count"])
+            self.assertTrue(placeholder["title"])                                       # slug-derived title, ads can attach
+            # next run reads the remaining page and keeps the cached two (no refetch within CATALOGUE_REFRESH_DAYS)
+            with mock.patch.object(config, "CATALOGUE_MAX_PAGES", 2):
+                cat2 = platforms.fetch_catalogue(base, session, conn, sid, "2026-09-09")
+            self.assertEqual((cat2.partial, srv.RequestHandlerClass.stats["product_pages"]), (False, 3))
+            by = {p["handle"]: p for p in cat2.products}
+            self.assertEqual((by["wormwood-tincture"]["vendor"], by["wormwood-tincture"]["sold_out_variants"]), ("FakeBrand", 1))
+            self.assertEqual(conn.execute("SELECT platform FROM stores WHERE id = ?", (sid,)).fetchone()[0], "generic")
+        finally:
+            srv.shutdown()
+
+    def test_bigcommerce_dates_from_rss(self):
+        info, cat, _ = self._run("bigcommerce")
+        self.assertEqual((info["platform"], cat.platform), ("bigcommerce", "bigcommerce"))
+        by = {p["handle"]: p for p in cat.products}
+        self.assertEqual(by["tart-cherry-sleep-gummies"]["created_at"][:10], "2026-08-27")
+
+    def test_headless_shopify_uses_the_myshopify_origin(self):
+        srv, base = serve("headless")
+        try:
+            session = shopify.make_session()
+            info = platforms.detect(session, base)
+            self.assertEqual((info["platform"], info["myshopify"]), ("shopify_headless", "fakebrand.myshopify.com"))
+            fake_raw = [{"id": 1, "handle": "glow", "title": "Glow", "created_at": "2026-08-01T00:00:00Z", "published_at": "2026-08-01T00:00:00Z",
+                         "updated_at": "2026-09-01T00:00:00Z", "variants": [{"id": 11, "title": "d", "price": "20.00", "available": True}]}]
+            with mock.patch.object(shopify, "fetch_store", lambda dom, s: (fake_raw, {1: 0}, 1)) as _:
+                cat = platforms.fetch_catalogue(base, session, platform_hint=info, today=TODAY)
+            self.assertEqual((cat.platform, cat.products[0]["handle"], cat.extra["myshopify"]), ("shopify_headless", "glow", "fakebrand.myshopify.com"))
+        finally:
+            srv.shutdown()
+
+
+class FillDatesTests(unittest.TestCase):
+    def test_first_seen_becomes_created_only_after_the_first_snapshot(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        day1 = [platforms.make_product("/p/a", "A", [{"price": 1}]), platforms.make_product("/p/b", "B", [{"price": 1}])]
+        platforms.fill_dates(conn, sid, day1, "2026-09-01")
+        self.assertEqual([p["created_at"] for p in day1], [None, None])                # present on the first snapshot: unknown age
+        db.write_product_snapshot(conn, sid, "2026-09-01", day1)
+        day5 = [platforms.make_product("/p/a", "A", [{"price": 1}]), platforms.make_product("/p/c", "C", [{"price": 1}])]
+        platforms.fill_dates(conn, sid, day5, "2026-09-05")
+        by = {p["handle"]: p for p in day5}
+        self.assertIsNone(by["a"]["created_at"])
+        self.assertEqual((by["c"]["created_at"], by["c"]["published_at"]), ("2026-09-05T00:00:00+00:00", "2026-09-05T00:00:00+00:00"))
+        dated = [platforms.make_product("/p/d", "D", [{"price": 1}], created_at="2026-01-01T00:00:00+00:00")]
+        platforms.fill_dates(conn, sid, dated, "2026-09-05")
+        self.assertEqual(dated[0]["created_at"], "2026-01-01T00:00:00+00:00")          # a platform date is kept
+
+
+class DailyPassTests(unittest.TestCase):
+    def test_run_products_pass_over_three_platforms_and_signals(self):
+        servers = [serve(p) for p in ("woocommerce", "squarespace", "generic")]
+        try:
+            conn = db.connect(":memory:")
+            stores = [{"store_domain": base} for _, base in servers]
+            with mock.patch.object(config, "CATALOGUE_MAX_PAGES", 10):
+                ok, failed = run_products_pass(conn, stores, TODAY)
+            self.assertEqual((ok, failed), (3, 0))
+            plats = {r[0]: r[1] for r in conn.execute("SELECT store_domain, platform FROM stores")}
+            self.assertEqual(sorted(plats.values()), ["generic", "squarespace", "woocommerce"])
+            # the Squarespace stock count became an inventory reading for its hero variants, no probe needed
+            src = {r[0] for r in conn.execute("SELECT signal_source FROM inventory_daily")}
+            self.assertEqual(src, {"platform_json"})
+            with mock.patch.object(sheets, "watched_store_ids", lambda c: None):
+                rows = sheets.signals_rows(conn)
+                srows = sheets.stores_rows(conn)
+            self.assertEqual(len(rows), 9)
+            H = sheets.SIGNALS_HEADERS
+            generic_base = servers[2][1]
+            gen = [r for r in rows if r[0] == generic_base]
+            self.assertEqual(len(gen), 3)
+            self.assertTrue(all(r[H.index("days_since_created")] == "" for r in gen))    # no dates on the platform, first snapshot: unknown age, not "0 days"
+            woo = [r for r in rows if r[0] == servers[0][1]]
+            self.assertEqual(sorted(r[H.index("days_since_created")] for r in woo), [12, 40, 200])   # WooCommerce dates come through
+            SH = sheets.STORES_HEADERS
+            self.assertEqual(sorted(r[SH.index("platform")] for r in srows), ["generic", "squarespace", "woocommerce"])
+        finally:
+            for srv, _ in servers:
+                srv.shutdown()
+
+    def test_landing_join_on_a_woocommerce_store(self):
+        srv, base = serve("woocommerce")
+        try:
+            conn = db.connect(":memory:")
+            sid = db.upsert_store(conn, base)
+            run_products_pass(conn, [{"store_domain": base}], TODAY)
+            known, v2h = ad_metrics._known_handles(conn, sid, TODAY)
+            self.assertIn("tart-cherry-sleep-gummies", known)
+            host = base.split("//")[1]
+            ad = {"landing_url": f"{base}/product/tart-cherry-sleep-gummies/?utm=1", "landing_domain": host}
+            r = ad_metrics.resolve_landing(conn, sid, base, ad, known, v2h, None, {}, TODAY)
+            self.assertEqual((r["product_handle"], r["resolved_via"]), ("tart-cherry-sleep-gummies", "url"))
+            ad2 = {"landing_url": f"{base}/wormwood-tincture.html", "landing_domain": host}     # bare path (Magento style)
+            r2 = ad_metrics.resolve_landing(conn, sid, base, ad2, known, v2h, None, {}, TODAY)
+            self.assertEqual(r2["product_handle"], "wormwood-tincture")
+        finally:
+            srv.shutdown()
+
+
+class RadarPlatformTests(unittest.TestCase):
+    def test_woocommerce_store_is_classified_by_platform(self):
+        srv, base = serve("woocommerce")
+        try:
+            cls = radar.classify_domain(base, [], shopify.make_session())
+            self.assertEqual((cls["type"], cls["store_domain"], len(cls["products"])), ("woocommerce", base, 3))
+            rec = {"type": "woocommerce", "store_age_days": 30, "hot_new_product": None, "status": "candidate", "active_ads": 2}
+            self.assertTrue(radar._eligible(rec))
+            self.assertTrue(radar._needs_search(rec, TODAY))
+        finally:
+            srv.shutdown()
+
+
+if __name__ == "__main__":
+    unittest.main()

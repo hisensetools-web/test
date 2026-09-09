@@ -479,6 +479,42 @@ the Meta pass and the Sheets sync. `INVENTORY=1` (or `run --inventory`) probes e
 only after the readings from the first stores look right. `--no-inventory` skips the pass.
 Budget: about 40 probes x 10 s = 7 minutes per store per day.
 
+## Every storefront platform, not only Shopify
+
+`earlyscale/platforms.py` detects what a store runs on and reads its catalogue with a matching adapter.
+Every adapter returns the same product rows Shopify does, so snapshots, deltas, Signals, the landing
+join, the inventory pass and Radar work the same for all of them. The Stores tab shows the `platform`.
+
+| platform | detected by | catalogue from | dates | stock |
+|---|---|---|---|---|
+| `shopify` | `/products.json` answers | products.json + /collections/all order | created / published | cart probe (rung 1) |
+| `shopify_headless` | `cdn.shopify.com` assets, `<shop>.myshopify.com` in the page | the myshopify.com origin's products.json | created / published | cart probe on that origin |
+| `woocommerce` | `wp-content/plugins/woocommerce` | public Store API `/wp-json/wc/store/v1/products`, popularity order | `wp/v2/product` when the site exposes it | `low_stock_remaining` |
+| `squarespace` | `Static.SQUARESPACE_CONTEXT` | `/shop?format=json` (any commerce collection) | `addedOn` / `publishOn` | `qtyInStock` per variant |
+| `magento` | `Magento_`, `/static/version` | public `/graphql` products query | `created_at` | `only_x_left_in_stock` |
+| `bigcommerce` | `cdn11.bigcommerce.com`, stencil | sitemap + product pages (JSON-LD) | new-products RSS `pubDate` | JSON-LD `inventoryLevel` if present |
+| `wix`, `generic` | `wixstatic.com` / nothing known | sitemap product URLs + product pages (JSON-LD / OpenGraph) | none | JSON-LD `inventoryLevel` if present |
+
+**Dates a platform does not publish** come from `product_first_seen`: the day this tracker first saw
+the product URL. Products already there on a store's first snapshot get `created_at` NULL (unknown age,
+blank `days_since_created`) rather than "0 days", so a newly added store does not look like it launched
+its whole catalogue today. From the second snapshot on, a new URL is a new product.
+
+**Generic stores are read gradually.** The sitemap gives every product URL at once; product pages are
+read `CATALOGUE_MAX_PAGES` (60) per run, unread ones first, then pages older than
+`CATALOGUE_REFRESH_DAYS` (3), and cached in `product_pages`. Until a page has been read its row carries
+the slug as title and no price, so ads can already attach to it. The detected platform is trusted for
+`CATALOGUE_REDETECT_DAYS` (14); an adapter that fails falls back to the generic sitemap path.
+
+**Inventory:** platforms that publish stock counts feed the inventory pass directly
+(`signal_source=platform_json`, no probe). Non-Shopify stores get no cart probe.
+
+**Landing join:** ad landing URLs resolve to products on `/product/<slug>`, `/shop/p/<slug>`, `/p/<slug>`
+and bare `/<slug>.html` paths, not only `/products/<handle>`.
+
+**Radar** classifies any storefront platform, not only Shopify: the Candidates `type` column carries
+the platform name; `funnel` still means no catalogue found anywhere.
+
 ## Scaling columns: pages per domain, landing paths, page-likes slope
 
 Three "is this store scaling" measurements, all derived from ads already in the database (no
@@ -535,10 +571,10 @@ stage that runs on all of them and an expensive stage that runs only where it ca
 
 **Stage 1, HTTP only, `RADAR_CHECK_WORKERS` (6) domains at a time:**
 
-1. Is it a Shopify storefront? (`/products.json` answers with products; `www.` and `shop.` variants are
-   tried too.) If not, the lander's outbound links (buy buttons, checkout, "shop now") are followed one
-   hop; if one of them is a Shopify store, that store is the candidate (`store_domain`) and the lander
-   is remembered in `lander_domain`.
+1. Is it a storefront on any platform (`platforms.is_store`: Shopify, headless Shopify, WooCommerce,
+   Squarespace, Magento, BigCommerce, Wix, or any site with a product sitemap and JSON-LD)? If not, the
+   lander's outbound links (buy buttons, checkout, "shop now") are followed one hop; if one of them is a
+   store, that store is the candidate (`store_domain`) and the lander is remembered in `lander_domain`.
    Still nothing: it is a **funnel**. With `RADAR_FUNNEL_MIN_ADS` (3) or more sweep ads pointing at it,
    it is parked as `type=funnel` and its ads, pages and landing URLs are tracked; with fewer it is
    `discarded` (news sites, app stores, one-off landers) and comes back automatically the day a later

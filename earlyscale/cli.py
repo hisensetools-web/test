@@ -13,7 +13,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, radar, scaling, sheets, shopify, store_age
+from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, platforms, radar, scaling, sheets, shopify, store_age
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist, update_watchlist_entry
 
 console = Console()
@@ -75,19 +75,27 @@ def run_products_pass(conn, stores: list[dict], snapshot_date: str, only: set[st
         conn.commit()
         t0 = time.monotonic()
         try:
-            raw, positions, pages = shopify.fetch_store(domain, session)
-            products = shopify.normalise_products(raw, positions)
+            cat = platforms.fetch_catalogue(domain, session, conn, store_id, snapshot_date)
+            products, pages = cat.products, cat.pages
             n = db.write_product_snapshot(conn, store_id, snapshot_date, products)
             dur = time.monotonic() - t0
             db.record_store_run(conn, run_id, store_id, snapshot_date, "ok", None, n, pages, dur)
             sold_out = sum(p["sold_out_variants"] for p in products)
-            log.info("%-28s ok  products=%-5d variants=%-5d sold_out_variants=%-4d pages=%d  %.1fs",
-                     domain, n, sum(p["variant_count"] for p in products), sold_out, pages, dur)
+            log.info("%-28s ok  %-16s products=%-5d variants=%-5d sold_out_variants=%-4d pages=%d  %.1fs%s",
+                     domain, cat.platform, n, sum(p["variant_count"] for p in products), sold_out, pages, dur,
+                     f"  ({cat.note})" if cat.note and cat.platform != "shopify" else "")
             ok += 1
-            try:   # shop id, once per store, quietly: Radar's store-age calibration uses it
-                store_age.ensure_identity(conn, store_id, domain, session)
+            if cat.platform in ("shopify", "shopify_headless"):
+                try:   # shop id, once per store, quietly: Radar's store-age calibration uses it
+                    store_age.ensure_identity(conn, store_id, cat.extra.get("myshopify") or domain, session)
+                except Exception as e:  # noqa: BLE001
+                    log.debug("%s shop id lookup failed: %s", domain, e)
+            try:   # a platform that publishes stock counts gives the inventory pass its readings for free
+                got = inventory.record_platform_stock(conn, store_id, snapshot_date, products)
+                if got:
+                    log.info("%-28s stock from the platform for %d hero variant(s)", domain, got)
             except Exception as e:  # noqa: BLE001
-                log.debug("%s shop id lookup failed: %s", domain, e)
+                log.debug("%s platform stock failed: %s", domain, e)
         except Exception as e:  # noqa: BLE001 - by design: log and continue
             dur = time.monotonic() - t0
             db.record_store_run(conn, run_id, store_id, snapshot_date, "error", str(e)[:500], 0, 0, dur)
@@ -508,6 +516,12 @@ def run_inventory_pass(conn, stores: list[dict], snapshot_date: str) -> list[dic
         store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
         conn.commit()
         t0 = time.monotonic()
+        plat = (conn.execute("SELECT platform FROM stores WHERE id = ?", (store_id,)).fetchone() or [None])[0]
+        if plat and plat not in ("shopify", "shopify_headless"):
+            log.info("%-28s %s store: no cart probe (stock comes from the platform's own JSON when it publishes any)", domain, plat)
+            results.append({"store": domain, "ok": True, "cart_probe": 0, "theme_inventory": 0, "ads_only": 0, "blocked": 0,
+                            "components": 0, "skipped": 0, "alerts": len(inventory.run_alerts(conn, store_id, domain, snapshot_date))})
+            continue
         try:
             counts = inventory.probe_store(conn, store_id, domain, snapshot_date)
             alerts = inventory.run_alerts(conn, store_id, domain, snapshot_date)
@@ -1061,15 +1075,15 @@ def _radar_summary(conn, out: dict) -> None:
                           + (f"; [yellow]{sw['deferred']} deferred to the next sweep (budget)[/]" if sw.get("deferred") else ""))
     if out.get("web"):
         console.print(f"web search: {out['web']['queries']} queries, {out['web']['domains']} domains")
-    console.print(f"new landing domains: {out['found']} found -> Shopify stores {out['shopify']} (promoted {out['promoted']}, parked "
+    console.print(f"new landing domains: {out['found']} found -> storefronts {out['shopify']} (promoted {out['promoted']}, parked "
                   f"{out['parked'] - out['funnels']}), funnels parked {out['funnels']}, discarded {out['discarded']} "
-                  f"(non-Shopify with < {config.RADAR_FUNNEL_MIN_ADS} ads)"
+                  f"(no storefront and < {config.RADAR_FUNNEL_MIN_ADS} ads)"
                   + (f"; [yellow]{out['deferred_triage']} not checked yet (budget)[/]" if out.get("deferred_triage") else ""))
     console.print(f"re-checked {out['retriaged']} candidate(s) from stored facts, refreshed {out['refreshed']} catalogue(s); "
                   f"Ad Library searches run {out['searched']}"
                   + (f", [yellow]{out['deferred_search']} waiting for the next run[/]" if out.get("deferred_search") else "")
                   + f"; promoted later {out['promoted_later']}")
-    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']} (Shopify {c['shopify']}, funnels {c['funnel']}, "
+    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']} (storefronts {c['shopify']}, funnels {c['funnel']}, "
                   f"{c['unsearched']} not yet searched), promoted {c['promoted']}, manual {c['watchlist']}, discarded {c['discarded']}")
 
 
@@ -1127,7 +1141,7 @@ def _hook_table(conn) -> None:
     if not rows or not any(r["sweeps"] for r in rows):
         return
     t = Table(title="hook phrases by yield (delete a phrase with 0 promotable stores over 2 sweeps; add siblings to the top ones)")
-    for c in ("hook", "sweeps", "ads", "domains", "promoted", "shopify cands", "funnels", "discarded", "verdict"):
+    for c in ("hook", "sweeps", "ads", "domains", "promoted", "store cands", "funnels", "discarded", "verdict"):
         t.add_column(c, justify="left" if c in ("hook", "verdict") else "right")
     for r in rows:
         t.add_row(r["hook"], str(r["sweeps"]), str(r["ads"]), str(r["domains"]), str(r["promoted"]), str(r["candidates"]), str(r["funnels"]),
@@ -1149,7 +1163,7 @@ def cmd_radar_report(args) -> int:
     conn = db.connect(args.db)
     _hook_table(conn)
     c = radar.summary_counts(conn)
-    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']} (Shopify {c['shopify']}, funnels {c['funnel']}, "
+    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']} (storefronts {c['shopify']}, funnels {c['funnel']}, "
                   f"{c['unsearched']} not yet searched), promoted {c['promoted']}, manual {c['watchlist']}, discarded {c['discarded']}")
     runs = conn.execute("SELECT kind, query, started_at, ads_found, domains_found, note FROM radar_runs ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
     if runs:

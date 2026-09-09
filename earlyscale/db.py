@@ -62,7 +62,26 @@ CREATE TABLE IF NOT EXISTS products_daily (
     max_price           REAL,
     collection_position INTEGER,            -- 0-based index in /collections/all, NULL if absent
     fetched_at          TEXT NOT NULL,
+    url_path            TEXT,               -- /products/<handle> on Shopify; the product page path on other platforms
     PRIMARY KEY (snapshot_date, store_id, product_id)
+);
+-- The day this tracker first saw a product URL: created_at for platforms that do not publish dates.
+CREATE TABLE IF NOT EXISTS product_first_seen (
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    url_path        TEXT NOT NULL,
+    first_seen      TEXT NOT NULL,
+    PRIMARY KEY (store_id, url_path)
+);
+-- Product pages read by the generic (sitemap + JSON-LD) adapter, refreshed every CATALOGUE_REFRESH_DAYS.
+CREATE TABLE IF NOT EXISTS product_pages (
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    url_path        TEXT NOT NULL,
+    first_seen      TEXT NOT NULL,
+    last_fetched    TEXT,
+    status          INTEGER,
+    lastmod         TEXT,
+    json            TEXT,                   -- parsed facts (title, brand, variants, dates)
+    PRIMARY KEY (store_id, url_path)
 );
 CREATE INDEX IF NOT EXISTS idx_products_daily_handle ON products_daily(store_id, handle, snapshot_date);
 
@@ -78,6 +97,7 @@ CREATE TABLE IF NOT EXISTS variants_daily (
     available           INTEGER NOT NULL,   -- 0/1
     inventory_management TEXT,              -- 'shopify' = stock is tracked (rung-1 cart probe applies); NULL = unknown/untracked
     inventory_policy    TEXT,               -- deny (stop selling at 0) | continue (oversell allowed)
+    stock               INTEGER,            -- a stock count the platform itself published (Squarespace qtyInStock, Woo low_stock_remaining...)
     PRIMARY KEY (snapshot_date, store_id, variant_id)
 );
 
@@ -418,9 +438,10 @@ def _migrate(conn: sqlite3.Connection) -> None:
                           ("store_domain", "TEXT")],
         "alerts": [("dedupe_key", "TEXT")],
         "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
-                   ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT")],
-        "products_daily": [("unlisted", "INTEGER DEFAULT 0")],   # 1 = live product page not in products.json (found via ads)
-        "variants_daily": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
+                   ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),
+                   ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT")],
+        "variants_daily": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT"), ("stock", "INTEGER")],
+        "products_daily": [("unlisted", "INTEGER DEFAULT 0"), ("url_path", "TEXT")],
         "hero_variants": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
         "meta_ads_daily": [("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
                            ("engagement_per_day", "REAL"),
@@ -508,13 +529,13 @@ def write_product_snapshot(conn: sqlite3.Connection, store_id: int, snapshot_dat
             """INSERT INTO products_daily
                (snapshot_date, store_id, product_id, handle, title, vendor, product_type, tags,
                 created_at, published_at, updated_at, variant_count, sold_out_variants,
-                min_price, max_price, collection_position, fetched_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                min_price, max_price, collection_position, fetched_at, url_path)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 (snapshot_date, store_id, p["product_id"], p["handle"], p["title"], p["vendor"],
                  p["product_type"], json.dumps(p["tags"]), p["created_at"], p["published_at"],
                  p["updated_at"], p["variant_count"], p["sold_out_variants"], p["min_price"],
-                 p["max_price"], p["collection_position"], fetched_at)
+                 p["max_price"], p["collection_position"], fetched_at, p.get("url_path") or f"/products/{p['handle']}")
                 for p in products
             ],
         )
@@ -523,12 +544,12 @@ def write_product_snapshot(conn: sqlite3.Connection, store_id: int, snapshot_dat
         conn.executemany(
             """INSERT INTO variants_daily
                (snapshot_date, store_id, product_id, variant_id, title, sku, price, compare_at_price, available,
-                inventory_management, inventory_policy)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                inventory_management, inventory_policy, stock)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
             [
                 (snapshot_date, store_id, p["product_id"], v["variant_id"], v["title"], v["sku"],
                  v["price"], v["compare_at_price"], 1 if v["available"] else 0,
-                 v.get("inventory_management"), v.get("inventory_policy"))
+                 v.get("inventory_management"), v.get("inventory_policy"), v.get("stock"))
                 for p in products for v in p["variants"]
             ],
         )

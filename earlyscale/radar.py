@@ -296,13 +296,17 @@ def new_domains(conn: sqlite3.Connection, watchlist_path: Path | None = None) ->
     return out
 
 
-def is_shopify(domain: str, session=None) -> tuple[bool, list[dict]]:
-    """products.json check; returns (True, normalised products) or (False, [])."""
-    try:
-        raw, positions, _ = shopify.fetch_store(domain, session)
-        return True, shopify.normalise_products(raw, positions)
-    except Exception:  # noqa: BLE001 - StoreFetchError, JSON errors, network
-        return False, []
+def is_shopify(domain: str, session=None) -> tuple[str | bool, list[dict]]:
+    """Storefront check on any platform (name kept for the callers): (platform name, normalised products) when the
+    domain sells products through Shopify, headless Shopify, WooCommerce, Squarespace, Magento, BigCommerce, Wix
+    or a sitemap + JSON-LD site; (False, []) otherwise."""
+    from . import platforms
+    plat, products = platforms.is_store(domain, session)
+    return (plat, products) if plat else (False, [])
+
+
+def _platform_of(ok) -> str:
+    return ok if isinstance(ok, str) else "shopify"
 
 
 CTA_HINT = re.compile(r"/products/|/cart|/checkout|/collections|/order|shop|buy|store|get-|offer|discount", re.I)
@@ -325,9 +329,10 @@ def landing_urls(conn: sqlite3.Connection, domain: str, limit: int = 3) -> list[
                                        (domain, limit))]
 
 
-def follow_lander_urls(urls: list[str], domain: str, session=None, fetch=ad_metrics.fetch_landing, check=is_shopify) -> tuple[str | None, list[dict]]:
-    """For a non-Shopify landing domain: open up to 3 of its ad landing pages, collect the shop domains they
-    link to, and return the first that is a Shopify storefront (with its products). Pure HTTP, thread-safe."""
+def follow_lander_urls(urls: list[str], domain: str, session=None, fetch=ad_metrics.fetch_landing, check=is_shopify,
+                       with_platform: bool = False):
+    """For a non-store landing domain: open up to 3 of its ad landing pages, collect the shop domains they link to,
+    and return the first that is a storefront (with its products). Pure HTTP, thread-safe."""
     session = session or shopify.make_session()
     cands: Counter = Counter()
     for u in urls:
@@ -340,8 +345,8 @@ def follow_lander_urls(urls: list[str], domain: str, session=None, fetch=ad_metr
     for d, _ in cands.most_common(3):
         ok, products = check(d, session)
         if ok:
-            return d, products
-    return None, []
+            return (d, products, _platform_of(ok)) if with_platform else (d, products)
+    return (None, [], None) if with_platform else (None, [])
 
 
 def follow_lander(conn: sqlite3.Connection, domain: str, session=None, fetch=ad_metrics.fetch_landing, check=is_shopify) -> tuple[str | None, list[dict]]:
@@ -354,10 +359,10 @@ def classify_domain(domain: str, urls: list[str], session=None, check=is_shopify
     session = session or shopify.make_session()
     ok, products = check(domain, session)
     if ok:
-        return {"type": "shopify", "store_domain": domain, "products": products, "lander_domain": None}
-    shop, products = follow_lander_urls(urls, domain, session, fetch=fetch, check=check)
+        return {"type": _platform_of(ok), "store_domain": domain, "products": products, "lander_domain": None}
+    shop, products, plat = follow_lander_urls(urls, domain, session, fetch=fetch, check=check, with_platform=True)
     if shop:
-        return {"type": "shopify", "store_domain": shop, "products": products, "lander_domain": domain}
+        return {"type": plat, "store_domain": shop, "products": products, "lander_domain": domain}
     return {"type": "funnel", "store_domain": domain, "products": [], "lander_domain": None}
 
 
@@ -422,7 +427,7 @@ def decide(age_days: int | None, active_ads: int, hot_new_product: str | None) -
 def _eligible(rec: dict) -> bool:
     """Could this row ever promote? Shopify stores that are young or have a hot new product. Old stores without one
     can only get there through a new product, which the weekly products refresh picks up."""
-    if rec.get("type") != "shopify":
+    if rec.get("type") in (None, "funnel"):
         return False
     age = rec.get("store_age_days")
     return (age is not None and age <= config.RADAR_MAX_AGE_DAYS) or bool(rec.get("hot_new_product"))
@@ -447,7 +452,7 @@ def _store_facts(conn, rec: dict, store_domain: str, products: list[dict], today
     rec["store_first_created"] = firsts[0] if firsts else rec.get("store_first_created")
     rec["products_fetched"] = today
     rec["handles_new"] = ",".join(sorted(p["handle"] for p in products if _published_within(p, today, 30)))[:2000]
-    if rec.get("shop_id") is None:
+    if rec.get("shop_id") is None and rec.get("type") in ("shopify", "shopify_headless"):
         try:
             rec["shop_id"] = identity(store_domain, session).get("shop_id")
         except Exception:  # noqa: BLE001
@@ -515,7 +520,7 @@ def triage_domain(conn: sqlite3.Connection, browser, domain: str, source: str, t
         if follow is not None:                      # legacy hook used by tests: (conn, domain, session) -> (shop, products)
             ok, products = check(domain, session)
             if ok:
-                classified = {"type": "shopify", "store_domain": domain, "products": products, "lander_domain": None}
+                classified = {"type": _platform_of(ok), "store_domain": domain, "products": products, "lander_domain": None}
             else:
                 shop, products = follow(conn, domain, session)
                 classified = ({"type": "shopify", "store_domain": shop, "products": products, "lander_domain": domain} if shop
@@ -530,13 +535,13 @@ def triage_domain(conn: sqlite3.Connection, browser, domain: str, source: str, t
     if classified is not None:
         rec["store_domain"] = classified["store_domain"]
     store_domain = rec.get("store_domain") or domain
-    if rec["type"] == "shopify" and products:
+    if rec["type"] != "funnel" and products:
         _store_facts(conn, rec, store_domain, products, today, identity, session)
-    elif rec["type"] != "shopify":
+    elif rec["type"] == "funnel":
         rec["products"] = 0
     _stats(conn, rec, store_domain, products, today)
     forced = (rec.get("promote_flag") or "").upper() == "Y"
-    promote = rec["type"] == "shopify" and (forced or decide(rec["store_age_days"], rec["active_ads"], rec["hot_new_product"]))
+    promote = rec["type"] != "funnel" and (forced or decide(rec["store_age_days"], rec["active_ads"], rec["hot_new_product"]))
     rec["searched"] = False
     if not promote and allow_search and _needs_search(rec, today):
         if True:
@@ -553,7 +558,7 @@ def triage_domain(conn: sqlite3.Connection, browser, domain: str, source: str, t
             except Exception as e:  # noqa: BLE001
                 log.warning("radar: ad search for %s failed: %s", store_domain, e)
             _stats(conn, rec, store_domain, products, today)
-            promote = rec["type"] == "shopify" and decide(rec["store_age_days"], rec["active_ads"], rec["hot_new_product"])
+            promote = rec["type"] != "funnel" and decide(rec["store_age_days"], rec["active_ads"], rec["hot_new_product"])
     if promote and rec.get("status") != "promoted":
         note = f"radar: {rec['source']} {today}" + (f" via {domain}" if rec.get("lander_domain") else "")
         append_to_watchlist({"store_domain": store_domain, "meta_page_name": rec.get("top_page") or "", "notes": note}, watchlist_path)
@@ -692,7 +697,7 @@ def run_radar(conn: sqlite3.Connection, browser, today: str, do_sweep: bool | No
     src_of = {d: src for d, src, _ in todo}
     stale = (date.fromisoformat(today) - timedelta(days=config.RADAR_REFRESH_DAYS)).isoformat()
     refresh_rows = {r["domain"]: r["source"] for r in conn.execute("""SELECT domain, source FROM radar_domains WHERE status = 'candidate'
-                                                                       AND type = 'shopify' AND COALESCE(products_fetched, '') < ?""", (stale,))}
+                                                                       AND type != 'funnel' AND COALESCE(products_fetched, '') < ?""", (stale,))}
     stage1 = [d for d, _, _ in todo] + [d for d in refresh_rows if d not in src_of]
     done = 0
     for dom, cls in classify_many(conn, stage1, check=check, fetch=fetch, workers=workers, deadline=deadline):
@@ -719,7 +724,7 @@ def run_radar(conn: sqlite3.Connection, browser, today: str, do_sweep: bool | No
     # stage 2: Ad Library searches where they can change a verdict, most sweep ads first, within the budget
     cands = [dict(r) for r in conn.execute("SELECT * FROM radar_domains WHERE status = 'candidate' ORDER BY ads_in_sweeps DESC, store_age_days ASC")]
     queue = [c for c in cands if _needs_search(c, today)]
-    queue.sort(key=lambda c: (0 if c["type"] == "shopify" else 1, -(c.get("ads_in_sweeps") or 0)))
+    queue.sort(key=lambda c: (0 if c["type"] != "funnel" else 1, -(c.get("ads_in_sweeps") or 0)))
     batch = queue[: config.RADAR_MAX_TRIAGE]
     out["deferred_search"] = len(queue) - len(batch)
     for i, c in enumerate(batch):
@@ -738,7 +743,7 @@ def run_radar(conn: sqlite3.Connection, browser, today: str, do_sweep: bool | No
     for r in conn.execute("SELECT domain, type, status, last_checked FROM radar_domains"):
         if r["domain"] not in src_of or r["last_checked"] != today:
             continue
-        out["shopify"] += 1 if r["type"] == "shopify" else 0
+        out["shopify"] += 1 if r["type"] != "funnel" else 0
         if r["status"] == "promoted":
             out["promoted"] += 1
         elif r["status"] == "discarded":
@@ -790,7 +795,7 @@ def summary_counts(conn: sqlite3.Connection) -> dict:
         c[r["status"]] = c.get(r["status"], 0) + r["n"]
         if r["type"] == "funnel" and r["status"] == "candidate":
             c["funnel"] += r["n"]
-        if r["type"] == "shopify" and r["status"] == "candidate":
+        if r["type"] != "funnel" and r["status"] == "candidate":
             c["shopify"] += r["n"]
     c["domains"] = sum(v for k, v in c.items() if k in ("candidate", "promoted", "discarded", "watchlist"))
     c["unsearched"] = conn.execute("SELECT COUNT(*) FROM radar_domains WHERE status = 'candidate' AND searched_at IS NULL").fetchone()[0]
@@ -809,7 +814,7 @@ def hook_yield(conn: sqlite3.Connection) -> list[dict]:
         ads = conn.execute("SELECT COUNT(DISTINCT ad_id) FROM radar_ad_hits WHERE source = ?", (src,)).fetchone()[0]
         doms = {r[0] for r in conn.execute("SELECT DISTINCT landing_domain FROM radar_ad_hits WHERE source = ? AND landing_domain IS NOT NULL", (src,))}
         promoted = sum(1 for d in doms if status.get(d, ("", ""))[0] == "promoted")
-        cands = sum(1 for d in doms if status.get(d, ("", ""))[0] == "candidate" and status[d][1] == "shopify")
+        cands = sum(1 for d in doms if status.get(d, ("", ""))[0] == "candidate" and status[d][1] != "funnel")
         funnels = sum(1 for d in doms if status.get(d, ("", ""))[0] == "candidate" and status[d][1] == "funnel")
         discarded = sum(1 for d in doms if status.get(d, ("", ""))[0] == "discarded")
         out.append({"hook": h, "sweeps": sweeps, "ads": ads, "domains": len(doms), "promoted": promoted, "candidates": cands,

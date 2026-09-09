@@ -21,7 +21,7 @@ from .watchlist import read_watchlist
 
 log = logging.getLogger("earlyscale.sheets")
 
-STORES_HEADERS = ["store", "meta page", "last status", "products", "sold-out variants", "new products 7d",
+STORES_HEADERS = ["store", "meta page", "platform", "last status", "products", "sold-out variants", "new products 7d",
                   "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date",
                   "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow",
                   "pages_per_domain", "pages_new_7d", "page_likes_slope_max",
@@ -79,7 +79,7 @@ def watched_store_ids(conn: sqlite3.Connection) -> set[int] | None:
 
 def _stores(conn: sqlite3.Connection):
     keep = watched_store_ids(conn)
-    for s in conn.execute("SELECT id, store_domain, meta_page_name FROM stores ORDER BY store_domain"):
+    for s in conn.execute("SELECT id, store_domain, meta_page_name, platform FROM stores ORDER BY store_domain"):
         if keep is None or s["id"] in keep:
             yield s
 
@@ -117,11 +117,12 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
                    b["to_products"], b["products"], ad_metrics.breakdown_summary(b)]
         else:
             age = ["never", "", "", "", "", "", "", "", "", "", ""]
+        platform = s["platform"] or ""
         if d is None:
-            rows.append([s["store_domain"], s["meta_page_name"] or "", status, "", "", "", "", "", "", "", ""] + age)
+            rows.append([s["store_domain"], s["meta_page_name"] or "", platform, status, "", "", "", "", "", "", "", ""] + age)
             continue
         rows.append([
-            d.store_domain, s["meta_page_name"] or "", status, d.products, d.sold_out_variants,
+            d.store_domain, s["meta_page_name"] or "", platform, status, d.products, d.sold_out_variants,
             d.new_products_7d, d.updated_products_7d,
             "" if d.sold_out_variants_delta is None else d.sold_out_variants_delta,
             "" if d.price_changes is None else d.price_changes,

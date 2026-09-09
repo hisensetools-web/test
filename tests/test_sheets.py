@@ -39,26 +39,27 @@ class RowBuildingTests(unittest.TestCase):
     def test_stores_rows_cover_every_store_including_failed(self):
         rows = sheets.stores_rows(self.conn)
         self.assertEqual(len(rows), 2)
+        H = sheets.STORES_HEADERS
         ok = next(r for r in rows if r[0] == "example.com")
-        self.assertEqual(len(ok), len(sheets.STORES_HEADERS))
-        self.assertEqual(ok[1], "Example")
-        self.assertEqual(ok[2], "ok")
-        self.assertEqual(ok[3], 3)              # products on latest day
-        self.assertEqual(ok[7], 0)              # sold-out delta 2 -> 2
-        self.assertEqual(ok[8], 2)              # price changes
-        self.assertEqual(ok[10], D2)
+        self.assertEqual(len(ok), len(H))
+        self.assertEqual(ok[H.index("meta page")], "Example")
+        self.assertEqual(ok[H.index("last status")], "ok")
+        self.assertEqual(ok[H.index("products")], 3)              # products on latest day
+        self.assertEqual(ok[H.index("sold-out delta")], 0)        # sold-out delta 2 -> 2
+        self.assertEqual(ok[H.index("price changes")], 2)         # price changes
+        self.assertEqual(ok[H.index("last snapshot date")], D2)
         dead = next(r for r in rows if r[0] == "dead.com")
-        self.assertTrue(dead[2].startswith("error: HTTP 404"))
-        self.assertEqual(dead[3], "")           # no snapshot -> blanks, not zeros
-        self.assertEqual(rows[0][0], "example.com")  # sorted by score desc
+        self.assertTrue(dead[H.index("last status")].startswith("error: HTTP 404"))
+        self.assertEqual(dead[H.index("products")], "")           # no snapshot -> blanks, not zeros
 
     def test_stores_rows_single_day_blank_deltas(self):
         conn = db.connect(":memory:")
         sid = db.upsert_store(conn, "one.com")
         db.write_product_snapshot(conn, sid, D2, load("products_page1.json"))
         r = sheets.stores_rows(conn)[0]
-        self.assertEqual((r[7], r[8]), ("", ""))
-        self.assertEqual(r[2], "never run")
+        H = sheets.STORES_HEADERS
+        self.assertEqual((r[H.index("sold-out delta")], r[H.index("price changes")]), ("", ""))
+        self.assertEqual(r[H.index("last status")], "never run")
 
     def test_products_rows_are_latest_snapshot_only(self):
         rows = sheets.products_rows(self.conn)

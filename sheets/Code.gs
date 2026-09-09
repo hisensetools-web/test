@@ -37,9 +37,9 @@ var TABS = {
     keyCols: null, textCols: [0, 3, 5, 6], position: 4
   },
   Stores: {
-    headers: ["store", "meta page", "last status", "products", "sold-out variants", "new products 7d", "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date", "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow", "pages_per_domain", "pages_new_7d", "page_likes_slope_max", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
+    headers: ["store", "meta page", "platform", "last status", "products", "sold-out variants", "new products 7d", "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date", "ads_scraped_on", "ads_active", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow", "pages_per_domain", "pages_new_7d", "page_likes_slope_max", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
     keyCols: null,                 // fully overwritten each sync
-    textCols: [0, 1, 2, 10, 11, 15, 21],   // keep dates / domains as text, not auto-parsed
+    textCols: [0, 1, 2, 3, 11, 12, 16, 22],   // keep dates / domains as text, not auto-parsed
     position: 5
   },
   Pages: {

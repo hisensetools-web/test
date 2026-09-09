@@ -132,7 +132,7 @@ python tracker.py set-page getdovi.com --name "Dovi" --page-id 1234567890   # se
 
 A store without a Meta page name is searched by its domain, which finds nothing for most brands: set the page for every store that shows `ads_active` empty on the Stores tab after a night pass.
 
-The 17 domains that fail with 404 every run are not Shopify storefronts; removing them saves time.
+Stores on WooCommerce, Squarespace, Magento, BigCommerce, Wix, headless Shopify or a plain site with a product sitemap are tracked the same way; the Stores tab's `platform` column says what each one runs on. `prune-dead` lists domains where no catalogue was found on any platform.
 
 Stores found by Radar are added automatically with the note `radar: <source> <date>` and show `store_badge=NEW` on Signals for 14 days. To add stores from an ad-spy export or by hand without triage:
 
