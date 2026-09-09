@@ -167,6 +167,29 @@ def cmd_hf_check(args) -> int:
     return 0
 
 
+def cmd_hf_models(args) -> int:
+    """Probe Higgsfield model ids with an empty request: 404 = missing, validation error = exists (and names its fields)."""
+    import higgsfield_client
+    from . import higgsfield
+    client = higgsfield_client.SyncClient(timeout=30.0)
+    ids = args.model_id or list(higgsfield.CANDIDATE_MODELS)
+    found = []
+    for mid in ids:
+        status, detail = higgsfield.probe_model(client, mid)
+        if status == "exists":
+            fields = higgsfield.required_fields(detail)
+            found.append(mid)
+            print(f"EXISTS   {mid}   required: {', '.join(fields) or detail[:160]}")
+        elif status == "missing":
+            print(f"missing  {mid}")
+        else:
+            print(f"?        {mid}   {detail}")
+    if found:
+        print("\nset in .env:  HIGGSFIELD_MODEL=<one of the EXISTS ids that takes reference images>")
+        print("              HIGGSFIELD_IMAGE_ARG=<its image field: image_urls / image_url / images / input_images>")
+    return 0 if found else 1
+
+
 def cmd_shopify_check(args) -> int:
     """Mint/verify the Admin API token and confirm the app has the scopes `upload` needs."""
     from . import shopify_admin
@@ -263,6 +286,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--sample", help="api backend: upload this image instead of a 1x1 placeholder")
     s.add_argument("--backend", choices=("api", "cli"))
     s.set_defaults(func=cmd_hf_check)
+
+    s = sub.add_parser("hf-models", help="find which Higgsfield model ids exist (free: empty requests only)")
+    s.add_argument("model_id", nargs="*", help="ids to probe (default: a built-in list of likely image models)")
+    s.set_defaults(func=cmd_hf_models)
 
     s = sub.add_parser("shopify-check", help="verify the Shopify app credentials and scopes (mints the token if needed)")
     s.set_defaults(func=cmd_shopify_check)

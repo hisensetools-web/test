@@ -201,6 +201,30 @@ class HiggsfieldTests(unittest.TestCase):
         self.assertEqual(extra, {"x-amz-tagging": "ttl=7d"})
         self.assertEqual(higgsfield._signed_headers(up), ["content-type", "host", "x-amz-tagging"])
 
+    def test_required_fields_parsing_and_probe_classification(self):
+        detail = "[{'type': 'missing', 'loc': ['body', 'prompt'], 'msg': 'Field required'}, {'type': 'missing', 'loc': ['body', 'image_urls'], 'msg': 'Field required'}]"
+        self.assertEqual(higgsfield.required_fields(detail), ["prompt", "image_urls"])
+        import httpx
+        from higgsfield_client.exceptions import HiggsfieldClientError
+
+        def err(code, body):
+            req = httpx.Request("POST", "https://platform.higgsfield.ai/x")
+            e = HiggsfieldClientError(body)
+            e.__cause__ = httpx.HTTPStatusError("x", request=req, response=httpx.Response(code, request=req, text=body))
+            return e
+
+        class T:
+            def __init__(self, e): self.e = e
+            def request(self, *a, **k): raise self.e
+
+        class C:
+            def __init__(self, e): self._transport = T(e)
+
+        self.assertEqual(higgsfield.probe_model(C(err(404, "Not Found")), "m")[0], "missing")
+        status, d = higgsfield.probe_model(C(err(422, detail)), "m")
+        self.assertEqual(status, "exists")
+        self.assertIn("image_urls", d)
+
     def test_upload_error_is_explained(self):
         msg = higgsfield.explain_error(higgsfield.UploadError("refused"), "m")
         self.assertIn("accepted the key", msg)

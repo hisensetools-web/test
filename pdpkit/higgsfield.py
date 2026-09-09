@@ -274,3 +274,53 @@ def explain_error(e: Exception, model: str) -> str:
     if code == 402 or "credit" in low or "balance" in low:
         return "Higgsfield reports no credits left on this key."
     return text
+
+
+# --------------------------------------------------------------------------- model discovery
+CANDIDATE_MODELS = (
+    # bytedance seedream family
+    "bytedance/seedream/v4/text-to-image", "bytedance/seedream/v4/edit", "bytedance/seedream/v4/image-to-image",
+    "bytedance/seedream/v4/image-edit", "bytedance/seedream/v4.5/text-to-image", "bytedance/seedream/v4.5/edit",
+    "bytedance/seedream/v4.5/image-to-image", "bytedance/seedream/v5/edit", "bytedance/seedream/v5/image-to-image",
+    "bytedance/seedream/v5-lite/edit", "bytedance/seedream-4.5/edit", "bytedance/seedream-4.5/image-to-image",
+    # google nano banana family
+    "google/nano-banana/edit", "google/nano-banana/image-to-image", "google/nano-banana/text-to-image",
+    "google/nano-banana-pro/edit", "google/nano-banana-pro/image-to-image", "google/nano-banana-2/edit",
+    "google/nano-banana-2/image-to-image", "google/gemini-2.5-flash-image/edit", "google/gemini-3-pro-image/edit",
+    # higgsfield soul
+    "higgsfield-ai/soul/text-to-image", "higgsfield-ai/soul/image-to-image", "higgsfield-ai/soul/v2/text-to-image",
+    "higgsfield-ai/soul/v2/image-to-image", "higgsfield-ai/soul-v2/image-to-image", "higgsfield-ai/dop/standard",
+    # others commonly hosted
+    "black-forest-labs/flux-kontext/max", "black-forest-labs/flux-kontext/pro", "bfl/flux-kontext-max",
+    "black-forest-labs/flux-2/edit", "openai/gpt-image-1.5/edit", "openai/gpt-image-2/edit", "openai/gpt-image/edit",
+    "reve/text-to-image", "reve/edit", "reve/image-to-image", "qwen/qwen-image/edit", "qwen/qwen-image-edit",
+)
+
+
+def probe_model(client, model: str) -> tuple[str, str]:
+    """POST an empty body to a model endpoint. Returns (status, detail):
+    'exists' with the validation message (which names the required fields) when the model is there,
+    'missing' on 404, 'other' with the response text otherwise. Nothing is generated or charged."""
+    from higgsfield_client.exceptions import HiggsfieldClientError
+
+    try:
+        resp = client._transport.request("POST", model, json={})
+    except HiggsfieldClientError as e:
+        code = _status_code(e)
+        text = str(e)
+        if code == 404 or "not found" in text.lower():
+            return "missing", ""
+        if code in (400, 422):
+            return "exists", text[:600]
+        return "other", f"HTTP {code}: {text[:300]}"
+    except Exception as e:  # noqa: BLE001
+        return "other", str(e)[:300]
+    return "exists", f"accepted an empty request?! {resp.text[:200]}"
+
+
+def required_fields(detail: str) -> list[str]:
+    """Field names out of a FastAPI-style validation message like
+    [{'loc': ['body', 'prompt'], 'msg': 'Field required'}, ...]."""
+    import re
+    names = re.findall(r"'loc':\s*\[\s*'body',\s*'([^']+)'", detail) or re.findall(r'"loc":\s*\[\s*"body",\s*"([^"]+)"', detail)
+    return list(dict.fromkeys(names))
