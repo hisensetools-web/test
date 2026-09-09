@@ -84,6 +84,7 @@ python tracker.py fb-report                   # captured Sponsored posts, matche
 python tracker.py radar-report                # hook phrases by yield, radar totals, recent searches, Candidates
 python tracker.py delivering-report --handle <handle>   # active vs delivering ads (low-impression badge) for a product, before/after
 python tracker.py ads-fields --grep impression          # which payload keys carry the badge (confirm Meta's field name)
+python tracker.py rank-check --only a.com b.com         # is the 'Impressions: high to low' sort informative for these stores?
 ```
 
 Alerts also land in `alerts\YYYY-MM-DD.md` and the Alerts tab.

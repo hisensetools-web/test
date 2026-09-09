@@ -867,7 +867,8 @@ def write_alerts_markdown(conn: sqlite3.Connection, today: str, path: Path | Non
     path = path or (config.ALERTS_DIR / f"{today}.md")
     path.parent.mkdir(parents=True, exist_ok=True)
     from . import ad_detail, inventory, scaling
-    names = {**RULES, **inventory.RULES, **ad_detail.RULES, **scaling.RULES}
+    from . import ad_rank
+    names = {**RULES, **inventory.RULES, **ad_detail.RULES, **scaling.RULES, **ad_rank.RULES}
     lines = [f"# Alerts {today}", ""]
     for r in rows:
         lines.append(f"- **rule {r['rule']}** ({names.get(r['rule'], '')}) {r['store_domain']} "
@@ -1017,6 +1018,13 @@ def meta_for_signals(conn: sqlite3.Connection, store_id: int, today: str) -> dic
                                  "ad_velocity_wow": "", "days_running_max": None, "engagement_per_day": None, "concept_status": "",
                                  "eu_reach_slope_7d": None, "comment_delta_1d": None})
         rec.update({k: m[k] for k in ("ads_delivering", "ads_low_impressions", "ads_delivering_7d_ago", "delivering_velocity_wow", "concepts_delivering")})
+    from . import ad_rank
+    rm = ad_rank.ad_rank_metrics(conn, store_id, today)
+    for h, pm in rm["products"].items():
+        rec = out.setdefault(h, {"ads_as_of": snap, "ads_pointing_here": 0, "ads_launched_7d": 0, "ads_launched_prev_7d": 0,
+                                 "ad_velocity_wow": "", "days_running_max": None, "engagement_per_day": None, "concept_status": "",
+                                 "eu_reach_slope_7d": None, "comment_delta_1d": None})
+        rec.update({"ads_in_top5": pm["ads_in_top5"], "best_rank": pm["best_rank"], "best_rank_delta_7d": pm["best_rank_delta_7d"]})
     for r in conn.execute(
         """SELECT product_handle, COUNT(*) AS concepts, SUM(COALESCE(ads_delivering, ads_active) > 0) AS alive, MAX(days_running) AS oldest,
                   MAX(CASE WHEN COALESCE(ads_delivering, ads_active) = ads_ever THEN days_running END) AS oldest_intact

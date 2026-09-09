@@ -21,7 +21,7 @@ from .watchlist import read_watchlist
 
 log = logging.getLogger("earlyscale.sheets")
 
-STORES_HEADERS = ["store", "meta page", "platform", "last status", "products", "sold-out variants", "new products 7d",
+STORES_HEADERS = ["store", "meta page", "platform", "sort_informative", "last status", "products", "sold-out variants", "new products 7d",
                   "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date",
                   "ads_scraped_on", "ads_active", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow",
                   "ads_low_impressions", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow",
@@ -36,7 +36,8 @@ ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
                    "days_since_created", "created_at", "relaunch",
                    "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
-                   "variants_of_family_published_7d", "ads_pointing_here", "ads_delivering", "ads_delivering_7d_ago",
+                   "variants_of_family_published_7d", "ads_pointing_here", "ads_in_top5", "best_rank", "best_rank_delta_7d",
+                   "ads_delivering", "ads_delivering_7d_ago",
                    "delivering_velocity_wow", "ads_low_impressions", "concepts_delivering", "ads_launched_7d", "ads_launched_prev_7d",
                    "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d",
                    "engagement_per_day",
@@ -49,6 +50,7 @@ CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "
                       "store list", "example families"]
 
 EARLY_HEADERS = ["store", "handle", "product family", "days_since_created", "created_at", "relaunch", "days_since_published",
+                 "ads_in_top5", "best_rank", "best_rank_delta_7d",
                  "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "concepts_delivering", "ads_pointing_here",
                  "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d",
                  "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level",
@@ -82,7 +84,7 @@ def watched_store_ids(conn: sqlite3.Connection) -> set[int] | None:
 
 def _stores(conn: sqlite3.Connection):
     keep = watched_store_ids(conn)
-    for s in conn.execute("SELECT id, store_domain, meta_page_name, platform FROM stores ORDER BY store_domain"):
+    for s in conn.execute("SELECT id, store_domain, meta_page_name, platform, sort_informative FROM stores ORDER BY store_domain"):
         if keep is None or s["id"] in keep:
             yield s
 
@@ -124,11 +126,12 @@ def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list
         else:
             age = ["never"] + [""] * 14
         platform = s["platform"] or ""
+        si = {1: "true", 0: "false"}.get(s["sort_informative"], "")
         if d is None:
-            rows.append([s["store_domain"], s["meta_page_name"] or "", platform, status, "", "", "", "", "", "", "", ""] + age)
+            rows.append([s["store_domain"], s["meta_page_name"] or "", platform, si, status, "", "", "", "", "", "", "", ""] + age)
             continue
         rows.append([
-            d.store_domain, s["meta_page_name"] or "", platform, status, d.products, d.sold_out_variants,
+            d.store_domain, s["meta_page_name"] or "", platform, si, status, d.products, d.sold_out_variants,
             d.new_products_7d, d.updated_products_7d,
             "" if d.sold_out_variants_delta is None else d.sold_out_variants_delta,
             "" if d.price_changes is None else d.price_changes,
@@ -227,19 +230,23 @@ def _contexts(conn: sqlite3.Connection, as_of: str | None):
 
 def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     rows = [r for ctx in _contexts(conn, as_of) for r in signals.signals_rows_for_store(ctx)]
-    # what we compare: ads actually delivering (desc), their week-over-week trend (desc), then launches this week
-    # (testing volume), then youngest product first by created_at (published_at resets on every relaunch)
-    idl, iwow = SIGNALS_HEADERS.index("ads_delivering"), SIGNALS_HEADERS.index("delivering_velocity_wow")
-    il, ip = SIGNALS_HEADERS.index("ads_launched_7d"), SIGNALS_HEADERS.index("ads_pointing_here")
-    icreated, ipub = SIGNALS_HEADERS.index("days_since_created"), SIGNALS_HEADERS.index("days_since_published")
+    # what we compare: ads in the impressions top 5 (desc) and the best-rank trend (climbing first), then the
+    # delivering trend, then delivering ads, then launches this week (testing volume only), then youngest by created_at
+    H = SIGNALS_HEADERS
+    itop, idelta = H.index("ads_in_top5"), H.index("best_rank_delta_7d")
+    idl, iwow = H.index("ads_delivering"), H.index("delivering_velocity_wow")
+    il, ip = H.index("ads_launched_7d"), H.index("ads_pointing_here")
+    icreated, ipub = H.index("days_since_created"), H.index("days_since_published")
 
     def key(r):
+        top = r[itop] if isinstance(r[itop], int) else -1
+        delta = r[idelta] if isinstance(r[idelta], int) else 0          # no history: neither climbing nor falling
         deliv = r[idl] if isinstance(r[idl], int) else -1
         wow = _wow_value(r[iwow])
         launched = r[il] if isinstance(r[il], int) else -1
         pointing = r[ip] if isinstance(r[ip], int) else -1
         days = r[icreated] if r[icreated] != "" else (r[ipub] if r[ipub] != "" else 10**6)
-        return (-deliv, -wow, -launched, -pointing, days, r[0], r[2])
+        return (-top, delta, -wow, -deliv, -launched, -pointing, days, r[0], r[2])
     rows.sort(key=key)
     return rows
 
@@ -274,9 +281,11 @@ def early_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]
         if not ((isinstance(ads, int) and ads > 0) or (isinstance(launched, int) and launched > 0)):
             continue
         out.append([r[idx[h]] for h in EARLY_HEADERS])
-    ic, il = EARLY_HEADERS.index("days_since_created"), EARLY_HEADERS.index("ads_launched_7d")
-    idl, iwow = EARLY_HEADERS.index("ads_delivering"), EARLY_HEADERS.index("delivering_velocity_wow")
-    out.sort(key=lambda r: (-(r[idl] if isinstance(r[idl], int) else -1), -_wow_value(r[iwow]),
+    E = EARLY_HEADERS
+    ic, il = E.index("days_since_created"), E.index("ads_launched_7d")
+    idl, iwow, itop, idelta = E.index("ads_delivering"), E.index("delivering_velocity_wow"), E.index("ads_in_top5"), E.index("best_rank_delta_7d")
+    out.sort(key=lambda r: (-(r[itop] if isinstance(r[itop], int) else -1), r[idelta] if isinstance(r[idelta], int) else 0,
+                            -_wow_value(r[iwow]), -(r[idl] if isinstance(r[idl], int) else -1),
                             -(r[il] if isinstance(r[il], int) else -1), r[ic], r[0], r[1]))
     return out
 

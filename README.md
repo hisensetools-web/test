@@ -544,6 +544,32 @@ python tracker.py delivering-report --handle calming-diffuser --handle probiotic
 prints, per matching product, active ads vs delivering ads, badge counts, the week-ago count and trend,
 concepts alive before (search presence) and after (delivering), and the active ads with their badge.
 
+## Impression rank: where an ad sits when sorted "Impressions: high to low"
+
+The second per-ad delivery signal. Every Meta pass runs the store's search a second time with the
+impressions sort (`sort_data[mode]=total_impressions`, `META_RANK_SCROLLS` (8) scrolls, top ranks only)
+and stores each ad's 1-based position as `meta_ads_daily.impression_rank` for the day.
+
+**Is the sort informative?** For every store the sorted order is compared with the newest-first order of
+the same day (`rank_checks`: first `META_RANK_MIN_COMPARE` (20) ids, how many sit in the same position).
+Identical orders mean the sort carries no information for that store: `stores.sort_informative` = false
+(shown on the Stores tab), the store is re-checked weekly instead of daily, and its rank columns stay
+blank. `python tracker.py rank-check --only a.com b.com c.com d.com e.com` does the comparison for a few
+stores on demand and prints the verdict per store.
+
+Derived per ad: `rank_7d_ago`, `rank_delta_7d` (negative = climbing), `top5_days` (days the ad held a
+top-5 rank). Per product on Signals / Early: `ads_in_top5`, `best_rank`, `best_rank_delta_7d`.
+
+**Ranking on Signals and Early:** `ads_in_top5` (desc), `best_rank_delta_7d` (climbing first), then
+`delivering_velocity_wow` and `ads_delivering`, then `ads_launched_7d` as testing volume only, then youngest
+by `created_at`.
+
+Alerts: **15** an ad entered the top 5 for a product created < 30 days ago; **16** an ad climbed 5+ ranks
+in 7 days; **17** a product's delivering ads at least doubled week over week (from 2+).
+
+`delivering-report --handle <h>` adds, per product, the top-5 ads by impression rank with days running,
+rank a week ago, delta and top-5 days, plus the store's sort_informative verdict.
+
 ## Scaling columns: pages per domain, landing paths, page-likes slope
 
 Three "is this store scaling" measurements, all derived from ads already in the database (no

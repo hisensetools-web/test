@@ -51,16 +51,18 @@ class MetaScrapeError(Exception):
 # ---------------------------------------------------------------- pure parsing
 
 def build_search_url(query: str | None = None, page_id: str | None = None, active_only: bool = True,
-                     country: str = "ALL", search_type: str | None = None) -> str:
+                     country: str = "ALL", search_type: str | None = None, sort: str | None = None) -> str:
+    """sort='impressions' asks for "Impressions: high to low" (sort_data[mode]=total_impressions); default is newest first."""
     status = "active" if active_only else "all"
     base = f"{config.META_AD_LIBRARY_BASE}?active_status={status}&ad_type=all&country={quote(country)}&media_type=all"
+    tail = "&sort_data[direction]=desc&sort_data[mode]=total_impressions" if sort == "impressions" else ""
     if page_id:
-        return f"{base}&view_all_page_id={quote(str(page_id))}&search_type=page"
+        return f"{base}&view_all_page_id={quote(str(page_id))}&search_type=page{tail}"
     if not query:
         raise ValueError("query or page_id required")
     if search_type is None:
         search_type = "keyword_unordered" if ("." in query and " " not in query) else "page"
-    return f"{base}&q={quote(query)}&search_type={search_type}"
+    return f"{base}&q={quote(query)}&search_type={search_type}{tail}"
 
 
 def _walk(obj, seen: list):

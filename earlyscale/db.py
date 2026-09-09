@@ -333,6 +333,22 @@ CREATE TABLE IF NOT EXISTS radar_runs (
     note        TEXT
 );
 
+-- One row per store per day: does the impressions-sorted search order differ from the newest-first order?
+CREATE TABLE IF NOT EXISTS rank_checks (
+    snapshot_date   TEXT NOT NULL,
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    query           TEXT,
+    n_default       INTEGER,
+    n_sorted        INTEGER,
+    n_compared      INTEGER,
+    overlap         INTEGER,
+    same_position   INTEGER,
+    identical       INTEGER,
+    informative     INTEGER,
+    checked_at      TEXT,
+    PRIMARY KEY (snapshot_date, store_id)
+);
+
 CREATE TABLE IF NOT EXISTS hero_variants (
     store_id            INTEGER NOT NULL REFERENCES stores(id),
     variant_id          INTEGER NOT NULL,
@@ -439,11 +455,13 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "alerts": [("dedupe_key", "TEXT")],
         "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
                    ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),
-                   ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT")],
+                   ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT"),
+                   ("sort_informative", "INTEGER"), ("rank_checked_at", "TEXT")],
         "variants_daily": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT"), ("stock", "INTEGER")],
         "products_daily": [("unlisted", "INTEGER DEFAULT 0"), ("url_path", "TEXT")],
         "hero_variants": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
         "meta_ads_daily": [("low_impressions", "INTEGER"),   # 1 = 'Low impression count' badge on the card, 0 = no badge, NULL = unknown
+                           ("impression_rank", "INTEGER"),   # 1-based position in the "Impressions: high to low" search, NULL = not in it
                            ("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
                            ("engagement_per_day", "REAL"),
                            # reach curve (EU exact, UK exact or range) and the comment curve

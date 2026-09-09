@@ -13,7 +13,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import ad_detail, ad_metrics, config, db, deltas, fb_posts, inventory, meta_ads, platforms, radar, scaling, sheets, shopify, store_age
+from . import ad_detail, ad_metrics, ad_rank, config, db, deltas, fb_posts, inventory, meta_ads, platforms, radar, scaling, sheets, shopify, store_age
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist, update_watchlist_entry
 
 console = Console()
@@ -471,6 +471,16 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                         ad_detail.record_list_readings(conn, store_id, snapshot_date, res.ads)
                     except Exception as e:  # noqa: BLE001
                         log.warning("%-28s list readings failed: %s", domain, e)
+                    if config.META_RANK and _rank_due(conn, store_id, snapshot_date):
+                        try:
+                            rk = ad_rank.scrape_ranks(conn, handle.get(), s, store_id, snapshot_date, [a["ad_id"] for a in res.ads])
+                            log.info("%-28s impression rank: %d ads ranked; sort %s (first %d: %d in the same position)", domain,
+                                     rk["ranked"], "informative" if rk["informative"] else "NOT informative (same order as newest first)",
+                                     rk["n"], rk["same_position"])
+                        except meta_ads.MetaBlocked as e:
+                            log.error("%-28s impression-rank search blocked: %s", domain, e)
+                        except Exception as e:  # noqa: BLE001
+                            log.warning("%-28s impression-rank search failed: %s", domain, e)
                     _post_process_store(conn, store_id, domain, snapshot_date, session)
                     if detail:
                         _detail_pass_store(conn, handle, store_id, domain, snapshot_date, detail_cap)
@@ -507,12 +517,24 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
     return ok, failed
 
 
+def _rank_due(conn, store_id: int, today: str) -> bool:
+    """Daily while the sort is informative or unknown; weekly re-check for a store where it was not."""
+    r = conn.execute("SELECT sort_informative, rank_checked_at FROM stores WHERE id = ?", (store_id,)).fetchone()
+    if not r or r["sort_informative"] is None or r["sort_informative"]:
+        return True
+    try:
+        return (date.fromisoformat(today) - date.fromisoformat(r["rank_checked_at"])).days >= 7
+    except (TypeError, ValueError):
+        return True
+
+
 def _post_process_store(conn, store_id: int, domain: str, snapshot_date: str, session, fetch_landings: bool = True) -> dict:
     """Landing join, concepts, lineage, per-day metrics and alerts for one store. Never raises."""
     try:
         m = ad_metrics.process_store(conn, store_id, domain, snapshot_date, session, fetch_landings)
         alerts = ad_metrics.run_alerts(conn, store_id, domain, snapshot_date)
         alerts += scaling.run_alerts(conn, store_id, domain, snapshot_date)
+        alerts += ad_rank.run_alerts(conn, store_id, domain, snapshot_date)
         log.info("%-28s metrics: resolved=%s/%s unlisted_products=%s concepts=%s lineage=%s pages_fetched=%s alerts=%d",
                  domain, m.get("resolved", 0), m.get("ads", 0), m.get("unlisted", 0), m.get("concepts", 0),
                  m.get("lineage", 0), m.get("pages_fetched", 0), len(alerts))
@@ -1234,6 +1256,55 @@ def cmd_ads(args) -> int:
     return 1 if ok == 0 and failed else 0
 
 
+def cmd_rank_check(args) -> int:
+    """Confirm the impressions sort is informative: for the given stores run the newest-first and the impressions-sorted
+    searches (few scrolls each) and compare the orders; records ranks and sort_informative as the night pass would."""
+    from playwright.sync_api import sync_playwright
+    conn = db.connect(args.db)
+    today = _parse_date(args.date)
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    if args.only:
+        stores = [s for s in stores if s["store_domain"] in set(args.only)]
+    stores = stores[: args.limit]
+    if not stores:
+        console.print("[red]no stores selected[/]")
+        return 2
+    t = Table(title="impressions sort vs newest first")
+    for c in ("store", "query", "newest", "sorted", "compared", "same position", "sort_informative", "top 3 by impressions"):
+        t.add_column(c, justify="right" if c in ("newest", "sorted", "compared", "same position") else "left")
+    with sync_playwright() as pw, meta_ads.KeepAwake():
+        handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
+        try:
+            for s in stores:
+                sid = db.upsert_store(conn, s["store_domain"], s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
+                conn.commit()
+                query = s.get("meta_page_name") or s["store_domain"].split("//")[-1]
+                url = meta_ads.build_search_url(query=None if s.get("meta_page_id") else query, page_id=s.get("meta_page_id") or None)
+                try:
+                    base = meta_ads.scrape_page(url, max_scrolls=args.scrolls, browser=handle.get())
+                    if base.blocked:
+                        raise meta_ads.MetaBlocked(base.note)
+                    if base.ads:
+                        meta_ads.record_scrape(conn, sid, today, base.ads, query)
+                    rk = ad_rank.scrape_ranks(conn, handle.get(), s, sid, today, [a["ad_id"] for a in base.ads], max_scrolls=args.scrolls)
+                except meta_ads.MetaBlocked as e:
+                    console.print(f"[red]{s['store_domain']}: blocked ({e}); stopping[/]")
+                    break
+                except Exception as e:  # noqa: BLE001
+                    t.add_row(_short(s["store_domain"]), query, "", "", "", "", f"error: {str(e)[:40]}", "")
+                    continue
+                top = [r[0] for r in conn.execute("SELECT ad_id FROM meta_ads_daily WHERE store_id = ? AND snapshot_date = ? AND impression_rank IS NOT NULL ORDER BY impression_rank LIMIT 3", (sid, today))]
+                t.add_row(_short(s["store_domain"]), query[:24], str(len(base.ads)), str(rk["ranked"]), str(rk["n"]), str(rk["same_position"]),
+                          "[green]true[/]" if rk["informative"] else "[red]false[/]" if rk["informative"] is not None else "?", ", ".join(top))
+                _post_process_store(conn, sid, s["store_domain"], today, shopify.make_session(), fetch_landings=False)
+        finally:
+            handle.close()
+    console.print(t)
+    console.print("false = the impressions-sorted search returned the same ads in the same order as newest-first: the sort carries no "
+                  "information for that store, and it is re-checked weekly instead of daily.")
+    return 0
+
+
 def cmd_ads_fields(args) -> int:
     """Which keys the stored ad payloads carry that match --grep (to confirm what Meta calls a badge)."""
     conn = db.connect(args.db)
@@ -1311,7 +1382,29 @@ def cmd_delivering_report(args) -> int:
             t2.add_row(a["ad_id"], a["ad_start_date"] or "", badge, (a["low_impressions_key"] or "")[:28], a["delivery_status"] or "",
                        (a["concept_id"] or "")[:10], "yes" if ad_metrics.delivering(dict(a)) else "no")
         console.print(t2)
-    console.print("Signals and Early now rank on ads_delivering; run `python tracker.py sync-sheets` to push the recomputed columns.")
+        rm = ad_rank.ad_rank_metrics(conn, r["store_id"], snap)
+        pm = rm["products"].get(r["product_handle"])
+        chk = conn.execute("SELECT informative, n_compared, same_position FROM rank_checks WHERE store_id = ? ORDER BY snapshot_date DESC LIMIT 1", (r["store_id"],)).fetchone()
+        if pm:
+            t3 = Table(title=f"top {ad_rank.TOP_N} ads by impression rank for {r['product_handle']} (ranks as of {rm['as_of']}; "
+                             f"best rank {pm['best_rank']}, 7d ago {pm['best_rank_7d_ago'] if pm['best_rank_7d_ago'] is not None else '-'}, "
+                             f"ads in top {ad_rank.TOP_N}: {pm['ads_in_top5']})")
+            for c in ("rank", "ad_id", "started", "days running", "rank 7d ago", "delta 7d", "top5 days", "badge"):
+                t3.add_column(c, justify="right" if c not in ("ad_id", "started", "badge") else "left")
+            for a in pm["top5_ads"]:
+                t3.add_row(str(a["rank"]), a["ad_id"], "", "" if a["days_running"] is None else str(a["days_running"]),
+                           "" if a["rank_7d_ago"] is None else str(a["rank_7d_ago"]), "" if a["rank_delta_7d"] is None else str(a["rank_delta_7d"]),
+                           str(a["top5_days"]), {1: "LOW", 0: "no"}.get(a["low_impressions"], "?"))
+            console.print(t3)
+        elif rm["as_of"] is None:
+            console.print(f"  no impression-rank data for {_short(r['store_domain'])} yet: run `python tracker.py rank-check --only {r['store_domain']}` "
+                          "or wait for the next Meta pass")
+        else:
+            console.print(f"  {r['product_handle']}: none of its ads appear in the impressions-sorted result of {rm['as_of']}")
+        if chk is not None:
+            console.print(f"  sort_informative={'true' if chk['informative'] else 'false' if chk['informative'] is not None else '?'} "
+                          f"({chk['same_position']}/{chk['n_compared']} of the first ids in the same position as newest-first)")
+    console.print("Signals and Early rank on ads_in_top5 / best-rank trend, then delivering trend; run `python tracker.py sync-sheets` to push.")
     return 0
 
 
@@ -1788,6 +1881,13 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("fb-report", help="captured posts, matches and count history")
     s.add_argument("--date"); s.add_argument("--limit", type=int, default=60)
     s.set_defaults(fn=cmd_fb_report)
+
+    s = sub.add_parser("rank-check", help="confirm the impressions sort is informative for a few stores (records ranks + sort_informative)")
+    s.add_argument("--only", nargs="+", metavar="DOMAIN")
+    s.add_argument("--limit", type=int, default=5)
+    s.add_argument("--scrolls", type=int, default=None)
+    s.add_argument("--date"); s.add_argument("--watchlist"); s.add_argument("--headed", action="store_true")
+    s.set_defaults(fn=cmd_rank_check)
 
     s = sub.add_parser("ads-fields", help="which keys the stored ad payloads carry that match --grep (find what Meta calls a badge)")
     s.add_argument("--grep", default="impression")
