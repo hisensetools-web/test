@@ -181,7 +181,10 @@ def explain_error(e: Exception, model: str) -> str:
     code = _status_code(e)
     low = text.lower()
     if code in (401, 403) or "unauthorized" in low or "invalid api key" in low:
-        return "Higgsfield rejected the credentials: check HF_KEY=<key>:<secret> in .env (from cloud.higgsfield.ai > API keys)."
+        return (f"Higgsfield rejected the credentials (HTTP {code}: {text[:200]}). HF_KEY must be the API key *id* and *secret* "
+                "from https://cloud.higgsfield.ai (Settings > API keys), joined with a colon, not a key from the higgsfield.ai "
+                "consumer app. If the key is from cloud.higgsfield.ai, check the account has credits and the key was not revoked. "
+                "Alternative: the CLI route (`higgsfield auth login`, then `python pdp.py hf-check --backend cli`).")
     if code == 404 or "not found" in low:
         return (f"model id '{model}' not found on platform.higgsfield.ai. Open the model's page on cloud.higgsfield.ai, copy the id from its "
                 "API example, and set HIGGSFIELD_MODEL in .env (and HIGGSFIELD_IMAGE_ARG if its reference field is not 'image_urls').")

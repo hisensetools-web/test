@@ -139,7 +139,7 @@ class HiggsfieldTests(unittest.TestCase):
             return err
 
         self.assertIn("network", higgsfield.explain_error(httpx.ProxyError("403 Forbidden"), "m"))
-        self.assertIn("credentials", higgsfield.explain_error(client_error(401, "Unauthorized"), "m"))
+        self.assertIn("cloud.higgsfield.ai", higgsfield.explain_error(client_error(401, "Unauthorized"), "m"))
         self.assertIn("HIGGSFIELD_MODEL", higgsfield.explain_error(client_error(404, "Not Found"), "some/model"))
         self.assertIn("HIGGSFIELD_IMAGE_ARG", higgsfield.explain_error(client_error(422, "image_urls field required"), "m"))
         self.assertIn("credits", higgsfield.explain_error(client_error(402, "Insufficient balance"), "m"))

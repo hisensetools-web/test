@@ -49,7 +49,13 @@ def _prompts(args) -> list[str]:
 # --------------------------------------------------------------------------- commands
 def cmd_grab(args) -> int:
     from . import scrape, summary
-    data, out_dir, manifest = scrape.grab(args.url, use_browser=True if args.browser else None)
+    if not args.url.startswith(("http://", "https://")):
+        args.url = "https://" + args.url
+    try:
+        data, out_dir, manifest = scrape.grab(args.url, use_browser=True if args.browser else None)
+    except RuntimeError as e:
+        raise SystemExit(f"could not fetch {args.url}: {str(e).split('Caused by')[-1].strip(' ()')[:200]}\n"
+                         "Check the URL opens in your browser; if the store blocks scripts, retry with --browser.") from e
     md = summary.write_summary(data, out_dir, manifest, use_claude=not args.no_claude)
     print(f"product : {data.title}")
     print(f"folder  : {out_dir}")
