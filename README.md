@@ -643,11 +643,32 @@ Without `/RU` and `/RP` the task only fires while you are logged on. To run when
 open the task's Properties in Task Scheduler and pick "Run whether user is logged on or not"
 (or re-register with `/RU <user> /RP <password>`).
 
-Linux/macOS cron equivalent (09:00 daily):
+### Running it on an always-on Linux box (VPS, mini PC, old laptop)
+
+The code is the same; only the scheduler differs. One-time setup on Ubuntu/Debian:
+
+```bash
+sudo apt install -y git python3.11 python3.11-venv
+git clone <your repo url> tracker && cd tracker
+python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m playwright install --with-deps chromium
+# copy .env, watchlist.csv and data/tracker.db from the laptop (scp / WinSCP) to keep the history
+mkdir -p logs && crontab -e
+```
+
+Cron lines (same three jobs as the Windows tasks; times are the box's local time):
 
 ```
-0 9 * * * cd /path/to/tracker && .venv/bin/python tracker.py run >> logs/run_$(date +\%F).log 2>&1
+0 9  * * * cd /home/you/tracker && .venv/bin/python tracker.py run --no-ads            >> logs/run_$(date +\%F).log  2>&1
+0 22 * * * cd /home/you/tracker && .venv/bin/python tracker.py ads --max-minutes 480   >> logs/meta_$(date +\%F).log 2>&1
+30 6 * * * cd /home/you/tracker && .venv/bin/python tracker.py radar                   >> logs/meta_$(date +\%F).log 2>&1 && .venv/bin/python tracker.py sync-sheets >> logs/meta_$(date +\%F).log 2>&1
 ```
+
+Two cautions. The Meta Ad Library pass runs a real Chromium for hours a day; from a datacenter IP
+(most VPS providers) Facebook shows login walls more often than from a home connection, so a small
+machine at home keeps the IP that has worked so far. And only one machine should run the passes:
+move `data/tracker.db` once and retire the Windows tasks (`schtasks /Delete /TN "ShopifyTracker Daily" /F`,
+same for `ShopifyTracker Meta`) so two copies do not scrape the same stores.
 
 `watchlist.csv` ships with three test stores (gymshark, allbirds, colourpop). Add more with:
 
