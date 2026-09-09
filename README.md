@@ -7,6 +7,41 @@ leading signals daily and alerting on week-over-week deltas. Full spec: [CLAUDE.
 delta calculations and the `report` / `product` commands. Meta Ad Library (step 3),
 landing-URL join (4), alerts (5) and the full cron/README pass (6) are not built yet.
 
+## PDP cloner (`pdp.py`)
+
+Separate from the tracker: give it a competitor product page and it produces everything needed to
+launch our own version of that page. One folder per product under `pdp_output/<slug>/`:
+
+| what | where | command |
+|---|---|---|
+| every image on the competitor page (gallery first, then page images, size suffixes stripped so you get the originals) | `competitor_imgs/` + `manifest.json` (source URL, alt text, kind) | `grab` |
+| summary of the competitor page (title, price/compare-at, variants, copy, headings in order, bullets, FAQ, trust lines, reviews) | `product_summary.md` + `product_summary.json` | `grab` |
+| new images rendered by Higgsfield from your prompt, with the competitor images as references | `<product name>_shopify_PDP_imgs/` + `generation_log.json` | `generate` |
+| those images uploaded to a **draft** Shopify product | `shopify_upload.json` | `upload` |
+| PDF build instructions for Fudge, merged from our reference PDP template + the summary | `<slug>_fudge_guide.pdf` (+ `.md`) | `guide` |
+
+```bash
+pip install -r requirements.txt            # adds beautifulsoup4, reportlab, anthropic, higgsfield-client
+python pdp.py grab https://competitor.com/products/glow-neck-massager
+python pdp.py generate glow-neck-massager --prompt "Studio shot on white, soft shadow, same product" --prompt "Lifestyle shot, woman on sofa using it"
+python pdp.py upload glow-neck-massager                       # creates a DRAFT product with the competitor title
+python pdp.py guide glow-neck-massager --template templates/pdp_template.md
+python pdp.py run https://competitor.com/products/x --prompt "..." --template templates/pdp_template.md   # all four
+python pdp.py list                                            # what has been grabbed / generated / uploaded
+```
+
+Keys in `.env` (see `.env.example`): `ANTHROPIC_API_KEY` (summary brief + guide text; without it you get the
+raw-facts summary and a mechanical guide), `HF_KEY` from cloud.higgsfield.ai (`generate`), `SHOPIFY_STORE` +
+`SHOPIFY_ADMIN_TOKEN` from a custom app with `write_products` and `write_files` (`upload`), `PDP_TEMPLATE` for the
+default template. `HIGGSFIELD_MODEL` / `HIGGSFIELD_IMAGE_ARG` pick the Higgsfield model and the request field that
+carries the reference-image URLs (default `bytedance/seedream/v4/edit` / `image_urls`; `generate --dry-run` prints the
+exact request without sending it). Shopify pages are read through `/products/<handle>.json`; other platforms fall back
+to HTML parsing and, when the page is JavaScript-rendered, a headless Chromium pass (`grab --browser` forces it).
+Useful flags: `generate --ref path.jpg` (choose references by hand), `--num`, `--prompt-file` (blank-line separated
+prompts), `upload --handle x` / `--product-id N` (attach to an existing product), `upload --with-description`,
+`--dry-run` on `generate` and `upload`. A starter template is in `templates/pdp_template.example.md`.
+Tests: `python -m unittest tests.test_pdpkit tests.test_pdpkit_shopify`.
+
 ## Setup
 
 ```bash

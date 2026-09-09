@@ -1,3 +1,9 @@
 requests>=2.31
 rich>=13.0
 playwright>=1.44   # Meta Ad Library scrape; run `python -m playwright install chromium` once
+# --- pdp.py (competitor PDP cloner) ---
+beautifulsoup4>=4.12   # HTML parsing for image discovery + page facts
+reportlab>=4.0         # PDF guide for Fudge
+anthropic>=1.0         # optional: Claude rewrites product_summary and writes the guide (ANTHROPIC_API_KEY)
+higgsfield-client>=0.1 # optional: Higgsfield Cloud image generation (HF_KEY)
+# optional template readers: python-docx (for .docx templates), pypdf (for .pdf templates)
