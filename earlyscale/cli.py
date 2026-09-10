@@ -584,8 +584,8 @@ def _rank_due(conn, store_id: int, today: str) -> bool:
     if not r or r["sort_informative"] is None or r["sort_informative"]:
         return True
     chk = conn.execute("SELECT note FROM rank_checks WHERE store_id = ? ORDER BY snapshot_date DESC LIMIT 1", (store_id,)).fetchone()
-    if chk is None or not chk["note"]:
-        return True
+    if chk is None or not chk["note"] or "[sort control" not in chk["note"]:
+        return True      # judged before the per-view comparison / before the in-page sort control existed: judge again
     try:
         return (date.fromisoformat(today) - date.fromisoformat(r["rank_checked_at"])).days >= 7
     except (TypeError, ValueError):

@@ -127,9 +127,13 @@ class RankDueTests(unittest.TestCase):
         self.assertTrue(cli._rank_due(self.conn, self.sid, "2026-09-10"))
 
     def test_not_informative_is_weekly(self):
-        self._check("2026-09-08", 0, "ALL: 40 ads, 20/20 ... -> same order; DE: 0 ads; NL: 0 ads")
+        self._check("2026-09-08", 0, "ALL: 40 ads, 20/20 ... -> same order [sort control: select option 'Impressions: high to low']; DE: 0 ads; NL: 0 ads")
         self.assertFalse(cli._rank_due(self.conn, self.sid, "2026-09-10"))
         self.assertTrue(cli._rank_due(self.conn, self.sid, "2026-09-15"))
+
+    def test_verdict_from_the_url_sort_is_redone_with_the_page_control(self):
+        self._check("2026-09-10", 0, "ALL: 40 ads, 20/20 ... -> same order; DE: 0 ads; NL: 0 ads")
+        self.assertTrue(cli._rank_due(self.conn, self.sid, "2026-09-10"))
 
     def test_verdict_from_before_per_view_comparison_is_redone(self):
         self._check("2026-09-09", 0, None)

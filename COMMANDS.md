@@ -168,7 +168,7 @@ Captured posts are re-counted by the morning run automatically.
 | `META_ADS=1` | `run` includes the Meta pass when run by hand (the night task does it anyway) |
 | `META_STORES=a.com,b.com` | limit the Meta pass to these stores (default: all, rotating) |
 | `INVENTORY_STORES=a.com,b.com` | which stores get the stock probe (`INVENTORY=1` = all); stores whose products.json says `inventory_management=shopify` are probed anyway |
-| `META_MAX_SCROLLS=40` / `META_DETAIL_MAX=30` | how deep each store's Meta scrape goes (~6 min per store at these) |
+| `META_MAX_SCROLLS=20` / `META_DETAIL_MAX=15` | how deep each store's Meta scrape goes (~3-4 min per store at these; 40 / 30 covered only ~50 stores a night) |
 | `RADAR_MAX_MINUTES=240` | cap for one radar run (sweeps + triage); leftovers continue next time |
 | `RADAR_MAX_AGE_DAYS=180` / `RADAR_MIN_ACTIVE_ADS=10` | promotion thresholds: (age <= 180 d OR a product <= 30 d old with >= 3 ads) AND >= 10 active ads |
 | `RADAR_FUNNEL_MIN_ADS=3` | a non-Shopify lander needs this many sweep ads to be tracked as a funnel; fewer = discarded (1 keeps everything) |

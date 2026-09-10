@@ -104,7 +104,7 @@ def collect_diag(conn: sqlite3.Connection, notes: list[str] | None = None, max_c
                              FROM rank_checks c JOIN stores s ON s.id = c.store_id
                              WHERE c.snapshot_date >= date((SELECT MAX(snapshot_date) FROM rank_checks), '-2 days')
                              ORDER BY c.snapshot_date DESC, s.store_domain LIMIT 150"""):
-        add(f"{r[1]} {r[0]:<28} {r[2] or '-':<4} informative={r[3]} sorted={r[4]} {(r[5] or '')[:220]}")
+        add(f"{r[1]} {r[0]:<28} {r[2] or '-':<4} informative={r[3]} sorted={r[4]} {(r[5] or '')[:600]}")
     add("")
     add("== stores ==")
     add("domain | platform | products: status date | ads: date active badge_known low resolved | last error")

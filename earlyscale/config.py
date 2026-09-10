@@ -61,7 +61,7 @@ SHEETS_TIMEOUT = (10, 90)  # Apps Script can take a while on big appends
 META_ADS_ENABLED = os.environ.get("META_ADS", "").strip() in ("1", "true", "yes")
 META_WAIT_MIN = float(os.environ.get("META_WAIT_MIN", "3"))
 META_WAIT_MAX = float(os.environ.get("META_WAIT_MAX", "8"))
-META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "40"))   # ~700 ads, ~4 min; the newest ads come first
+META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "20"))   # ~350 ads, ~2 min; the newest ads come first (40 covered only ~50 stores a night)
 # Which stores the Meta pass covers and how long it may run. META_STORES empty = every watchlist
 # store; META_MAX_MINUTES caps the whole pass (scrape + single-ad pages) per day, and stores are
 # taken least-recently-scraped first so a big watchlist rotates through over several days.
@@ -82,7 +82,7 @@ META_RANK_UI = os.environ.get("META_RANK_UI", "1").strip() not in ("0", "false",
 META_RANK_SCROLLS = int(os.environ.get("META_RANK_SCROLLS", "8"))          # ~150 ads: only the top ranks matter
 META_RANK_COUNTRIES = [c.strip().upper() for c in os.environ.get("META_RANK_COUNTRIES", "ALL,DE,NL").split(",") if c.strip()]  # views tried until the sort is informative
 META_RANK_MIN_COMPARE = int(os.environ.get("META_RANK_MIN_COMPARE", "20")) # ids compared to decide whether the sort is informative
-META_DETAIL_MAX = int(os.environ.get("META_DETAIL_MAX", "30"))       # single-ad pages per store per day (~2.5 min)
+META_DETAIL_MAX = int(os.environ.get("META_DETAIL_MAX", "15"))       # single-ad pages per store per day (~1.3 min)
 META_DETAIL_LIGHT = os.environ.get("META_DETAIL_LIGHT", "1").strip() not in ("0", "false", "no")   # block images/media/fonts/css/external js on single-ad pages
 META_DETAIL_CONTEXT_PAGES = int(os.environ.get("META_DETAIL_CONTEXT_PAGES", "20"))   # new browser context every N single-ad pages
 META_CREATIVE_MAX_BYTES = int(os.environ.get("META_CREATIVE_MAX_BYTES", str(2 * 1024 * 1024)))   # hash at most this much of a video
