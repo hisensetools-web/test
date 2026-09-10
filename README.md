@@ -849,8 +849,9 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
   no write at all when the schema is already at the code's version (stamped in `PRAGMA user_version`), so
   read-only commands (`sync-sheets`, `report`, `product`) work while a pass is running; when a schema update
   is needed and the file is busy, connect waits and retries a few times instead of failing. To find the
-  holder: `Get-Process python | Select-Object Id, StartTime, CPU`, then `Stop-Process -Id <id>` if it is a
-  leftover from a run that should have finished.
+  holder: `python tracker.py db-check` tries a 2-second write lock and lists python / OneDrive / SQLite-viewer
+  processes; `Stop-Process -Id <id>` stops a leftover python. A SQLite viewer with unsaved changes, or OneDrive
+  syncing the Desktop, holds the file just the same.
 
 ## Tests and offline end-to-end
 

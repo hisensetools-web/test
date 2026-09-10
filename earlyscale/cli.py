@@ -259,6 +259,58 @@ def dead_stores(conn, stores: list[dict]) -> list[dict]:
     return out
 
 
+def cmd_db_check(args) -> int:
+    """Is data/tracker.db free? Tries a 2-second write lock, lists the database files and the programs that could be
+    holding it (any python, a database viewer, OneDrive syncing the folder)."""
+    import os
+    import sqlite3
+    path = Path(args.db) if args.db else config.DB_PATH
+    console.print(f"database: {path.resolve()}")
+    for f in sorted(path.parent.glob(path.name + "*")):
+        st = f.stat()
+        console.print(f"  {f.name:<22} {st.st_size / 1e6:8.1f} MB   modified {datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M:%S}")
+    if not path.exists():
+        console.print("[yellow]no database yet (the first run creates it)[/]")
+        return 0
+    raw = sqlite3.connect(str(path), timeout=2)
+    try:
+        ver = raw.execute("PRAGMA user_version").fetchone()[0]
+        mode = raw.execute("PRAGMA journal_mode").fetchone()[0]
+        console.print(f"  journal_mode={mode}  schema stamp {'current' if ver == db.schema_stamp() else 'needs the one-time update (a write)'}")
+        try:
+            raw.execute("BEGIN IMMEDIATE")
+            raw.rollback()
+            console.print("[green]write lock: free[/] (no other program is writing to it right now)")
+            locked = False
+        except sqlite3.OperationalError as e:
+            console.print(f"[red]write lock: NOT available[/] ({e}) - another program has the database open for writing")
+            locked = True
+        try:
+            n = raw.execute("SELECT COUNT(*) FROM stores").fetchone()[0]
+            console.print(f"read: ok ({n} stores)")
+        except sqlite3.OperationalError as e:
+            console.print(f"[red]read: failed ({e})[/]")
+    finally:
+        raw.close()
+    if os.name == "nt":
+        import subprocess
+        try:
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "Get-Process python, pythonw, OneDrive, 'DB Browser for SQLite', sqlitebrowser, Code -ErrorAction SilentlyContinue "
+                                  "| Select-Object Id, ProcessName, StartTime | Format-Table -AutoSize | Out-String"],
+                                 capture_output=True, text=True, timeout=20).stdout.strip()
+            console.print("processes that could hold it:" + ("\n" + out if out else " none of python / OneDrive / DB Browser / VS Code running"))
+        except Exception as e:  # noqa: BLE001
+            console.print(f"(could not list processes: {e})")
+        if "onedrive" in str(path.resolve()).lower() or (Path.home() / "OneDrive").exists():
+            console.print("[yellow]OneDrive is set up on this PC. If it syncs the Desktop it can hold tracker.db while uploading; "
+                          "move the project out of synced folders (e.g. C:\\tracker) or exclude it in OneDrive settings.[/]")
+    if locked:
+        console.print("close any program that has the database open (a SQLite viewer, a VS Code SQLite tab), stop leftover python "
+                      "processes (Stop-Process -Id <id>), then run db-check again.")
+    return 1 if locked else 0
+
+
 def cmd_prune_dead(args) -> int:
     conn = db.connect(args.db)
     stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
@@ -1933,6 +1985,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")
     s.add_argument("--no-verify", action="store_true", help="skip the read-back comparison after syncing")
     s.set_defaults(fn=cmd_sync_sheets)
+
+    s = sub.add_parser("db-check", help="is data/tracker.db free to write? lists its files and the programs that could be holding it")
+    s.add_argument("--db")
+    s.set_defaults(fn=cmd_db_check)
 
     s = sub.add_parser("prune-dead", help="list (and with --apply remove) watchlist domains that never returned a catalogue or an ad")
     s.add_argument("--apply", action="store_true", help="remove them from watchlist.csv (history in the DB is kept)")
