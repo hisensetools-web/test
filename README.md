@@ -626,8 +626,10 @@ its own newest-first list) the impressions-sorted URL came back in exactly the n
 store and every view tried (biorootlabs, holior: ALL, DE and NL, 20/20 ids in the same position). Meta's
 web app does not apply `sort_data[...]` from the URL; the sort is chosen in the page's dropdown, which
 issues its own request. Until the scrape drives that dropdown, the search costs 2-4 extra searches per store
-per night and returns nothing usable, so the pass is off and the rank columns stay blank. The Signals /
-Early ranking falls through to the delivering signal (badge), which does work. Everything below describes
+per night and returns nothing usable, so the pass is off and the rank columns stay blank. Ranks recorded
+before this finding were newest-first positions and are cleared once on the next database open (a
+`schema_migrations` step); `ads_in_top5` / `best_rank` only ever show for a store with a real informative
+verdict. The Signals / Early ranking falls through to the delivering signal (badge), which does work. Everything below describes
 the pass as built, for when it is switched on again (`META_RANK=1`, or `rank-check` by hand).
 
 The second per-ad delivery signal. Every Meta pass runs the store's search a second time with the

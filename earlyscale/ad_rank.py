@@ -188,7 +188,7 @@ def _snap(conn, store_id, day):
 
 def ad_rank_metrics(conn: sqlite3.Connection, store_id: int, today: str) -> dict:
     """{'ads': {ad_id: {...}}, 'products': {handle: {...}}, 'as_of': day, 'prev_as_of': day7}."""
-    snap = _snap(conn, store_id, today)
+    snap = _snap(conn, store_id, today) if sort_informative(conn, store_id) == 1 else None   # no verdict = no ranks
     if not snap:
         return {"ads": {}, "products": {}, "as_of": None, "prev_as_of": None}
     prev = _snap(conn, store_id, (date.fromisoformat(snap) - timedelta(days=7)).isoformat())

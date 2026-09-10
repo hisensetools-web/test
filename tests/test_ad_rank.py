@@ -227,3 +227,35 @@ class ScrapeRanksTests(unittest.TestCase):
         self.assertEqual((out["country"], out["informative"]), ("NL", True))
         self.assertIn("confirmed earlier", out["summary"])
         self.assertEqual(self.conn.execute("SELECT informative FROM rank_checks WHERE store_id = ? AND snapshot_date = ?", (self.sid, TODAY)).fetchone()[0], 1)
+
+
+class StaleRankTests(unittest.TestCase):
+    def test_ranks_without_a_real_verdict_are_cleared_once_and_never_shown(self):
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            conn = db.connect(Path(d) / "t.db")
+            sid = db.upsert_store(conn, "elivorahealth.com")
+            ids = [f"e{i}" for i in range(6)]
+            # what the overnight run left behind: ranks stored under a verdict that had no per-view note
+            seed_day(conn, sid, TODAY, ids, {i: "cinnamon-copy" for i in ids})
+            conn.execute("UPDATE rank_checks SET note = NULL")
+            conn.execute("DELETE FROM schema_migrations WHERE name LIKE '%clear-non-informative-ranks'")
+            conn.execute("PRAGMA user_version = 0")
+            conn.commit()
+            conn.close()
+            conn = db.connect(Path(d) / "t.db")   # the one-off step runs here
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM meta_ads_daily WHERE impression_rank IS NOT NULL").fetchone()[0], 0)
+            self.assertIsNone(conn.execute("SELECT sort_informative FROM stores WHERE id = ?", (sid,)).fetchone()[0])
+            self.assertEqual(ad_rank.ad_rank_metrics(conn, sid, TODAY)["products"], {})
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0], len(db.MIGRATION_STEPS))
+            conn.close()
+
+    def test_metrics_need_an_informative_verdict(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "x.com")
+        ids = [f"e{i}" for i in range(6)]
+        seed_day(conn, sid, TODAY, ids, {i: "p" for i in ids})
+        self.assertEqual(ad_rank.ad_rank_metrics(conn, sid, TODAY)["products"]["p"]["ads_in_top5"], 5)
+        conn.execute("UPDATE stores SET sort_informative = 0 WHERE id = ?", (sid,))
+        self.assertEqual(ad_rank.ad_rank_metrics(conn, sid, TODAY)["products"], {})

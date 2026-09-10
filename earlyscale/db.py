@@ -437,10 +437,25 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
+# One-off data fixes, applied once each (recorded in schema_migrations) and part of the schema stamp.
+MIGRATION_STEPS: list[tuple[str, str]] = [
+    ("2026-09-10-clear-non-informative-ranks",
+     # impression ranks recorded while the sort was judged against the wrong baseline are newest-first positions,
+     # not ranks: drop every rank not backed by a real per-view comparison, and the verdicts derived from them
+     """UPDATE meta_ads_daily SET impression_rank = NULL
+        WHERE impression_rank IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM rank_checks c WHERE c.store_id = meta_ads_daily.store_id AND c.snapshot_date = meta_ads_daily.snapshot_date
+              AND c.informative = 1 AND c.note LIKE '%-> informative%');
+        UPDATE stores SET sort_informative = NULL, rank_checked_at = NULL
+        WHERE sort_informative IS NOT NULL AND id NOT IN (
+            SELECT store_id FROM rank_checks WHERE note LIKE '%-> informative%' OR note LIKE '%-> same order%');"""),
+]
+
+
 def schema_stamp() -> int:
     """Checksum of the schema + migration list: the database carries it in user_version once set up, so a
     connection whose code version matches does no write at all on open (read-only commands never take a lock)."""
-    return zlib.crc32(SCHEMA.encode() + repr(MIGRATION_COLUMNS).encode()) & 0x7FFFFFFF
+    return zlib.crc32(SCHEMA.encode() + repr(MIGRATION_COLUMNS).encode() + repr([n for n, _ in MIGRATION_STEPS]).encode()) & 0x7FFFFFFF
 
 
 def _setup(conn: sqlite3.Connection, stamp: int, attempts: int = 6) -> None:
@@ -511,6 +526,15 @@ def _migrate(conn: sqlite3.Connection) -> None:
         for name, typ in cols:
             if name not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+    done = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
+    for name, sql in MIGRATION_STEPS:
+        if name in done:
+            continue
+        for stmt in sql.split(";"):
+            if stmt.strip():
+                conn.execute(stmt)
+        conn.execute("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)", (name, utcnow_iso()))
 
 
 # ---------------------------------------------------------------- stores
