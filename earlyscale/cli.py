@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -1566,8 +1567,9 @@ def cmd_landing(args) -> int:
         key = ad_metrics._strip(args.url)
         conn.execute("DELETE FROM landing_pages WHERE url = ?", (key,))
         conn.commit()
-        today = _parse_date(None)
-        _post_process_store(conn, store["id"], store["store_domain"], today, session, fetch_landings=True)
+        snap = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ?", (store["id"],)).fetchone()[0]
+        if snap:
+            ad_metrics.resolve_store_landings(conn, store["id"], store["store_domain"], snap, session)
         rows = conn.execute("""SELECT product_handle, COUNT(*) n FROM meta_ads WHERE store_id = ? AND landing_url LIKE ?
                                GROUP BY product_handle ORDER BY n DESC""", (store["id"], key + "%")).fetchall()
         console.print("ads landing here, by the product they now count for: " + (", ".join(f"{r['product_handle'] or '(unresolved)'}={r['n']}" for r in rows) or "none")
@@ -1577,48 +1579,75 @@ def cmd_landing(args) -> int:
 
 def _landing_refresh_all(conn, args) -> int:
     """Every cached landing page of every watchlist store is marked stale and fetched again (REQUEST_DELAY_S between
-    fetches), then the store's ads are re-resolved for its latest snapshot. Prints, per store, how many landers were
-    fetched and how many ads changed product."""
+    fetches of the same store; LANDING_REFRESH_WORKERS stores in parallel, each on its own host), then the store's
+    ads are re-resolved for its latest snapshot. Rows already resolved under the current rules are kept (a run can be
+    interrupted and resumed) unless --force. Prints, per store, landers fetched and ads that changed product."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
     stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
     only = set(args.only or [])
-    rows = [r for r in conn.execute("SELECT id, store_domain FROM stores ORDER BY store_domain")
+    rows = [(r["id"], r["store_domain"]) for r in conn.execute("SELECT id, store_domain FROM stores ORDER BY store_domain")
             if r["store_domain"] in {s["store_domain"] for s in stores} and (not only or r["store_domain"] in only)]
-    session = shopify.make_session()
+    workers = max(1, min(config.LANDING_REFRESH_WORKERS, len(rows) or 1))
     old_budget = config.META_MAX_LANDING_FETCH
     config.META_MAX_LANDING_FETCH = 10 ** 6     # this pass IS the landing fetch; no per-run cap
     ad_metrics.POLITE_LANDING_FETCH = True
     t = Table(title="landing pages re-fetched under the current rules")
     for c in ("store", "ads", "landers", "fetched", "ads changed product", "unresolved -> resolved", "took"):
         t.add_column(c, justify="right" if c not in ("store",) else "left")
-    total_changed = 0
-    try:
-        for i, r in enumerate(rows, start=1):
-            sid, domain = r["id"], r["store_domain"]
-            snap = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ?", (sid,)).fetchone()[0]
+
+    def one(sid: int, domain: str) -> dict | None:
+        c = db.connect(args.db)
+        try:
+            snap = c.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ?", (sid,)).fetchone()[0]
             if not snap:
-                continue
-            before = {a["ad_id"]: a["product_handle"] for a in conn.execute("SELECT ad_id, product_handle FROM meta_ads WHERE store_id = ?", (sid,))}
-            keys = {ad_metrics._strip(u) for (u,) in conn.execute("SELECT DISTINCT landing_url FROM meta_ads WHERE store_id = ? AND landing_url IS NOT NULL", (sid,))}
-            n_fetch = 0
-            for k in keys:
-                cur = conn.execute("UPDATE landing_pages SET fetched_at = '2000-01-01' WHERE url = ?", (k,))
-                n_fetch += cur.rowcount
-            conn.commit()
+                return None
+            before = {a["ad_id"]: a["product_handle"] for a in c.execute("SELECT ad_id, product_handle FROM meta_ads WHERE store_id = ?", (sid,))}
+            keys = {ad_metrics._strip(u) for (u,) in c.execute("SELECT DISTINCT landing_url FROM meta_ads WHERE store_id = ? AND landing_url IS NOT NULL", (sid,))}
+            n_stale = 0
+            with c:
+                for k in keys:
+                    # a row already resolved under the current rules (an interrupted run, --apply) is kept; --force redoes it
+                    n_stale += c.execute("UPDATE landing_pages SET fetched_at = '2000-01-01' WHERE url = ? AND (COALESCE(resolver, 0) < ? OR ?)",
+                                         (k, ad_metrics.RESOLVER_VERSION, 1 if args.force else 0)).rowcount
             t0 = time.monotonic()
-            console.print(f"[{i}/{len(rows)}] {domain}: {len(keys)} landing URLs ({n_fetch} cached) ...", end=" ")
-            _post_process_store(conn, sid, domain, snap, session, fetch_landings=True)
-            after = {a["ad_id"]: a["product_handle"] for a in conn.execute("SELECT ad_id, product_handle FROM meta_ads WHERE store_id = ?", (sid,))}
-            changed = sum(1 for k in after if k in before and before[k] != after[k])
-            gained = sum(1 for k in after if k in before and before[k] is None and after[k])
-            fetched = conn.execute("SELECT COUNT(*) FROM landing_pages WHERE fetched_at = ? AND url IN (%s)" % ",".join("?" * len(keys)),
-                                   (snap, *keys)).fetchone()[0] if keys else 0
-            total_changed += changed
-            took = time.monotonic() - t0
-            console.print(f"{fetched} fetched, {changed} ads changed product ({took:.0f}s)")
-            t.add_row(_short(domain), str(len(after)), str(len(keys)), str(fetched), str(changed), str(gained), f"{took:.0f}s")
+            ad_metrics.resolve_store_landings(c, sid, domain, snap, shopify.make_session())
+            after = {a["ad_id"]: a["product_handle"] for a in c.execute("SELECT ad_id, product_handle FROM meta_ads WHERE store_id = ?", (sid,))}
+            fetched = c.execute("SELECT COUNT(*) FROM landing_pages WHERE fetched_at = ? AND resolver = ? AND url IN (%s)" % ",".join("?" * len(keys)),
+                                (snap, ad_metrics.RESOLVER_VERSION, *keys)).fetchone()[0] if keys else 0
+            return {"domain": domain, "ads": len(after), "landers": len(keys), "stale": n_stale, "fetched": fetched,
+                    "changed": sum(1 for k in after if k in before and before[k] != after[k]),
+                    "gained": sum(1 for k in after if k in before and before[k] is None and after[k]), "took": time.monotonic() - t0}
+        finally:
+            c.close()
+
+    total_changed = done = 0
+    console.print(f"{len(rows)} stores, {workers} in parallel; REQUEST_DELAY_S={config.REQUEST_DELAY_S:.1f}s between fetches of one store. Ctrl+C keeps what is done.")
+    pool = ThreadPoolExecutor(max_workers=workers)
+    futures = {pool.submit(one, sid, domain): domain for sid, domain in rows}
+    try:
+        for f in as_completed(futures):
+            done += 1
+            domain = futures[f]
+            try:
+                r = f.result()
+            except Exception as e:  # noqa: BLE001
+                console.print(f"[{done}/{len(rows)}] {domain}: [red]failed: {e}[/]")
+                continue
+            if r is None:
+                continue
+            total_changed += r["changed"]
+            console.print(f"[{done}/{len(rows)}] {r['domain']}: {r['landers']} landing URLs, {r['fetched']} fetched, "
+                          f"{r['changed']} ads changed product ({r['took']:.0f}s)")
+            t.add_row(_short(r["domain"]), str(r["ads"]), str(r["landers"]), str(r["fetched"]), str(r["changed"]), str(r["gained"]), f"{r['took']:.0f}s")
     except KeyboardInterrupt:
-        console.print("\n[yellow]interrupted; stores done so far are re-resolved[/]")
+        console.print("\n[yellow]interrupted; stores done so far are re-resolved, run again to continue (already-fetched pages are skipped)[/]")
+        pool.shutdown(wait=False, cancel_futures=True)
+        config.META_MAX_LANDING_FETCH = old_budget
+        ad_metrics.POLITE_LANDING_FETCH = False
+        console.print(t)
+        os._exit(130)
     finally:
+        pool.shutdown(wait=True)
         config.META_MAX_LANDING_FETCH = old_budget
         ad_metrics.POLITE_LANDING_FETCH = False
     console.print(t)
@@ -2081,6 +2110,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--apply", action="store_true", help="re-resolve the store's ads that land on this URL and write the result")
     s.add_argument("--refresh-all", action="store_true", help="every watchlist store: re-fetch its cached landing pages under the current rules and re-resolve its ads")
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="with --refresh-all: limit to these stores")
+    s.add_argument("--force", action="store_true", help="with --refresh-all: re-fetch pages already fetched today (an interrupted run resumes without it)")
     s.add_argument("--watchlist")
     s.set_defaults(fn=cmd_landing)
 

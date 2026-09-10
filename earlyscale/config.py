@@ -66,6 +66,7 @@ META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "40"))   # ~700 ads, ~
 # taken least-recently-scraped first so a big watchlist rotates through over several days.
 META_STORES = [d.strip().lower() for d in os.environ.get("META_STORES", "").split(",") if d.strip()]
 META_MAX_MINUTES = float(os.environ.get("META_MAX_MINUTES", "90"))
+LANDING_REFRESH_WORKERS = int(os.environ.get("LANDING_REFRESH_WORKERS", "4"))   # `landing --refresh-all`: stores fetched in parallel (one host each)
 META_MAX_LANDING_FETCH = int(os.environ.get("META_MAX_LANDING_FETCH", "40"))   # advertorial / redirect pages fetched per store per run
 META_CREATIVES_PER_AD = int(os.environ.get("META_CREATIVES_PER_AD", "4"))     # images/videos hashed per ad
 META_MAX_ADS = int(os.environ.get("META_MAX_ADS", "3000"))

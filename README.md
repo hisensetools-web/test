@@ -633,8 +633,11 @@ softgels behind its Order Now button. Landers cached under the old rule are re-f
 
 `python tracker.py landing <url>` shows the evidence table and the pick for any page; `--apply` re-resolves the
 ads landing there right away. `python tracker.py landing --refresh-all` re-fetches every cached lander of every
-watchlist store under the current rules (`REQUEST_DELAY_S` between fetches) and re-resolves the ads in one pass,
-printing per store how many ads changed product; run `sync-sheets` afterwards. The **Ads** tab lists, per store,
+watchlist store under the current rules (`REQUEST_DELAY_S` between fetches of one store, `LANDING_REFRESH_WORKERS`
+(4) stores in parallel) and re-resolves the ads in one pass, printing per store how many ads changed product; run
+`sync-sheets` afterwards. It only resolves landings (concepts and daily metrics are recomputed by the next Meta
+pass), pages already resolved under the current rules are skipped so an interrupted run resumes, and `--force`
+re-fetches everything. Budget: about 2 s per landing page per store, four stores at a time. The **Ads** tab lists, per store,
 the active ads of the latest snapshot (delivering first, newest first, `SHEETS_ADS_PER_STORE` = 100 per store)
 with page name, ad id, started, days running, delivering, low_impressions, impression_rank, landing_path,
 resolved_product and the first 120 characters of the primary text, so attribution can be checked by eye. Signals shows the ad's own path in `landing_paths`, so a prostate funnel that

@@ -101,6 +101,7 @@ BTN_ATTR_RE = re.compile(r"(?:class|id|data-[a-z\-]+)=[\"'][^\"']*(?:btn|button|
 CART_PERMALINK_RE = re.compile(r"/cart/(\d{9,16}):\d+", re.I)
 TAG_RE = re.compile(r"<[^>]+>")
 W_LINK, W_JSON, W_CTA, W_BUY = 1, 1, 4, 6
+RESOLVER_VERSION = 2   # landing_pages.resolver: 2 = CTA-weighted (bump when the rules change; refresh-all re-fetches older rows)
 
 
 def handles_from_html(html: str, variant_to_handle: dict[int, str] | None = None) -> list[tuple[str, int]]:
@@ -322,10 +323,10 @@ def _resolve_url(conn: sqlite3.Connection, url: str, store_domain: str, known: s
         hit["status"] = -1
         hit["candidates"] = f"error:{str(e)[:80]}"
     conn.execute(
-        """INSERT OR REPLACE INTO landing_pages (url, fetched_at, status, final_url, product_handle, page_handle, candidates)
-           VALUES (?,?,?,?,?,?,?)""",
+        """INSERT OR REPLACE INTO landing_pages (url, fetched_at, status, final_url, product_handle, page_handle, candidates, resolver)
+           VALUES (?,?,?,?,?,?,?,?)""",
         (hit["url"], hit["fetched_at"], hit["status"], hit["final_url"], hit["product_handle"],
-         hit["page_handle"], hit["candidates"][:500]))
+         hit["page_handle"], hit["candidates"][:500], RESOLVER_VERSION))
     return hit
 
 
@@ -492,31 +493,46 @@ def _days(a: str | None, b: str) -> int | None:
         return None
 
 
-def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, today: str,
-                  session: requests.Session | None = None, fetch_landings: bool = True) -> dict:
-    """Resolve landings, cluster concepts, find lineage, write per-ad and per-concept rows for `today`.
-    Returns a summary dict."""
-    ads = [dict(r) for r in conn.execute(
+def _store_ads(conn: sqlite3.Connection, store_id: int, today: str) -> list[dict]:
+    return [dict(r) for r in conn.execute(
         """SELECT a.*, d.is_active, d.reactions, d.comments, d.shares
            FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id AND d.snapshot_date = ?
            WHERE a.store_id = ?""", (today, store_id))]
-    if not ads:
-        return {"ads": 0}
+
+
+def resolve_store_landings(conn: sqlite3.Connection, store_id: int, store_domain: str, today: str,
+                           session: requests.Session | None, ads: list[dict] | None = None) -> tuple[int, int, int]:
+    """Landing URL -> product for every ad of the store's `today` snapshot (fetching pages when a session is given);
+    writes product_handle / page_handle on meta_ads. Returns (ads resolved, unlisted products discovered). This is
+    the first step of process_store and all that `landing --refresh-all` needs: concepts, lineage and the daily
+    metrics are recomputed by the next Meta pass."""
+    ads = _store_ads(conn, store_id, today) if ads is None else ads
     known, v2h = _known_handles(conn, store_id, today)
     cache: dict[str, dict] = {}
-    unlisted = discover_unlisted_products(conn, store_id, store_domain, ads, known, session if fetch_landings else None,
-                                          cache, today)
+    unlisted = discover_unlisted_products(conn, store_id, store_domain, ads, known, session, cache, today)
     if unlisted:
         known, v2h = _known_handles(conn, store_id, today)
     resolved = 0
     for a in ads:
-        r = resolve_landing(conn, store_id, store_domain, a, known, v2h, session if fetch_landings else None, cache, today)
+        r = resolve_landing(conn, store_id, store_domain, a, known, v2h, session, cache, today)
         a["product_handle"], a["page_handle"] = r["product_handle"], r["page_handle"]
         a["landing_handle"] = handle_from_url(a.get("landing_url"))[0]   # raw advertised handle, suffix and all
         resolved += 1 if r["product_handle"] else 0
         conn.execute("""UPDATE meta_ads SET product_handle = ?, page_handle = ?, landing_resolved_via = ?, landing_handle = ?
                         WHERE ad_id = ?""",
                      (r["product_handle"], r["page_handle"], r["resolved_via"], a["landing_handle"], a["ad_id"]))
+    conn.commit()
+    return resolved, unlisted, sum(1 for h in cache.values() if isinstance(h, dict) and h.get("status") is not None)
+
+
+def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, today: str,
+                  session: requests.Session | None = None, fetch_landings: bool = True) -> dict:
+    """Resolve landings, cluster concepts, find lineage, write per-ad and per-concept rows for `today`.
+    Returns a summary dict."""
+    ads = _store_ads(conn, store_id, today)
+    if not ads:
+        return {"ads": 0}
+    resolved, unlisted, pages_fetched = resolve_store_landings(conn, store_id, store_domain, today, session if fetch_landings else None, ads)
 
     page_of = lambda a: a.get("page_id") or a.get("page_name") or ""
 
@@ -581,7 +597,7 @@ def process_store(conn: sqlite3.Connection, store_id: int, store_domain: str, to
     conn.commit()
     return {"ads": len(all_ads), "ignored": len(all_ads) - len(ads), "resolved": resolved, "concepts": n_concepts,
             "unlisted": unlisted,
-            "lineage": len(lineage), "pages_fetched": sum(1 for h in cache.values() if isinstance(h, dict) and h.get("status") is not None)}
+            "lineage": len(lineage), "pages_fetched": pages_fetched}
 
 
 def delivering(ad: dict) -> bool:

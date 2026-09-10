@@ -453,6 +453,9 @@ MIGRATION_STEPS: list[tuple[str, str]] = [
      # landing pages that named more than one product were resolved by link count (menus and upsells could beat the
      # buy button); mark them stale so the CTA-weighted resolver fetches them again, keeping the old handle meanwhile
      """UPDATE landing_pages SET fetched_at = '2000-01-01' WHERE candidates LIKE '%,%' AND status = 200;"""),
+    ("2026-09-10-landing-resolver-version",
+     # rows fetched on/after the day the CTA-weighted resolver shipped were resolved by it (the first refresh-all run)
+     """UPDATE landing_pages SET resolver = 2 WHERE resolver IS NULL AND fetched_at >= '2026-09-10';"""),
 ]
 
 
@@ -499,6 +502,7 @@ MIGRATION_COLUMNS = {   # columns added after the table was first created (ALTER
     "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
                       ("store_domain", "TEXT")],
     "alerts": [("dedupe_key", "TEXT")],
+    "landing_pages": [("resolver", "INTEGER")],   # rule version the row was resolved with (ad_metrics.RESOLVER_VERSION)
     "rank_checks": [("country", "TEXT"), ("note", "TEXT")],
     "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
                ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),

@@ -178,12 +178,19 @@ class LandingRefreshAllTests(unittest.TestCase):
             conn.close()
             with mock.patch.object(cli, "console"):
                 rc = cli.cmd_landing(argparse.Namespace(db=str(Path(d) / "t.db"), url=None, apply=False, refresh_all=True,
-                                                        only=None, watchlist=str(wl)))
+                                                        only=None, force=False, watchlist=str(wl)))
             conn = db.connect(Path(d) / "t.db")
             self.assertEqual(rc, 0)
             self.assertEqual({r[0] for r in conn.execute("SELECT product_handle FROM meta_ads")}, {"prostate-softgels"})
             lp = conn.execute("SELECT product_handle, fetched_at FROM landing_pages").fetchone()
-            self.assertEqual((lp[0], lp[1]), ("prostate-softgels", "2026-09-10"))
+            self.assertEqual(lp[0], "prostate-softgels")
+            self.assertEqual(conn.execute("SELECT resolver FROM landing_pages").fetchone()[0], ad_metrics.RESOLVER_VERSION)
+            # a second run has nothing left to fetch (rows already carry the current resolver version)
+            with mock.patch.object(cli, "console"), mock.patch.object(ad_metrics, "fetch_landing", side_effect=AssertionError("must not fetch")):
+                conn.close()
+                self.assertEqual(cli.cmd_landing(argparse.Namespace(db=str(Path(d) / "t.db"), url=None, apply=False, refresh_all=True,
+                                                                    only=None, force=False, watchlist=str(wl))), 0)
+                conn = db.connect(Path(d) / "t.db")
             self.assertFalse(ad_metrics.POLITE_LANDING_FETCH)   # restored
             conn.close()
         srv.shutdown()
