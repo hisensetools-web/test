@@ -200,6 +200,20 @@ class ScrapeRanksTests(unittest.TestCase):
         self.assertEqual((out["informative"], len(self.calls)), (False, 4))
         self.assertEqual(self.conn.execute("SELECT sort_informative FROM stores WHERE id = ?", (self.sid,)).fetchone()[0], 0)
 
+    def test_a_reused_verdict_does_not_extend_the_confirmation(self):
+        # day 1: real comparison; day 2: reused ("confirmed earlier"); day 9: the day-1 comparison is older than 7 days
+        # and day 2's reuse must not count, so the baseline is scraped again
+        nl = [f"n{i}" for i in range(22)]
+        script = {("NL", "sorted"): _res(list(reversed(nl))), ("NL", "newest"): _res(nl), ("ALL", "sorted"): _res(self.world), ("DE", "sorted"): _res([])}
+        with mock.patch.object(meta_ads, "scrape_page", self._fake(script)), mock.patch.object(meta_ads, "_wait"):
+            ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, "2026-09-01", self.world, countries=["ALL", "DE", "NL"])
+            ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, "2026-09-02", self.world, countries=["ALL", "DE", "NL"])
+            self.calls.clear()
+            out = ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, "2026-09-09", self.world, countries=["ALL", "DE", "NL"])
+        self.assertEqual(len(self.calls), 2)        # NL sorted + NL newest, no "confirmed earlier" shortcut
+        self.assertIn("-> informative", out["summary"])
+        self.assertNotIn("confirmed earlier", out["summary"])
+
     def test_confirmed_country_goes_first_without_a_baseline_scrape(self):
         nl = [f"n{i}" for i in range(22)]
         script = {("NL", "sorted"): _res(list(reversed(nl))), ("NL", "newest"): _res(nl), ("ALL", "sorted"): _res(self.world), ("DE", "sorted"): _res([])}

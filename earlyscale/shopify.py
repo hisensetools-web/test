@@ -9,7 +9,7 @@ import logging
 import random
 import re
 import time
-from urllib.parse import urlparse
+from urllib.parse import urlparse, unquote
 
 import requests
 
@@ -316,10 +316,23 @@ def discover_meta_page(store_domain: str, session: requests.Session | None = Non
     return extract_meta_page(r.text)
 
 
+_FB_PRETTY_RE = re.compile(r"https?://(?:www\.|m\.)?facebook\.com/(?:p|people)/([A-Za-z0-9_.\-%]+?)(?:-\d{5,}|/\d{5,})/?", re.I)
+
+
 def extract_meta_page(html: str) -> str | None:
+    """The page's name (or vanity slug) from the first facebook.com link on the page. Handles the newer
+    facebook.com/p/<Page-Name>-<id>/ and /people/<Name>/<id>/ links (the name, hyphens -> spaces) and skips
+    share / login / profile.php links and one- or two-character slugs."""
     for m in _FB_RE.finditer(html):
         name = m.group(1)
         if name.lower() in _FB_SKIP:
+            continue
+        if name.lower() in ("p", "people"):
+            pm = _FB_PRETTY_RE.match(html, m.start())
+            if pm:
+                return unquote(pm.group(1)).replace("-", " ").strip() or None
+            continue
+        if len(name) < 3:
             continue
         return name
     return None

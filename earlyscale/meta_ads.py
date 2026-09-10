@@ -50,13 +50,17 @@ class MetaScrapeError(Exception):
 
 # ---------------------------------------------------------------- pure parsing
 
+_short_name_warned: set[str] = set()
+
+
 def store_query(store: dict) -> str:
     """What to type into the Ad Library search for a store: its Meta page name, or the domain when no usable name is
     set. A one- or two-character 'name' (a mis-parsed footer link) would match thousands of unrelated pages."""
     domain = (store.get("store_domain") or "").split("//")[-1]
     name = (store.get("meta_page_name") or "").strip()
     if len(name) < 3:
-        if name:
+        if name and domain not in _short_name_warned:
+            _short_name_warned.add(domain)
             log.warning("%s: meta_page_name %r is too short to be a page name; searching the domain instead "
                         "(fix it with `python tracker.py set-page %s \"<page name>\"`)", domain, name, domain)
         return domain

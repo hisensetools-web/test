@@ -80,17 +80,25 @@ def record_ranks(conn: sqlite3.Connection, store_id: int, today: str, sorted_ads
     return {"ranked": len(ids), **cmp}
 
 
-def _confirmed_country(conn: sqlite3.Connection, store_id: int, today: str, within_days: int = 7) -> str | None:
-    """The country view whose sort was found informative for this store within the last `within_days` days."""
-    # note IS NOT NULL: only verdicts from the per-view comparison count (earlier ones judged an EU view against the worldwide list)
+def _last_informative(conn: sqlite3.Connection, store_id: int, today: str, within_days: int = 7) -> tuple[str | None, bool]:
+    """(country, fresh): the view last found informative for this store by a real comparison, and whether that
+    comparison is recent enough (within_days) to reuse without scraping the baseline again."""
+    # only a day on which the view was actually compared with its own newest-first list counts ('-> informative' in the
+    # note); a day that merely reused an earlier verdict ('confirmed earlier') does not, nor do rows from before the
+    # per-view comparison existed (no note). So a real comparison happens at least weekly.
     r = conn.execute("SELECT country, snapshot_date FROM rank_checks WHERE store_id = ? AND informative = 1 AND country IS NOT NULL "
-                     "AND note IS NOT NULL ORDER BY snapshot_date DESC LIMIT 1", (store_id,)).fetchone()
+                     "AND note LIKE '%-> informative%' ORDER BY snapshot_date DESC LIMIT 1", (store_id,)).fetchone()
     if not r:
-        return None
+        return None, False
     try:
-        return r["country"] if (date.fromisoformat(today) - date.fromisoformat(r["snapshot_date"])).days <= within_days else None
+        return r["country"], (date.fromisoformat(today) - date.fromisoformat(r["snapshot_date"])).days <= within_days
     except ValueError:
-        return None
+        return r["country"], False
+
+
+def _confirmed_country(conn: sqlite3.Connection, store_id: int, today: str, within_days: int = 7) -> str | None:
+    country, fresh = _last_informative(conn, store_id, today, within_days)
+    return country if fresh else None
 
 
 def _newest_ids(store: dict, country: str, browser, max_scrolls: int | None) -> list[str]:
@@ -113,10 +121,11 @@ def scrape_ranks(conn: sqlite3.Connection, browser, store: dict, store_id: int, 
     (skipped when that view was confirmed informative within the last 7 days). A view with 0 ads is skipped, not
     treated as the answer. The first informative view is kept; rank_checks.note records what every view returned."""
     countries = list(countries or config.META_RANK_COUNTRIES)
-    confirmed = _confirmed_country(conn, store_id, today)
-    if confirmed in countries:
-        countries.remove(confirmed)
-        countries.insert(0, confirmed)
+    preferred, fresh = _last_informative(conn, store_id, today)
+    confirmed = preferred if fresh else None
+    if preferred in countries:          # the view that worked last time goes first (with a fresh baseline when the verdict is stale)
+        countries.remove(preferred)
+        countries.insert(0, preferred)
     query = meta_ads.store_query(store)
     notes: list[str] = []
     last: dict | None = None
