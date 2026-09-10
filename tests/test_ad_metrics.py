@@ -646,3 +646,25 @@ class AdVelocityTests(unittest.TestCase):
         self.assertEqual([r[2] for r in rows], ["launching", "pointed", "quiet-young"])
         i = sheets.SIGNALS_HEADERS.index("ads_launched_7d")
         self.assertEqual(rows[0][i:i + 4], [2, 0, "new", "2026-09-07"])   # ads_as_of = the scrape the numbers come from
+
+
+class NoLockAcrossFetchTests(unittest.TestCase):
+    """A landing fetch can take seconds; the write lock must never be held while one is in flight (parallel
+    refresh-all workers and the scheduled tasks share the database)."""
+
+    def test_no_open_transaction_while_a_page_is_fetched(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "supp.com")
+        db.write_product_snapshot(conn, sid, "2026-09-10", [_prod(1, "hero", "H"), _prod(2, "other", "O")])
+        ads = [_ad(f"a{i}", "Brand", "2026-09-01", f"https://supp.com/pages/lander-{i}", f"copy {i}") for i in range(4)]
+        meta_ads.record_scrape(conn, sid, "2026-09-10", ads, "Brand")
+        conn.commit()
+        seen = []
+
+        def fake_fetch(session, url):
+            seen.append(conn.in_transaction)
+            return url, '<a class="btn" href="/products/hero">Order</a>', 200
+        with mock.patch.object(ad_metrics, "fetch_landing", fake_fetch):
+            resolved, _, fetched = ad_metrics.resolve_store_landings(conn, sid, "supp.com", "2026-09-10", session=object())
+        self.assertEqual((resolved, fetched, len(seen)), (4, 4, 4))
+        self.assertEqual(seen, [False] * 4)

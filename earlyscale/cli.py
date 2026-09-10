@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import sqlite3
 import sys
 import time
 from datetime import date, datetime
@@ -1596,6 +1597,16 @@ def _landing_refresh_all(conn, args) -> int:
         t.add_column(c, justify="right" if c not in ("store",) else "left")
 
     def one(sid: int, domain: str) -> dict | None:
+        for attempt in range(4):
+            try:
+                return _one(sid, domain)
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == 3:
+                    raise
+                time.sleep(5 * (attempt + 1))
+        return None
+
+    def _one(sid: int, domain: str) -> dict | None:
         c = db.connect(args.db)
         try:
             snap = c.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ?", (sid,)).fetchone()[0]

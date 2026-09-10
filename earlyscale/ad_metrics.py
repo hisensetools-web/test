@@ -376,6 +376,7 @@ def discover_unlisted_products(conn: sqlite3.Connection, store_id: int, store_do
             conn.execute("""INSERT OR REPLACE INTO landing_pages (url, fetched_at, status, final_url, product_handle, page_handle, candidates)
                             VALUES (?,?,?,?,?,?,?)""", (hit["url"], hit["fetched_at"], hit["status"], hit["final_url"],
                                                        hit["product_handle"], hit["page_handle"], hit["candidates"]))
+            conn.commit()   # one product page per transaction (a fetch follows)
         if product is not None:
             _db.write_unlisted_product(conn, store_id, today, product)
             known.add(product["handle"])
@@ -521,7 +522,7 @@ def resolve_store_landings(conn: sqlite3.Connection, store_id: int, store_domain
         conn.execute("""UPDATE meta_ads SET product_handle = ?, page_handle = ?, landing_resolved_via = ?, landing_handle = ?
                         WHERE ad_id = ?""",
                      (r["product_handle"], r["page_handle"], r["resolved_via"], a["landing_handle"], a["ad_id"]))
-    conn.commit()
+        conn.commit()   # never hold the write lock across the next page fetch: other commands / workers must get in
     return resolved, unlisted, sum(1 for h in cache.values() if isinstance(h, dict) and h.get("status") is not None)
 
 
