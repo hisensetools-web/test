@@ -126,6 +126,7 @@ function doPost(e) {
   try {
     if (!e || !e.postData || !e.postData.contents) throw new Error("empty POST body");
     var body = JSON.parse(e.postData.contents);
+    if (body.mode === "diag") return json_(writeDiag_(String(body.text || "")));
     var spec = TABS[body.tab];
     if (!spec) throw new Error("unknown tab: " + body.tab + " (expected one of " + Object.keys(TABS).join(", ") + ")");
     var rows = Array.isArray(body.rows) ? body.rows : [];
@@ -146,6 +147,20 @@ function doPost(e) {
 }
 
 // ---------------------------------------------------------------- helpers
+
+/** `python tracker.py diag`: the diagnostics report goes into a Google Doc named "EarlyScale Diag" in My Drive
+ *  (created on first use, replaced on every push) so it can be read without pasting anything. Needs the Docs and
+ *  Drive scopes: the first deployment after adding this asks for them. */
+function writeDiag_(text) {
+  var name = "EarlyScale Diag";
+  var files = DriveApp.getFilesByName(name);
+  var doc = files.hasNext() ? DocumentApp.openById(files.next().getId()) : DocumentApp.create(name);
+  var body = doc.getBody();
+  body.clear();
+  body.setText(text);
+  doc.saveAndClose();
+  return { ok: true, doc: doc.getUrl(), chars: text.length };
+}
 
 function getOrCreateSheet_(name, spec) {
   var ss = SpreadsheetApp.getActiveSpreadsheet();

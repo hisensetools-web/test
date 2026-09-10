@@ -45,6 +45,9 @@ if /i "%MODE%"=="meta" (
   set RC=!ERRORLEVEL!
 )
 echo ==== %DATE% %TIME% exit code %RC% >> "%LOG%"
+REM The diagnostics report (versions, task status, database counts, per-store status, log errors) goes to the
+REM Google Doc "EarlyScale Diag" so problems can be read there instead of pasting logs.
+%PY% tracker.py diag --note "after run_daily.bat %MODE% (exit code %RC%)" >> "%LOG%" 2>&1
 endlocal & exit /b %RC%
 
 :try

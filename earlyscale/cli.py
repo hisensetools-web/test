@@ -1667,6 +1667,32 @@ def _landing_refresh_all(conn, args) -> int:
     return 0
 
 
+def cmd_diag(args) -> int:
+    """Collect the diagnostics report (read-only) and write it to the Google Doc "EarlyScale Diag" via Apps Script,
+    plus logs/diag.txt. The scheduled tasks run this when they finish, so the doc always shows the latest state."""
+    from . import ops
+    conn = db.connect(args.db)
+    text = ops.collect_diag(conn, [n for n in (args.note or [])])
+    out = Path(config.ROOT) / "logs" / "diag.txt"
+    try:
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+    if args.print:
+        console.print(text, markup=False, highlight=False)
+    if args.no_push or not config.SHEETS_WEBHOOK_URL:
+        console.print(f"diag written to {out}" + ("" if config.SHEETS_WEBHOOK_URL else " (SHEETS_WEBHOOK_URL not set: not pushed)"))
+        return 0
+    try:
+        r = ops.push_diag(shopify.make_session(), config.SHEETS_WEBHOOK_URL, text)
+        console.print(f"diag pushed ({r.get('chars')} chars) -> Google Doc '{ops.DIAG_DOC}' {r.get('doc') or ''}")
+    except sheets.SheetsSyncError as e:
+        console.print(f"[red]diag not pushed:[/] {e} (the deployed Code.gs must know mode=diag: re-paste sheets/Code.gs, deploy a new version)")
+        return 3
+    return 0
+
+
 def cmd_ads_report(args) -> int:
     conn = db.connect(args.db)
     as_of = _parse_date(args.date) if args.date else (
@@ -2152,6 +2178,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")
     s.add_argument("--no-verify", action="store_true", help="skip the read-back comparison after syncing")
     s.set_defaults(fn=cmd_sync_sheets)
+
+    s = sub.add_parser("diag", help="write the diagnostics report to the Google Doc 'EarlyScale Diag' (and logs/diag.txt); read-only")
+    s.add_argument("--no-push", action="store_true", help="write logs/diag.txt only")
+    s.add_argument("--print", action="store_true")
+    s.add_argument("--note", action="append", help="a line to include at the top (e.g. what just ran)")
+    s.set_defaults(fn=cmd_diag)
 
     s = sub.add_parser("db-check", help="is data/tracker.db free to write? lists its files and the programs that could be holding it")
     s.add_argument("--db")

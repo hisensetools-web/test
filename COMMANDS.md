@@ -128,6 +128,7 @@ python tracker.py add-store pipitea.com                # use the apex domain eve
 python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
 python tracker.py landing https://x.com/pages/prostate     # which product does this lander sell? evidence per product; --apply re-resolves the ads landing there
 python tracker.py landing --refresh-all                # re-fetch every cached lander under the current rules and re-resolve every store's ads (then sync-sheets)
+python tracker.py diag                                 # write the diagnostics report to the Google Doc 'EarlyScale Diag' (+ logs\diag.txt); --print shows it
 python tracker.py db-check                             # 'database is locked'? shows whether tracker.db is free and what could be holding it
 python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad (dead / non-Shopify)
 python tracker.py prune-dead --apply                   # ...and remove them from the watchlist

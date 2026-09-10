@@ -7,6 +7,7 @@
 //   POST /exec           -> doPost(), 302 to /r/<id>
 //   GET /r/<id>          -> the stored doPost response
 //   GET /__dump          -> {sheetName: {frozenRows, rows:[[...]]}} for assertions
+//   GET /__doc?name=X     -> {count, text} of the fake Google Doc written by mode=diag
 //   GET /__login         -> an HTML page (simulates a deployment that is not "Anyone")
 "use strict";
 const fs = require("fs"), http = require("http"), path = require("path"), vm = require("vm");
@@ -80,8 +81,19 @@ const spreadsheet = {
   setActiveSheet: s => { active = s; return s; },
   moveActiveSheet: pos => { const i = order.indexOf(active); if (i < 0) throw new Error("no active sheet"); order.splice(i, 1); order.splice(pos - 1, 0, active); },
 };
+// ------------------------------------------------ fake Docs / Drive (the diag doc)
+const docs = {}; let docSeq = 0;
+class Doc {
+  constructor(name) { this.id = "doc" + (++docSeq); this.name = name; this.text = ""; docs[this.id] = this; }
+  getId() { return this.id; }
+  getUrl() { return "https://docs.google.com/document/d/" + this.id; }
+  getBody() { const d = this; return { clear() { d.text = ""; return this; }, setText(t) { d.text = String(t); return this; }, getText() { return d.text; } }; }
+  saveAndClose() {}
+}
 const sandbox = {
   SpreadsheetApp: { getActiveSpreadsheet: () => spreadsheet },
+  DriveApp: { getFilesByName: n => { const hits = Object.values(docs).filter(d => d.name === n); let i = 0; return { hasNext: () => i < hits.length, next: () => hits[i++] }; } },
+  DocumentApp: { create: n => new Doc(n), openById: id => { if (!docs[id]) throw new Error("no such doc " + id); return docs[id]; } },
   ContentService: {
     MimeType: { JSON: "application/json", TEXT: "text/plain" },
     createTextOutput: t => { const o = { content: t, mime: "text/plain" }; o.setMimeType = m => { o.mime = m; return o; }; o.getContent = () => o.content; return o; },
@@ -109,6 +121,10 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && url.pathname === "/__dump") {
     const out = { __order: order.map(s => s.name) }; for (const [n, s] of Object.entries(sheets)) out[n] = { frozenRows: s.frozenRows, autoResized: s.autoResized, hidden: [...s.hidden].sort((a, b) => a - b), rows: s.cells.slice(0, s.getLastRow()).map(r => r.map(v => v instanceof Date ? "DATE:" + v.toISOString().slice(0, 10) : v)) };
     res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify(out));
+  }
+  if (req.method === "GET" && url.pathname === "/__doc") {
+    const d = Object.values(docs).filter(x => x.name === url.searchParams.get("name"));
+    res.writeHead(200, { "Content-Type": "application/json" }); return res.end(JSON.stringify({ count: d.length, text: d.length ? d[d.length - 1].text : null }));
   }
   if (url.pathname === "/__login") { res.writeHead(200, { "Content-Type": "text/html" }); return res.end("<!DOCTYPE html><html><body>Sign in - Google Accounts</body></html>"); }
   if (req.method === "GET" && url.pathname.startsWith("/r/")) {

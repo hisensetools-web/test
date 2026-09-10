@@ -817,6 +817,21 @@ funnels, how many discarded, and a verdict. A phrase gets credit for every ad it
 another phrase returned the same ad first. `delete` = zero promotable stores across two or more sweeps; `add siblings` = the top
 producers. Edit `radar/hooks.txt` accordingly; the next sweep picks up the new list.
 
+## Diagnostics without pasting: the "EarlyScale Diag" doc
+
+`python tracker.py diag` collects a read-only report and writes it to a Google Doc named **EarlyScale Diag**
+in the Drive of the account that owns the sheet (through the same Apps Script web app, `mode=diag`; the doc
+is created on first use and replaced on every push). Both scheduled tasks push it when they finish, so the
+doc always shows the latest state, and anyone with access to the Drive can read it directly instead of
+asking for log pastes. Contents: code version (commit, branch, local changes), config flags, the two
+scheduled tasks' last run / result / next run, database counts (latest snapshot dates, badge coverage,
+ranks stored, landing-page resolver versions, applied migrations), the rank verdicts of the last 3 days
+with their notes, one line per store (platform, last catalogue status, latest ads snapshot with active /
+badge-known / low / resolved counts, last error), and for the last 4 log files every ERROR / WARNING /
+Traceback line plus the last 30 lines. Size-capped by `OPS_DIAG_CHARS` (250k). `--print` shows it,
+`--no-push` only writes `logs/diag.txt`. The first deployment of a Code.gs with `writeDiag_` asks for the
+Docs and Drive permissions once.
+
 ## Scheduling (Windows)
 
 Two tasks, so the morning numbers are ready quickly and the slow Meta pass runs overnight:
