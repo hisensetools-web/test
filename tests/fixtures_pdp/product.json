@@ -1,0 +1,5 @@
+{"product":{"id":1,"title":"Glow Neck Massager","handle":"glow-neck-massager","vendor":"Dropstore","product_type":"Massager","tags":["neck","relief"],
+"body_html":"<p>Relieve neck tension in <b>10 minutes</b> a day with heat and pulse therapy.</p>",
+"options":[{"name":"Color","values":["Black","White"]}],
+"variants":[{"id":11,"title":"Black","price":"49.00","compare_at_price":"89.00","available":true,"sku":"GNM-B"},{"id":12,"title":"White","price":"49.00","compare_at_price":"89.00","available":false,"sku":"GNM-W"}],
+"images":[{"src":"https://dropstore.example/cdn/shop/files/glow-main.jpg?v=1","alt":"Glow Neck Massager front"},{"src":"https://dropstore.example/cdn/shop/files/glow-side_1024x1024.jpg?v=1","alt":"side view"}]}}
