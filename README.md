@@ -621,6 +621,15 @@ concepts alive before (search presence) and after (delivering), and the active a
 
 ## Impression rank: where an ad sits when sorted "Impressions: high to low"
 
+**Status: off by default (`META_RANK=0`).** With the comparison done properly (each country view against
+its own newest-first list) the impressions-sorted URL came back in exactly the newest-first order for every
+store and every view tried (biorootlabs, holior: ALL, DE and NL, 20/20 ids in the same position). Meta's
+web app does not apply `sort_data[...]` from the URL; the sort is chosen in the page's dropdown, which
+issues its own request. Until the scrape drives that dropdown, the search costs 2-4 extra searches per store
+per night and returns nothing usable, so the pass is off and the rank columns stay blank. The Signals /
+Early ranking falls through to the delivering signal (badge), which does work. Everything below describes
+the pass as built, for when it is switched on again (`META_RANK=1`, or `rank-check` by hand).
+
 The second per-ad delivery signal. Every Meta pass runs the store's search a second time with the
 impressions sort (`sort_data[mode]=total_impressions`, `META_RANK_SCROLLS` (8) scrolls, top ranks only)
 and stores each ad's 1-based position as `meta_ads_daily.impression_rank` for the day.
