@@ -295,16 +295,24 @@ def cmd_db_check(args) -> int:
     if os.name == "nt":
         import subprocess
         try:
+            me = os.getpid()
             out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                  "Get-Process python, pythonw, OneDrive, 'DB Browser for SQLite', sqlitebrowser, Code -ErrorAction SilentlyContinue "
-                                  "| Select-Object Id, ProcessName, StartTime | Format-Table -AutoSize | Out-String"],
+                                  "Get-CimInstance Win32_Process -Filter \"name='python.exe' or name='pythonw.exe' or name='py.exe' or "
+                                  "name='OneDrive.exe' or name='DB Browser for SQLite.exe' or name='sqlitebrowser.exe' or name='wsl.exe'\" "
+                                  f"| Where-Object {{ $_.ProcessId -ne {me} }} "
+                                  "| Select-Object ProcessId, @{n='started';e={$_.CreationDate.ToString('HH:mm:ss')}}, CommandLine "
+                                  "| Format-Table -AutoSize -Wrap | Out-String -Width 200"],
                                  capture_output=True, text=True, timeout=20).stdout.strip()
-            console.print("processes that could hold it:" + ("\n" + out if out else " none of python / OneDrive / DB Browser / VS Code running"))
+            console.print("other processes that could hold it (python / OneDrive / SQLite viewers / WSL):"
+                          + ("\n" + out if out else " none running"))
+            if "OneDrive.exe" in out and "desktop" in str(path.resolve()).lower():
+                console.print("[yellow]OneDrive is running and the project sits on the Desktop, which OneDrive often syncs: it can hold tracker.db "
+                              "while uploading. Move the project out of synced folders (e.g. C:\\tracker) or exclude the folder in OneDrive.[/]")
+            if "wsl.exe" in out:
+                console.print("[yellow]WSL is running: a python started inside WSL (e.g. by a Claude Code session there) is invisible to "
+                              "Get-Process but still locks the file. `wsl --shutdown` releases it.[/]")
         except Exception as e:  # noqa: BLE001
             console.print(f"(could not list processes: {e})")
-        if "onedrive" in str(path.resolve()).lower() or (Path.home() / "OneDrive").exists():
-            console.print("[yellow]OneDrive is set up on this PC. If it syncs the Desktop it can hold tracker.db while uploading; "
-                          "move the project out of synced folders (e.g. C:\\tracker) or exclude it in OneDrive settings.[/]")
     if locked:
         console.print("close any program that has the database open (a SQLite viewer, a VS Code SQLite tab), stop leftover python "
                       "processes (Stop-Process -Id <id>), then run db-check again.")
