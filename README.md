@@ -928,6 +928,9 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
 - Pagination stops on an empty page, a short page, a repeated page (some themes ignore
   `page=`), or after 60 pages.
 - A configurable pause (`REQUEST_DELAY_S`, default 1s) sits between requests to the same store.
+- **The Sheets web app is unreachable** (DNS failure, no network): the GET is retried twice, then the sync
+  reports `sheets sync failed: cannot reach the Apps Script web app` and exits 3. The snapshot is already in
+  the database; the next sync pushes it. No traceback.
 - **`database is locked`** means another tracker command holds `data/tracker.db` for writing (a Meta pass
   still running, the scheduled task, or a python process that never exited). Opening the database now does
   no write at all when the schema is already at the code's version (stamped in `PRAGMA user_version`), so
@@ -942,6 +945,12 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
 ```bash
 python -m unittest discover -s tests -v
 ```
+
+`bash tests/replay.sh` (Linux / macOS / WSL, needs node) replays two scheduled days end to end against the
+fakes: the morning `run --no-ads`, the night `ads`, `radar` and `sync-sheets`, for 2026-09-03 and then
+2026-09-10 with mutated catalogues and ads a week older. It exercises every delta and week-over-week column,
+the badge read, the landing join, the alert rules and the real `Code.gs` (inside `tests/fake_gas.js`), and
+ends with the sheet-vs-database table. Every step must exit 0 and no log may contain a traceback.
 
 `tests/mock_store.py` is a fake Shopify storefront with real pagination semantics, so the
 whole pipeline can be exercised without network access:

@@ -426,6 +426,15 @@ class EchoHiccupTests(unittest.TestCase):
             out = sheets.sync(conn, "https://script.google.com/macros/s/x/exec", tabs=["products"], session=session, check_headers=False)
         self.assertEqual((state["posts"], out[0]["written"]), (1, 2))
 
+    def test_an_unreachable_web_app_is_a_sync_error_not_a_traceback(self):
+        session = mock.Mock()
+        session.get.side_effect = requests.ConnectionError("Failed to resolve 'script.google.com'")
+        with mock.patch("earlyscale.sheets.time.sleep"):
+            with self.assertRaises(sheets.SheetsSyncError) as cm:
+                sheets.get_json(session, "https://script.google.com/macros/s/x/exec", {"tabs": "1"})
+        self.assertIn("cannot reach", str(cm.exception))
+        self.assertEqual(session.get.call_count, 3)
+
     def test_post_re_posts_when_the_echo_host_keeps_redirecting(self):
         session = mock.Mock()
         echo = "https://script.googleusercontent.com/macros/echo?user_content_key=k"

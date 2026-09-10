@@ -449,6 +449,34 @@ class BrowserHandle:
         self.browser = None
 
 
+class LazyBrowser:
+    """A BrowserHandle that starts Playwright only when a browser is first needed. A command that ends up opening
+    no page (radar with nothing to triage) must not start and stop the driver for nothing: that leaves
+    'Task was destroyed but it is pending' noise from asyncio at exit."""
+
+    def __init__(self, headless: bool = True):
+        self.headless, self.pw, self.handle, self.relaunches = headless, None, None, 0
+
+    def get(self):
+        if self.handle is None:
+            from playwright.sync_api import sync_playwright
+            self.pw = sync_playwright().start()
+            self.handle = BrowserHandle(self.pw, self.headless)
+        b = self.handle.get()
+        self.relaunches = self.handle.relaunches
+        return b
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self.handle.close()
+        if self.pw is not None:
+            try:
+                self.pw.stop()
+            except Exception:  # noqa: BLE001
+                pass
+        self.pw = self.handle = None
+
+
 def browser_closed_error(e: BaseException) -> bool:
     m = str(e).lower()
     return "has been closed" in m or "target closed" in m or "browser closed" in m or "connection closed" in m
@@ -665,6 +693,12 @@ def record_scrape(conn: sqlite3.Connection, store_id: int, snapshot_date: str, a
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     ids_today = {a["ad_id"] for a in ads}
     new = 0
+    if not query.startswith("rank:"):
+        shared = sum(1 for a in ads if conn.execute("SELECT 1 FROM meta_ads_daily WHERE snapshot_date = ? AND ad_id = ? AND store_id != ?",
+                                                    (snapshot_date, a["ad_id"], store_id)).fetchone())
+        if shared:
+            log.warning("%s: %d of %d ads were already recorded today under another watchlist store (the same page advertises for "
+                        "both?); a day's row holds one store, so the other store's counts drop by that many", query, shared, len(ads))
     with conn:
         for pos, a in enumerate(ads):
             existing = conn.execute("SELECT ad_id FROM meta_ads WHERE ad_id = ?", (a["ad_id"],)).fetchone()

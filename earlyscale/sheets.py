@@ -418,7 +418,22 @@ def post_payload(session: requests.Session, url: str, payload: dict, retries: in
 
 
 def get_json(session: requests.Session, url: str, params: dict, _retry: int = 0) -> dict:
-    """GET the web app (follows the same 302 hop as POST) and parse its JSON."""
+    """GET the web app (follows the same 302 hop as POST) and parse its JSON. A network failure (DNS down, no
+    connection) is retried twice and then reported as a SheetsSyncError, never as a raw traceback."""
+    last: Exception | None = None
+    for attempt in range(3):
+        try:
+            return _get_json_once(session, url, params, _retry)
+        except (requests.ConnectionError, requests.Timeout) as e:
+            last = e
+            if attempt < 2:
+                wait = 3 * (2 ** attempt)
+                log.warning("sheets: cannot reach the web app (%s); retry %d/2 in %ds", type(e).__name__, attempt + 1, wait)
+                time.sleep(wait)
+    raise SheetsSyncError(f"cannot reach the Apps Script web app (network down or DNS failure?): {str(last)[:200]}")
+
+
+def _get_json_once(session: requests.Session, url: str, params: dict, _retry: int = 0) -> dict:
     r = session.get(url, params=params, timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
     hops = 0
     chain = []
@@ -432,7 +447,7 @@ def get_json(session: requests.Session, url: str, params: dict, _retry: int = 0)
         hops += 1
     if _echo_hiccup(r, hops) and _retry < 3:
         time.sleep(5 * (_retry + 1))
-        return get_json(session, url, params, _retry=_retry + 1)
+        return _get_json_once(session, url, params, _retry=_retry + 1)
     text = r.text.strip()
     if r.status_code in (301, 302, 303, 307, 308):
         raise SheetsSyncError(f"Apps Script kept redirecting ({hops} hops via {', '.join(dict.fromkeys(chain))}); usually a temporary "

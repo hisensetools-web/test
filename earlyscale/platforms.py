@@ -175,6 +175,8 @@ def detect(session: requests.Session, domain: str, quiet: bool = False) -> dict:
     try:
         resolved = shopify.resolve_base_url(session, domain, quiet=quiet)
         r = _get(session, f"{resolved}/products.json?limit=1", accept=config.JSON_ACCEPT)
+        if r.status_code == 406:   # a WAF that rejects an explicit JSON Accept (olavita.co): same retry as shopify.fetch
+            r = _get(session, f"{resolved}/products.json?limit=1", accept=config.FALLBACK_ACCEPT)
         if r.status_code == 200 and r.text.lstrip().startswith("{") and "products" in r.text[:200]:
             return {"platform": "shopify", "base": resolved, "myshopify": None, "evidence": "products.json"}
         base = resolved

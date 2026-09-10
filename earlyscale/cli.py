@@ -1207,14 +1207,13 @@ def _radar_summary(conn, out: dict) -> None:
 
 
 def cmd_radar(args) -> int:
-    from playwright.sync_api import sync_playwright
     conn = db.connect(args.db)
     today = _parse_date(args.date)
     do_sweep = True if args.sweep else (False if args.no_sweep else None)
     console.print(f"radar: {'sweep + ' if do_sweep or (do_sweep is None and date.fromisoformat(today).weekday() == config.RADAR_SWEEP_WEEKDAY) else ''}triage, "
                   f"hooks={len(radar.load_hooks())}, country={config.RADAR_COUNTRY}, up to {config.RADAR_MAX_ADS_PER_QUERY} ads/query")
-    with sync_playwright() as pw, meta_ads.KeepAwake():
-        handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
+    with meta_ads.KeepAwake():
+        handle = meta_ads.LazyBrowser(headless=not args.headed)   # Playwright starts only if a search is actually needed
         try:
             out = radar.run_radar(conn, handle, today, do_sweep=do_sweep, watchlist_path=Path(args.watchlist) if args.watchlist else None,
                                   max_minutes=args.max_minutes)

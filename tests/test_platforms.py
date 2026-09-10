@@ -233,3 +233,38 @@ class RadarPlatformTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WafStoreTests(unittest.TestCase):
+    """A storefront WAF that answers 406 to an explicit JSON Accept (olavita.co) is still a Shopify store: the probe
+    must retry with the browser Accept like shopify.fetch does, not fall through to the headless / sitemap adapters."""
+
+    def test_406_to_json_accept_is_retried_and_detected_as_shopify(self):
+        from http.server import BaseHTTPRequestHandler
+        from earlyscale import config, platforms, shopify
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                accept = self.headers.get("Accept", "")
+                if self.path.startswith("/products.json"):
+                    if accept.startswith(config.JSON_ACCEPT):
+                        body, status, ctype = b"Not Acceptable", 406, "text/plain"
+                    else:
+                        body, status, ctype = b'{"products": [{"id": 1, "handle": "x", "title": "X", "variants": []}]}', 200, "application/json"
+                else:
+                    body, status, ctype = b'<html><script>Shopify.shop = "waf-1.myshopify.com"</script></html>', 200, "text/html"
+                self.send_response(status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            info = platforms.detect(shopify.make_session(), f"http://127.0.0.1:{srv.server_port}", quiet=True)
+        finally:
+            srv.shutdown()
+        self.assertEqual((info["platform"], info["evidence"]), ("shopify", "products.json"))

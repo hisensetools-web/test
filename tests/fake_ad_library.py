@@ -28,7 +28,7 @@ let batch = 0, done = false, loading = false;
 async function load() {
   if (done || loading) return; loading = true;
   const r = await fetch('/api/graphql/', {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                                          body: 'doc_id=123&variables=' + encodeURIComponent(JSON.stringify({cursor: batch, sort: (location.search.match(/sort_data\\[mode\\]=([a-z_]+)/) || [null, null])[1]}))});
+                                          body: 'doc_id=123&variables=' + encodeURIComponent(JSON.stringify({cursor: batch, q: new URLSearchParams(location.search).get('q') || new URLSearchParams(location.search).get('view_all_page_id') || '', sort: (location.search.match(/sort_data\\[mode\\]=([a-z_]+)/) || [null, null])[1]}))});
   const text = await r.text();
   const first = JSON.parse(text.split('\\n')[0]);
   const ads = [];
@@ -46,9 +46,15 @@ load();
 BLOCKED = "<html><head><title>Log in to Facebook</title></head><body><h1>You must log in to continue.</h1></body></html>"
 
 
+def _query_offset(q: str) -> int:
+    """Every search term gets its own block of ad ids and its own page id, as different advertisers would."""
+    import zlib
+    return (zlib.crc32(q.encode()) % 900 + 1) * 10_000_000 if q else 0
+
+
 def make_handler(batches: int, block: bool, landing: str | None = None, handles: list[str] | None = None, port: int = 8095,
                  day: int = 1, likes: int = 12000, stop_ads: tuple[str, ...] = (), base_date: str | None = None,
-                 same_order: bool = False):
+                 same_order: bool = False, landing_map: dict[str, str] | None = None):
     """day / likes / stop_ads drive the single-ad page: end_date = base_date + (day - 1) except for ads in
     stop_ads (which freeze at day 1); page_like_count grows with day. base_date defaults to today (UTC)."""
     base = json.loads(FIX.read_text())
@@ -100,6 +106,7 @@ def make_handler(batches: int, block: bool, landing: str | None = None, handles:
                     if off >= 0 and off % 100 == 0:
                         node = copy.deepcopy(r)
                         node["ad_archive_id"] = ad_id
+                        node["page_id"] = str(int(r["page_id"]) + (off // 10_000_000))
                         break
                 if node is None:
                     return self._send(200, b"<html><head><title>Ad Library</title></head><body>No ads</body></html>", "text/html")
@@ -141,23 +148,30 @@ def make_handler(batches: int, block: bool, landing: str | None = None, handles:
                 return self._send(404, b"nope", "text/plain")
             cursor = 0
             sort = None
+            q = ""
             try:
                 v = json.loads(parse_qs(body).get("variables", ["{}"])[0])
-                cursor, sort = v.get("cursor", 0), v.get("sort")
+                cursor, sort, q = v.get("cursor", 0), v.get("sort"), v.get("q") or ""
             except ValueError:
                 pass
             doc = copy.deepcopy(base)
             results = doc["data"]["ad_library_main"]["search_results_connection"]["edges"][0]["node"]["collated_results"]
+            qoff = _query_offset(q)
             for i, r in enumerate(results):
-                r["ad_archive_id"] = str(int(r["ad_archive_id"]) + 100 * cursor)
+                r["ad_archive_id"] = str(int(r["ad_archive_id"]) + 100 * cursor + qoff)
+                if qoff:
+                    r["page_id"] = str(int(r["page_id"]) + qoff // 10_000_000)
+                    r["page_name"] = q
                 # the 'Low impression count' badge: Meta's exact key is confirmed with `ads-fields`; the fake uses a
                 # plausible boolean so the whole chain (payload -> daily row -> delivering metrics) is exercised
-                r["is_low_impressions"] = (i % 3 == 2)
+                r["is_low_impressions"] = (i % 3 == 1)   # an ACTIVE ad with the badge (index 2 is the fixture's inactive ad)
             if sort == "total_impressions" and not same_order:
                 results.reverse()          # "Impressions: high to low": a different order from newest-first
             doc["data"]["ad_library_main"]["search_results_connection"]["page_info"]["has_next_page"] = cursor + 1 < batches
             # Facebook-style multi-document body: main payload, then a deferred payload line.
             text = json.dumps(doc) + "\n" + json.dumps({"label": "deferred", "data": {}}) + "\n"
+            if landing and landing_map and q in landing_map:
+                text = text.replace(landing, landing_map[q])      # this advertiser's ads land on its own store
             self._send(200, text.encode(), "application/json; charset=utf-8")
 
     return H
@@ -174,10 +188,13 @@ def main(argv=None):
     ap.add_argument("--likes", type=int, default=12000)
     ap.add_argument("--stop-ads", nargs="*", default=(), help="ad ids whose end_date stops advancing (switched off)")
     ap.add_argument("--base-date", help="ISO date that day 1's end_date maps to (default: today)")
+    ap.add_argument("--landing-map", nargs="*", default=(), metavar="NAME=ORIGIN",
+                    help="per search term, the store origin its ads land on (e.g. MockOne=http://127.0.0.1:8001)")
     ap.add_argument("--same-order", action="store_true", help="the impressions sort returns the newest-first order (not informative)")
     a = ap.parse_args(argv)
     srv = HTTPServer(("127.0.0.1", a.port), make_handler(a.batches, a.block, a.landing, a.handles, a.port, a.day, a.likes,
-                                                         tuple(a.stop_ads), a.base_date, a.same_order))
+                                                         tuple(a.stop_ads), a.base_date, a.same_order,
+                                                                     landing_map=dict(x.split('=', 1) for x in a.landing_map)))
     print(f"fake Ad Library on http://127.0.0.1:{a.port}/ads/library/ batches={a.batches} block={a.block}")
     srv.serve_forever()
 
