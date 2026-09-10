@@ -202,6 +202,12 @@ Every sync ends by reading row counts back from the sheet and comparing them wit
 per tab and, for Products, per store. A mismatch is printed and the command exits 3. To check
 without sending anything:
 
+A retried chunk is never sent twice by accident: when Google loses the reply to a POST (its response
+host answers a 404 page, a redirect loop, or the plain `ok` health check), the sync first asks the sheet
+how many rows the tab holds; if the chunk is already there it moves on instead of re-sending it. Before
+this, every lost reply on a replace-mode tab added its rows a second time (967 duplicate Candidates rows
+from 8 retries in one sync).
+
 ```bash
 python tracker.py sync-sheets --verify-only
 ```
@@ -632,7 +638,9 @@ per day. `rank_checks.note` records what every view returned (e.g. `ALL: 150 ads
 DE: 0 ads; NL: 41 ads, 2/20 ... -> informative`) and the ads log prints the same line per store.
 Identical orders everywhere mean the sort carries no information for that store: `stores.sort_informative`
 = false (shown on the Stores tab), the store is re-checked weekly instead of daily, and its rank columns
-stay blank. Stores judged before the per-view comparison existed are re-judged on the next pass. `python tracker.py rank-check --only a.com b.com c.com d.com e.com` does the comparison for a few
+stay blank (a non-informative order is not stored as ranks at all: it is just newest-first, and would put the
+newest ads in the "top 5"). A store whose `meta_page_name` is shorter than 3 characters is searched by
+domain instead, with a warning: a one-letter "name" matches thousands of unrelated pages. Stores judged before the per-view comparison existed are re-judged on the next pass. `python tracker.py rank-check --only a.com b.com c.com d.com e.com` does the comparison for a few
 stores on demand and prints the verdict per store.
 
 Derived per ad: `rank_7d_ago`, `rank_delta_7d` (negative = climbing), `top5_days` (days the ad held a

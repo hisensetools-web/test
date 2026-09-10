@@ -514,7 +514,7 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                 domain = s["store_domain"]
                 store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
                 conn.commit()
-                query = s.get("meta_page_name") or domain.split("//")[-1]
+                query = meta_ads.store_query(s)
                 url = meta_ads.build_search_url(query=None if s.get("meta_page_id") else query,
                                                 page_id=s.get("meta_page_id") or None)
                 t0 = time.monotonic()
@@ -1340,7 +1340,7 @@ def cmd_rank_check(args) -> int:
             for s in stores:
                 sid = db.upsert_store(conn, s["store_domain"], s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
                 conn.commit()
-                query = s.get("meta_page_name") or s["store_domain"].split("//")[-1]
+                query = meta_ads.store_query(s)
                 url = meta_ads.build_search_url(query=None if s.get("meta_page_id") else query, page_id=s.get("meta_page_id") or None)
                 try:
                     base = meta_ads.scrape_page(url, max_scrolls=args.scrolls, browser=handle.get())
@@ -1456,7 +1456,7 @@ def cmd_delivering_report(args) -> int:
             for c in ("rank", "ad_id", "started", "days running", "rank 7d ago", "delta 7d", "top5 days", "badge"):
                 t3.add_column(c, justify="right" if c not in ("ad_id", "started", "badge") else "left")
             for a in pm["top5_ads"]:
-                t3.add_row(str(a["rank"]), a["ad_id"], "", "" if a["days_running"] is None else str(a["days_running"]),
+                t3.add_row(str(a["rank"]), a["ad_id"], a.get("started") or "", "" if a["days_running"] is None else str(a["days_running"]),
                            "" if a["rank_7d_ago"] is None else str(a["rank_7d_ago"]), "" if a["rank_delta_7d"] is None else str(a["rank_delta_7d"]),
                            str(a["top5_days"]), {1: "LOW", 0: "no"}.get(a["low_impressions"], "?"))
             console.print(t3)

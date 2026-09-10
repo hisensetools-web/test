@@ -37,7 +37,7 @@ def _utcnow() -> str:
 def rank_url(store: dict, country: str = "ALL") -> tuple[str, str]:
     """(url, query) for the store's Ad Library search sorted by impressions, for one country view."""
     domain = store["store_domain"]
-    query = store.get("meta_page_name") or domain.split("//")[-1]
+    query = meta_ads.store_query(store)
     url = meta_ads.build_search_url(query=None if store.get("meta_page_id") else query, page_id=store.get("meta_page_id") or None,
                                     sort="impressions", country=country)
     return url, query
@@ -67,8 +67,9 @@ def record_ranks(conn: sqlite3.Connection, store_id: int, today: str, sorted_ads
                                                                                     "same_position": 0, "informative": None}
     with conn:
         conn.execute("UPDATE meta_ads_daily SET impression_rank = NULL WHERE store_id = ? AND snapshot_date = ?", (store_id, today))
-        for i, aid in enumerate(ids, start=1):
-            conn.execute("UPDATE meta_ads_daily SET impression_rank = ? WHERE ad_id = ? AND snapshot_date = ?", (i, aid, today))
+        if cmp["informative"] is not False:   # a non-informative order is just newest-first: storing it would rank the newest ads on top
+            for i, aid in enumerate(ids, start=1):
+                conn.execute("UPDATE meta_ads_daily SET impression_rank = ? WHERE ad_id = ? AND snapshot_date = ?", (i, aid, today))
         conn.execute("""INSERT OR REPLACE INTO rank_checks (snapshot_date, store_id, query, n_default, n_sorted, n_compared, overlap,
                         same_position, identical, informative, checked_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
                      (today, store_id, query, len(default_ids or []), len(ids), cmp["n"], cmp["overlap"], cmp["same_position"],
@@ -81,8 +82,9 @@ def record_ranks(conn: sqlite3.Connection, store_id: int, today: str, sorted_ads
 
 def _confirmed_country(conn: sqlite3.Connection, store_id: int, today: str, within_days: int = 7) -> str | None:
     """The country view whose sort was found informative for this store within the last `within_days` days."""
+    # note IS NOT NULL: only verdicts from the per-view comparison count (earlier ones judged an EU view against the worldwide list)
     r = conn.execute("SELECT country, snapshot_date FROM rank_checks WHERE store_id = ? AND informative = 1 AND country IS NOT NULL "
-                     "ORDER BY snapshot_date DESC LIMIT 1", (store_id,)).fetchone()
+                     "AND note IS NOT NULL ORDER BY snapshot_date DESC LIMIT 1", (store_id,)).fetchone()
     if not r:
         return None
     try:
@@ -93,7 +95,7 @@ def _confirmed_country(conn: sqlite3.Connection, store_id: int, today: str, with
 
 def _newest_ids(store: dict, country: str, browser, max_scrolls: int | None) -> list[str]:
     """Newest-first order of the same country view: the only valid baseline for that view's impressions sort."""
-    query = store.get("meta_page_name") or store["store_domain"].split("//")[-1]
+    query = meta_ads.store_query(store)
     url = meta_ads.build_search_url(query=None if store.get("meta_page_id") else query, page_id=store.get("meta_page_id") or None,
                                     country=country)
     res = meta_ads.scrape_page(url, max_scrolls=max_scrolls or config.META_RANK_SCROLLS, browser=browser)
@@ -115,7 +117,7 @@ def scrape_ranks(conn: sqlite3.Connection, browser, store: dict, store_id: int, 
     if confirmed in countries:
         countries.remove(confirmed)
         countries.insert(0, confirmed)
-    query = store.get("meta_page_name") or store["store_domain"].split("//")[-1]
+    query = meta_ads.store_query(store)
     notes: list[str] = []
     last: dict | None = None
     first = True
@@ -203,6 +205,7 @@ def ad_rank_metrics(conn: sqlite3.Connection, store_id: int, today: str) -> dict
         except ValueError:
             days = None
         ads[r["ad_id"]] = {"rank": rk, "rank_7d_ago": p7, "rank_delta_7d": (rk - p7) if p7 is not None else None,
+                           "started": launch[:10] if launch else None,
                            "top5_days": top5_days.get(r["ad_id"], 0), "product_handle": r["product_handle"],
                            "days_running": days, "page_name": r["page_name"], "low_impressions": r["low_impressions"],
                            "entered_top5": rk <= TOP_N and (p7 is None or p7 > TOP_N)}

@@ -7,6 +7,7 @@ from unittest import mock
 import requests
 
 from earlyscale import config, db, sheets, shopify
+from tests.test_ad_metrics import _prod
 
 config.WATCHLIST_PATH = Path(__file__).parent / "fixtures" / "empty_watchlist.csv"
 
@@ -388,6 +389,42 @@ class EchoHiccupTests(unittest.TestCase):
                 data = sheets.post_payload(session, "https://script.google.com/macros/s/x/exec", {"tab": "Signals", "rows": []})
         self.assertEqual((data["written"], session.post.call_count), (3, 2))
         self.assertIn("health-check", logs.output[0])
+
+    def test_a_lost_reply_does_not_resend_a_chunk_the_script_already_wrote(self):
+        """The 967 duplicate Candidates rows: every retried chunk had in fact been written; only the reply was lost."""
+        session = mock.Mock()
+        echo = "https://script.googleusercontent.com/macros/echo?user_content_key=k"
+        session.post.return_value = _resp(302, "", location=echo)
+        session.get.return_value = _resp(404, self.PAGE, url=echo, ctype="text/html")
+        with mock.patch("earlyscale.sheets.time.sleep"):
+            data = sheets.post_payload(session, "https://script.google.com/macros/s/x/exec",
+                                       {"tab": "Candidates", "mode": "replace", "chunk": 2, "rows": [[1], [2], [3]]},
+                                       already_applied=lambda: True)
+        self.assertEqual((data["written"], data.get("recovered"), session.post.call_count), (3, True, 1))
+
+    def test_sync_checks_the_tab_count_before_resending_a_replace_chunk(self):
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "a.com")
+        db.write_product_snapshot(conn, sid, "2026-09-10", [_prod(1, "p1", "P1"), _prod(2, "p2", "P2")])
+        conn.commit()
+        echo = "https://script.googleusercontent.com/macros/echo?user_content_key=k"
+        state = {"posts": 0, "count": 0}
+        session = mock.Mock()
+
+        def post(url, data=None, **kw):
+            body = json.loads(data)
+            state["posts"] += 1
+            state["count"] = len(body["rows"])          # the script writes the rows ...
+            return _resp(302, "", location=echo)         # ... but the reply is a redirect that will fail
+
+        def get(url, params=None, **kw):
+            if params and params.get("tabs"):
+                return _resp(200, json.dumps({"ok": True, "tabs": {"Products": state["count"]}, "headers": {}}))
+            return _resp(404, EchoHiccupTests.PAGE, url=echo, ctype="text/html")
+        session.post.side_effect, session.get.side_effect = post, get
+        with mock.patch("earlyscale.sheets.time.sleep"):
+            out = sheets.sync(conn, "https://script.google.com/macros/s/x/exec", tabs=["products"], session=session, check_headers=False)
+        self.assertEqual((state["posts"], out[0]["written"]), (1, 2))
 
     def test_post_re_posts_when_the_echo_host_keeps_redirecting(self):
         session = mock.Mock()

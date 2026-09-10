@@ -346,10 +346,33 @@ def _echo_hiccup(r, hops: int) -> bool:
     return r.status_code == 404 or ("ppConfig" in head and not head.lstrip().startswith("{"))
 
 
-def post_payload(session: requests.Session, url: str, payload: dict, retries: int = 5) -> dict:
+def tab_count(session: requests.Session, url: str, tab: str) -> int | None:
+    """Data rows the sheet holds for one tab right now (None when the web app cannot be asked)."""
+    try:
+        counts = get_json(session, url, {"tabs": "1"}).get("tabs") or {}
+    except (SheetsSyncError, ValueError, requests.RequestException):
+        return None
+    n = counts.get(tab)
+    return int(n) if isinstance(n, (int, float)) else None
+
+
+def post_payload(session: requests.Session, url: str, payload: dict, retries: int = 5, already_applied=None) -> dict:
+    """POST one chunk and return the script's JSON reply. `already_applied()` is asked before a retry: Apps Script
+    may have written the rows although its reply was lost (Google's response host hiccups), and re-sending a
+    replace-mode chunk would duplicate them."""
     body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     last_err: Exception | None = None
     for attempt in range(retries + 1):
+        if attempt and already_applied is not None:
+            try:
+                applied = already_applied()
+            except Exception:  # noqa: BLE001
+                applied = False
+            if applied:
+                n = len(payload.get("rows") or [])
+                log.info("sheets: %s chunk %s was written although the reply was lost; not re-sending it",
+                         payload.get("tab"), payload.get("chunk"))
+                return {"ok": True, "written": n, "skipped": 0, "recovered": True}
         try:
             r = session.post(url, data=body, headers={"Content-Type": "application/json"},
                              timeout=config.SHEETS_TIMEOUT, allow_redirects=False)
@@ -528,13 +551,19 @@ def sync(conn: sqlite3.Connection, url: str, tabs=TAB_ORDER, as_of: str | None =
     for item in build_plan(conn, tabs, as_of):
         n = len(item["chunks"])
         written = skipped = 0
+        sent = 0   # rows the tab holds once every chunk so far has been applied (replace mode)
         for i, chunk in enumerate(item["chunks"], start=1):
             payload = {"tab": item["tab"], "mode": item["mode"], "chunk": i, "chunks": n, "rows": chunk}
             size = _size(payload)
             if dry_run:
                 log.info("sheets: [dry-run] %s chunk %d/%d: %d rows, %d bytes", item["tab"], i, n, len(chunk), size)
                 continue
-            resp = post_payload(session, url, payload)
+            applied = None
+            if item["mode"] == "replace":
+                expected_after = sent + len(chunk)
+                applied = (lambda tab=item["tab"], want=expected_after: tab_count(session, url, tab) == want)
+            resp = post_payload(session, url, payload, already_applied=applied)
+            sent += len(chunk)
             written += int(resp.get("written", 0))
             skipped += int(resp.get("skipped", 0))
             log.info("sheets: %s chunk %d/%d: %d rows -> written %s skipped %s (%d bytes)", item["tab"], i, n,

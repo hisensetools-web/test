@@ -67,6 +67,14 @@ class RankTests(unittest.TestCase):
         cmp = seed_day(conn, sid, TODAY, ids, {i: "p" for i in ids}, default_order=ids)
         self.assertEqual((cmp["identical"], cmp["informative"]), (True, False))
         self.assertEqual(conn.execute("SELECT sort_informative FROM stores WHERE id = ?", (sid,)).fetchone()[0], 0)
+        # a newest-first order must not be stored as ranks: the newest ads would sit in the "top 5" on Signals
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM meta_ads_daily WHERE impression_rank IS NOT NULL").fetchone()[0], 0)
+        self.assertEqual(ad_rank.ad_rank_metrics(conn, sid, TODAY)["products"], {})
+
+    def test_short_page_name_searches_the_domain(self):
+        self.assertEqual(meta_ads.store_query({"store_domain": "gutbiowellness.com", "meta_page_name": "p"}), "gutbiowellness.com")
+        self.assertEqual(meta_ads.store_query({"store_domain": "x.com", "meta_page_name": "Ruffs"}), "Ruffs")
+        self.assertIn("q=gutbiowellness.com", ad_rank.rank_url({"store_domain": "gutbiowellness.com", "meta_page_name": "p"})[0])
 
     def test_metrics_per_ad_and_product(self):
         m = ad_rank.ad_rank_metrics(self.conn, self.sid, TODAY)
@@ -179,6 +187,18 @@ class ScrapeRanksTests(unittest.TestCase):
         self.assertEqual((out["ranked"], out["informative"], out["country"]), (0, None, None))
         self.assertIsNone(self.conn.execute("SELECT sort_informative FROM stores WHERE id = ?", (self.sid,)).fetchone()[0])
         self.assertEqual(self.conn.execute("SELECT note FROM rank_checks WHERE store_id = ?", (self.sid,)).fetchone()[0], "ALL: 0 ads; DE: 0 ads; NL: 0 ads")
+
+    def test_a_verdict_without_a_note_is_not_trusted_as_confirmed(self):
+        # the overnight run judged DE against the worldwide list (no note column yet): compare again, baseline and all
+        self.conn.execute("INSERT INTO rank_checks (snapshot_date, store_id, informative, country) VALUES (?,?,1,'DE')", (WEEK_AGO, self.sid))
+        self.conn.commit()
+        self.assertIsNone(ad_rank._confirmed_country(self.conn, self.sid, TODAY))
+        de = [f"d{i}" for i in range(22)]
+        script = {("ALL", "sorted"): _res(self.world), ("DE", "sorted"): _res(de), ("DE", "newest"): _res(de), ("NL", "sorted"): _res([])}
+        with mock.patch.object(meta_ads, "scrape_page", self._fake(script)), mock.patch.object(meta_ads, "_wait"):
+            out = ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, TODAY, self.world, countries=["ALL", "DE", "NL"])
+        self.assertEqual((out["informative"], len(self.calls)), (False, 4))
+        self.assertEqual(self.conn.execute("SELECT sort_informative FROM stores WHERE id = ?", (self.sid,)).fetchone()[0], 0)
 
     def test_confirmed_country_goes_first_without_a_baseline_scrape(self):
         nl = [f"n{i}" for i in range(22)]
