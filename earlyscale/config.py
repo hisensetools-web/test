@@ -52,6 +52,7 @@ BROWSER_HEADERS = {
 
 # Google Sheets sync (Apps Script web app, see sheets/Code.gs). Empty = disabled.
 SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "").strip()
+SHEETS_ADS_PER_STORE = int(os.environ.get("SHEETS_ADS_PER_STORE", "100"))   # Ads tab rows per store (delivering first, newest first)
 SHEETS_CHUNK_BYTES = int(os.environ.get("SHEETS_CHUNK_BYTES", "40000"))
 SHEETS_TIMEOUT = (10, 90)  # Apps Script can take a while on big appends
 

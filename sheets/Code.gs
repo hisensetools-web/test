@@ -46,10 +46,14 @@ var TABS = {
     headers: ["store", "page name", "page_id", "first_seen", "active_ads", "last_delivered", "page_likes", "page_likes_7d_slope", "ads_as_of"],
     keyCols: null, textCols: [0, 1, 2, 3, 5, 8], position: 6
   },
+  Ads: {
+    headers: ["store", "page name", "ad_id", "started", "days_running", "delivering", "low_impressions", "impression_rank", "landing_path", "resolved_product", "primary_text"],
+    keyCols: null, textCols: [0, 1, 2, 3, 5, 6, 8, 9, 10], position: 7   // ad_id as text: 16-digit ids must not become 1.4E+15
+  },
   Candidates: {
     headers: ["domain", "type", "status", "first_seen", "store_age_days", "store_created_est", "store_first_created", "products", "active_ads", "ads_in_sweeps", "searched_at", "pages", "top page", "example ad text", "hot new product", "source", "lander_domain", "last_checked", "promote"],
     keyCols: null,                 // rewritten each sync AFTER the tracker has read the promote column back
-    textCols: [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 17, 18], position: 7
+    textCols: [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 17, 18], position: 8
   },
   Products: {
     headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price", "available variants", "total variants", "collection position"],

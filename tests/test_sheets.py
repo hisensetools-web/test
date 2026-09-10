@@ -80,6 +80,37 @@ class RowBuildingTests(unittest.TestCase):
         self.assertEqual(sheets.alerts_rows(db.connect(":memory:")), [])
 
 
+class AdsTabTests(unittest.TestCase):
+    def test_ads_rows_show_attribution_per_ad(self):
+        from tests.test_ad_metrics import _ad, _prod
+        from earlyscale import meta_ads
+        conn = db.connect(":memory:")
+        sid = db.upsert_store(conn, "elivorahealth.com", "Elivora")
+        db.write_product_snapshot(conn, sid, "2026-09-10", [_prod(1, "elivora-prostate-urinary-support-softgels", "Prostate")])
+        ads = [_ad("1001", "Elivora", "2026-08-20", "https://elivorahealth.com/pages/prostate", "Tired of night-time trips? " * 10),
+               _ad("1002", "Elivora", "2026-09-05", "https://elivorahealth.com/products/elivora-prostate-urinary-support-softgels?variant=1", "direct"),
+               _ad("1003", "Elivora", "2026-09-08", "https://elivorahealth.com/pages/prostate", "badge", active=1)]
+        meta_ads.record_scrape(conn, sid, "2026-09-10", ads, "Elivora")
+        conn.execute("UPDATE meta_ads SET product_handle = 'elivora-prostate-urinary-support-softgels', page_handle = 'prostate' WHERE ad_id IN ('1001', '1003')")
+        conn.execute("UPDATE meta_ads SET product_handle = 'elivora-prostate-urinary-support-softgels' WHERE ad_id = '1002'")
+        conn.execute("UPDATE meta_ads_daily SET low_impressions = 1 WHERE ad_id = '1003'")
+        conn.execute("UPDATE meta_ads_daily SET low_impressions = 0 WHERE ad_id IN ('1001', '1002')")
+        conn.commit()
+        rows = sheets.ads_rows(conn, "2026-09-10")
+        H = sheets.ADS_HEADERS
+        self.assertEqual([r[H.index("ad_id")] for r in rows], ["1002", "1001", "1003"])   # delivering first (newest first), badge last
+        r = {h: v for h, v in zip(H, rows[1])}
+        self.assertEqual((r["store"], r["page name"], r["landing_path"], r["resolved_product"], r["delivering"], r["low_impressions"]),
+                         ("elivorahealth.com", "Elivora", "/pages/prostate", "elivora-prostate-urinary-support-softgels", "yes", "no"))
+        self.assertEqual(r["days_running"], 21)
+        self.assertEqual(len(r["primary_text"]), 120)
+        self.assertEqual(rows[0][H.index("landing_path")], "/products/elivora-prostate-urinary-support-softgels?variant=1")
+        self.assertEqual(rows[2][H.index("low_impressions")], "LOW")
+        with mock.patch.object(config, "SHEETS_ADS_PER_STORE", 2):
+            self.assertEqual(len(sheets.ads_rows(conn, "2026-09-10")), 2)
+        self.assertEqual(sheets.expected_headers()["Ads"], H)
+
+
 class ChunkTests(unittest.TestCase):
     def test_chunks_respect_byte_limit_and_keep_order(self):
         rows = [[f"2026-09-06", f"store{i % 7}.com", f"handle-{i}", "T" * 50, "x", "y", 9.99, 1, 2, i] for i in range(2000)]
@@ -173,7 +204,7 @@ def _tabs_session(headers=None, tabs=None):
 
 
 class SyncTests(unittest.TestCase):
-    TABS = ["Signals", "Early", "Families", "Categories", "Stores", "Pages", "Candidates", "Products", "Alerts"]
+    TABS = ["Signals", "Early", "Families", "Categories", "Stores", "Pages", "Ads", "Candidates", "Products", "Alerts"]
 
     def test_sync_posts_every_tab_with_replace_then_append(self):
         conn = two_day_db()
@@ -181,8 +212,8 @@ class SyncTests(unittest.TestCase):
         out = sheets.sync(conn, "https://x/exec", session=session)
         payloads = [json.loads(c.kwargs["data"]) for c in session.post.call_args_list]
         self.assertEqual([p["tab"] for p in payloads], self.TABS)
-        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 8 + ["append"])
-        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 9)
+        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 9 + ["append"])
+        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 10)
         self.assertEqual([x["tab"] for x in out], self.TABS)
 
     def test_stale_code_gs_refuses_to_write(self):
@@ -202,7 +233,7 @@ class SyncTests(unittest.TestCase):
         with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
             sheets.sync(conn, "https://x/exec", session=session)
         self.assertTrue(any("does not report its headers" in x for x in logs.output))
-        self.assertEqual(session.post.call_count, 9)
+        self.assertEqual(session.post.call_count, 10)
 
     def test_dry_run_sends_nothing_and_missing_url_is_clear(self):
         conn = two_day_db()

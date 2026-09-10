@@ -12,6 +12,7 @@ import logging
 import random
 import sqlite3
 import time
+from datetime import date
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -56,12 +57,14 @@ EARLY_HEADERS = ["store", "handle", "product family", "days_since_created", "cre
                  "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level",
                  "units_per_day_7d", "ads_as_of", "store_badge"]
 EARLY_MAX_AGE_DAYS = 90
+ADS_HEADERS = ["store", "page name", "ad_id", "started", "days_running", "delivering", "low_impressions", "impression_rank",
+               "landing_path", "resolved_product", "primary_text"]
 
-TAB_ORDER = ("signals", "early", "families", "categories", "stores", "pages", "candidates", "products", "alerts")
+TAB_ORDER = ("signals", "early", "families", "categories", "stores", "pages", "ads", "candidates", "products", "alerts")
 TAB_NAMES = {"signals": "Signals", "early": "Early", "families": "Families", "categories": "Categories",
-             "stores": "Stores", "pages": "Pages", "candidates": "Candidates", "products": "Products", "alerts": "Alerts"}
+             "stores": "Stores", "pages": "Pages", "ads": "Ads", "candidates": "Candidates", "products": "Products", "alerts": "Alerts"}
 TAB_MODES = {"signals": "replace", "early": "replace", "families": "replace", "categories": "replace",
-             "stores": "replace", "pages": "replace", "candidates": "replace", "products": "replace", "alerts": "append"}
+             "stores": "replace", "pages": "replace", "ads": "replace", "candidates": "replace", "products": "replace", "alerts": "append"}
 
 
 _watchlist_path = None   # set by set_watchlist_path(); None = default watchlist.csv
@@ -170,6 +173,44 @@ def read_promote_marks(conn: sqlite3.Connection, url: str, session: requests.Ses
 
 def pages_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     return scaling.pages_tab_rows(conn, list(_stores(conn)), as_of)
+
+
+def ads_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
+    """Ads tab: one row per active ad in each store's latest snapshot, so attribution (landing path -> product) can be
+    checked by eye. Delivering ads first, newest first; at most SHEETS_ADS_PER_STORE rows per store."""
+    from urllib.parse import urlparse
+    from . import ad_metrics
+    rows = []
+    for s in _stores(conn):
+        snap = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ? AND snapshot_date <= ?",
+                            (s["id"], as_of or "9999")).fetchone()[0]
+        if not snap:
+            continue
+        ads = [dict(r) for r in conn.execute(
+            """SELECT a.ad_id, a.page_name, a.ad_start_date, a.first_seen_date, a.delivery_status, a.landing_url, a.product_handle,
+                      a.page_handle, a.primary_text, d.is_active, d.low_impressions, d.impression_rank, d.days_running
+               FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
+               WHERE d.store_id = ? AND d.snapshot_date = ? AND d.is_active = 1 AND COALESCE(a.page_ignored, 0) = 0""", (s["id"], snap))]
+        for a in ads:
+            a["_deliv"] = ad_metrics.delivering(a)
+            start = (a["ad_start_date"] or a["first_seen_date"] or "")[:10]
+            a["_start"] = start
+            if a["days_running"] is None and start:
+                try:
+                    a["days_running"] = (date.fromisoformat(snap) - date.fromisoformat(start)).days
+                except ValueError:
+                    pass
+        ads.sort(key=lambda a: (not a["_deliv"], -int((a["_start"] or "0000-00-00").replace("-", "") or 0)))
+        for a in ads[: config.SHEETS_ADS_PER_STORE]:
+            u = urlparse(a["landing_url"] or "")
+            path = (u.path or "/") + (("?" + u.query) if u.query and "variant=" in u.query else "")
+            text = " ".join((a["primary_text"] or "").split())[:120]
+            rows.append([s["store_domain"], a["page_name"] or "", str(a["ad_id"]), a["_start"],
+                         "" if a["days_running"] is None else a["days_running"], "yes" if a["_deliv"] else "no",
+                         {1: "LOW", 0: "no"}.get(a["low_impressions"], "?"),
+                         "" if a["impression_rank"] is None else a["impression_rank"],
+                         path if a["landing_url"] else "", a["product_handle"] or (f"page:{a['page_handle']}" if a["page_handle"] else ""), text])
+    return rows
 
 
 def products_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
@@ -501,7 +542,8 @@ def verify(conn: sqlite3.Connection, url: str, as_of: str | None = None,
 
 def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = None) -> list[dict]:
     builders = {"signals": signals_rows, "early": early_rows, "families": families_rows, "categories": categories_rows,
-                "stores": stores_rows, "pages": pages_rows, "candidates": candidates_rows, "products": products_rows, "alerts": alerts_rows}
+                "stores": stores_rows, "pages": pages_rows, "ads": ads_rows, "candidates": candidates_rows, "products": products_rows,
+                "alerts": alerts_rows}
     plan = []
     _ctx_cache.clear()
     _ctx_cache["active"] = True
@@ -520,7 +562,7 @@ def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = Non
 
 def expected_headers() -> dict[str, list[str]]:
     return {"Signals": SIGNALS_HEADERS, "Early": EARLY_HEADERS, "Families": FAMILIES_HEADERS, "Categories": CATEGORIES_HEADERS,
-            "Stores": STORES_HEADERS, "Pages": PAGES_HEADERS, "Candidates": radar.CANDIDATES_HEADERS,
+            "Stores": STORES_HEADERS, "Pages": PAGES_HEADERS, "Ads": ADS_HEADERS, "Candidates": radar.CANDIDATES_HEADERS,
             "Products": PRODUCTS_HEADERS, "Alerts": ALERTS_HEADERS}
 
 

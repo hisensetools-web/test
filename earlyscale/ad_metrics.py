@@ -194,8 +194,14 @@ def _known_handles(conn: sqlite3.Connection, store_id: int, today: str | None = 
     return handles, v2h
 
 
+POLITE_LANDING_FETCH = False   # set by `landing --refresh-all`: pause REQUEST_DELAY_S between back-to-back page fetches
+
+
 def fetch_landing(session: requests.Session, url: str) -> tuple[str, str, int]:
     """GET a landing page (follows redirects). Returns (final_url, html, status)."""
+    if POLITE_LANDING_FETCH:
+        from . import shopify
+        shopify._polite_pause()
     r = session.get(url, timeout=config.REQUEST_TIMEOUT, allow_redirects=True,
                     headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
     return r.url, r.text if r.status_code == 200 else "", r.status_code

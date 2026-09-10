@@ -1,4 +1,5 @@
 """prune-dead, find-page helpers, set-page, and the Early tab."""
+import argparse
 import tempfile
 import unittest
 from unittest import mock
@@ -133,3 +134,56 @@ class RankDueTests(unittest.TestCase):
     def test_verdict_from_before_per_view_comparison_is_redone(self):
         self._check("2026-09-09", 0, None)
         self.assertTrue(cli._rank_due(self.conn, self.sid, "2026-09-10"))
+
+
+class LandingRefreshAllTests(unittest.TestCase):
+    """`landing --refresh-all`: every cached lander is fetched again under the current rules and the ads re-resolved."""
+
+    def test_refresh_all_reattributes_ads_to_the_page_s_cta_product(self):
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        from earlyscale import ad_metrics, meta_ads
+        from tests.test_ad_metrics import _ad, _prod
+
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                if self.path.startswith("/pages/prostate"):
+                    body = (b'<header><nav><a href="/products/cinnamon-copy">c</a><a href="/products/cinnamon-copy">c</a></nav></header>'
+                            b'<main><a class="btn" href="/products/prostate-softgels">Order Now</a><a href="/products/cinnamon-copy">also</a></main>')
+                    ct = "text/html"
+                else:
+                    body, ct = b"<html>x</html>", "text/html"
+                self.send_response(200); self.send_header("Content-Type", ct); self.send_header("Content-Length", str(len(body)))
+                self.end_headers(); self.wfile.write(body)
+        srv = HTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        origin = f"http://127.0.0.1:{srv.server_port}"
+        with tempfile.TemporaryDirectory() as d:
+            wl = Path(d) / "watchlist.csv"
+            wl.write_text(f"store_domain,meta_page_name,meta_page_id,notes\n{origin},Brand,,\n")
+            conn = db.connect(Path(d) / "t.db")
+            sid = db.upsert_store(conn, origin, "Brand")
+            db.write_product_snapshot(conn, sid, "2026-09-10", [_prod(1, "prostate-softgels", "P"), _prod(2, "cinnamon-copy", "C")])
+            ads = [_ad(f"a{i}", "Brand", "2026-09-01", f"{origin}/pages/prostate", f"copy {i}") for i in range(3)]
+            meta_ads.record_scrape(conn, sid, "2026-09-10", ads, "Brand")
+            # what the old link-count rule left behind: the lander cached as selling the cinnamon product
+            conn.execute("INSERT INTO landing_pages (url, fetched_at, status, final_url, product_handle, page_handle, candidates) VALUES (?,?,?,?,?,?,?)",
+                         (f"{origin}/pages/prostate", "2026-09-10", 200, f"{origin}/pages/prostate", "cinnamon-copy", "prostate", "cinnamon-copy:4,prostate-softgels:1"))
+            conn.execute("UPDATE meta_ads SET product_handle = 'cinnamon-copy', page_handle = 'prostate'")
+            conn.commit()
+            conn.close()
+            with mock.patch.object(cli, "console"):
+                rc = cli.cmd_landing(argparse.Namespace(db=str(Path(d) / "t.db"), url=None, apply=False, refresh_all=True,
+                                                        only=None, watchlist=str(wl)))
+            conn = db.connect(Path(d) / "t.db")
+            self.assertEqual(rc, 0)
+            self.assertEqual({r[0] for r in conn.execute("SELECT product_handle FROM meta_ads")}, {"prostate-softgels"})
+            lp = conn.execute("SELECT product_handle, fetched_at FROM landing_pages").fetchone()
+            self.assertEqual((lp[0], lp[1]), ("prostate-softgels", "2026-09-10"))
+            self.assertFalse(ad_metrics.POLITE_LANDING_FETCH)   # restored
+            conn.close()
+        srv.shutdown()

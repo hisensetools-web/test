@@ -175,6 +175,7 @@ three tabs, each with a bold frozen header row:
 | tab | rows | behaviour |
 |---|---|---|
 | **Signals** | one per product (latest snapshot) | overwritten every sync; sorted by `ads_launched_7d` desc, then `ads_pointing_here` desc, then youngest product first. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then the Meta columns (`ads_pointing_here`, `ads_launched_7d`, `ads_launched_prev_7d`, `ad_velocity_wow` = launches this week / last week, `ads_as_of` = the date of the scrape those numbers come from, engagement, days running, concept status) and the six inventory columns (`signal_source`, `inventory_tracked`, `stock_level`, `units_sold_1d`, `units_per_day_7d`, `units_per_day_wow`) filled by the stock probe |
+| **Ads** | one per active ad (latest snapshot, delivering first, newest first, 100 per store) | overwritten; page name, ad id, started, days running, delivering, low_impressions, impression_rank, landing_path, resolved_product, primary text (120 chars): the attribution behind every Signals number |
 | **Families** | one per product family per store | overwritten; a family = handles sharing a base name or normalised title. Handle count, newest/oldest published_at, launches in 7/14/30 days, best rank, handle list. Sorted by 7-day launches |
 | **Categories** | one per keyword category | overwritten; categories are title unigrams/bigrams shared by 2+ stores (nothing hardcoded), with store/family counts and newest publish date. Families with no shared keyword fall into `(uncategorised)` |
 | **Stores** | one per store in watchlist.csv | fully overwritten every sync, sorted by change score |
@@ -631,7 +632,12 @@ prostate lander was attributed to a berberine product linked from its upsell ins
 softgels behind its Order Now button. Landers cached under the old rule are re-fetched over the next passes.
 
 `python tracker.py landing <url>` shows the evidence table and the pick for any page; `--apply` re-resolves the
-ads landing there right away. Signals shows the ad's own path in `landing_paths`, so a prostate funnel that
+ads landing there right away. `python tracker.py landing --refresh-all` re-fetches every cached lander of every
+watchlist store under the current rules (`REQUEST_DELAY_S` between fetches) and re-resolves the ads in one pass,
+printing per store how many ads changed product; run `sync-sheets` afterwards. The **Ads** tab lists, per store,
+the active ads of the latest snapshot (delivering first, newest first, `SHEETS_ADS_PER_STORE` = 100 per store)
+with page name, ad id, started, days running, delivering, low_impressions, impression_rank, landing_path,
+resolved_product and the first 120 characters of the primary text, so attribution can be checked by eye. Signals shows the ad's own path in `landing_paths`, so a prostate funnel that
 sells a product with an unrelated handle still reads as prostate.
 
 ## Impression rank: where an ad sits when sorted "Impressions: high to low"

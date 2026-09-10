@@ -1520,9 +1520,15 @@ def cmd_ads_metrics(args) -> int:
 def cmd_landing(args) -> int:
     """Which product does a landing page sell? Fetches the URL, prints every product the page names with its evidence
     weight (buy action > call-to-action link > plain link; menus ignored), the product the tracker picks, and, with
-    --apply, re-resolves the store's ads that land there."""
+    --apply, re-resolves the store's ads that land there. --refresh-all re-fetches every cached lander of every
+    watchlist store under the current rules and re-resolves their ads in one pass."""
     from urllib.parse import urlparse
     conn = db.connect(args.db)
+    if args.refresh_all:
+        return _landing_refresh_all(conn, args)
+    if not args.url:
+        console.print("[red]give a landing URL, or --refresh-all[/]")
+        return 2
     host = urlparse(args.url).netloc
     store = None
     for r in conn.execute("SELECT id, store_domain FROM stores"):
@@ -1566,6 +1572,58 @@ def cmd_landing(args) -> int:
                                GROUP BY product_handle ORDER BY n DESC""", (store["id"], key + "%")).fetchall()
         console.print("ads landing here, by the product they now count for: " + (", ".join(f"{r['product_handle'] or '(unresolved)'}={r['n']}" for r in rows) or "none")
                       + ". Run `python tracker.py sync-sheets` to push.")
+    return 0
+
+
+def _landing_refresh_all(conn, args) -> int:
+    """Every cached landing page of every watchlist store is marked stale and fetched again (REQUEST_DELAY_S between
+    fetches), then the store's ads are re-resolved for its latest snapshot. Prints, per store, how many landers were
+    fetched and how many ads changed product."""
+    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    only = set(args.only or [])
+    rows = [r for r in conn.execute("SELECT id, store_domain FROM stores ORDER BY store_domain")
+            if r["store_domain"] in {s["store_domain"] for s in stores} and (not only or r["store_domain"] in only)]
+    session = shopify.make_session()
+    old_budget = config.META_MAX_LANDING_FETCH
+    config.META_MAX_LANDING_FETCH = 10 ** 6     # this pass IS the landing fetch; no per-run cap
+    ad_metrics.POLITE_LANDING_FETCH = True
+    t = Table(title="landing pages re-fetched under the current rules")
+    for c in ("store", "ads", "landers", "fetched", "ads changed product", "unresolved -> resolved", "took"):
+        t.add_column(c, justify="right" if c not in ("store",) else "left")
+    total_changed = 0
+    try:
+        for i, r in enumerate(rows, start=1):
+            sid, domain = r["id"], r["store_domain"]
+            snap = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ?", (sid,)).fetchone()[0]
+            if not snap:
+                continue
+            before = {a["ad_id"]: a["product_handle"] for a in conn.execute("SELECT ad_id, product_handle FROM meta_ads WHERE store_id = ?", (sid,))}
+            keys = {ad_metrics._strip(u) for (u,) in conn.execute("SELECT DISTINCT landing_url FROM meta_ads WHERE store_id = ? AND landing_url IS NOT NULL", (sid,))}
+            n_fetch = 0
+            for k in keys:
+                cur = conn.execute("UPDATE landing_pages SET fetched_at = '2000-01-01' WHERE url = ?", (k,))
+                n_fetch += cur.rowcount
+            conn.commit()
+            t0 = time.monotonic()
+            console.print(f"[{i}/{len(rows)}] {domain}: {len(keys)} landing URLs ({n_fetch} cached) ...", end=" ")
+            _post_process_store(conn, sid, domain, snap, session, fetch_landings=True)
+            after = {a["ad_id"]: a["product_handle"] for a in conn.execute("SELECT ad_id, product_handle FROM meta_ads WHERE store_id = ?", (sid,))}
+            changed = sum(1 for k in after if k in before and before[k] != after[k])
+            gained = sum(1 for k in after if k in before and before[k] is None and after[k])
+            fetched = conn.execute("SELECT COUNT(*) FROM landing_pages WHERE fetched_at = ? AND url IN (%s)" % ",".join("?" * len(keys)),
+                                   (snap, *keys)).fetchone()[0] if keys else 0
+            total_changed += changed
+            took = time.monotonic() - t0
+            console.print(f"{fetched} fetched, {changed} ads changed product ({took:.0f}s)")
+            t.add_row(_short(domain), str(len(after)), str(len(keys)), str(fetched), str(changed), str(gained), f"{took:.0f}s")
+    except KeyboardInterrupt:
+        console.print("\n[yellow]interrupted; stores done so far are re-resolved[/]")
+    finally:
+        config.META_MAX_LANDING_FETCH = old_budget
+        ad_metrics.POLITE_LANDING_FETCH = False
+    console.print(t)
+    console.print(f"{total_changed} ads now count for a different product. Run `python tracker.py sync-sheets` to push "
+                  "(the Ads tab shows landing_path -> resolved_product per ad).")
     return 0
 
 
@@ -2017,9 +2075,13 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=20)
     s.set_defaults(fn=cmd_delivering_report)
 
-    s = sub.add_parser("landing", help="which product does a landing page sell? shows the evidence; --apply re-resolves the ads landing there")
-    s.add_argument("url")
+    s = sub.add_parser("landing", help="which product does a landing page sell? shows the evidence; --apply re-resolves the ads landing there; "
+                                       "--refresh-all re-fetches every cached lander and re-resolves every store's ads")
+    s.add_argument("url", nargs="?")
     s.add_argument("--apply", action="store_true", help="re-resolve the store's ads that land on this URL and write the result")
+    s.add_argument("--refresh-all", action="store_true", help="every watchlist store: re-fetch its cached landing pages under the current rules and re-resolve its ads")
+    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="with --refresh-all: limit to these stores")
+    s.add_argument("--watchlist")
     s.set_defaults(fn=cmd_landing)
 
     s = sub.add_parser("ads-report", help="per-page status, products by ads, concepts, lineage, alerts (--raw for ad rows)")
