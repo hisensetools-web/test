@@ -135,11 +135,20 @@ def scrape_ranks(conn: sqlite3.Connection, browser, store: dict, store_id: int, 
             meta_ads._wait()
         first = False
         url, query = rank_url(store, country)
-        res = meta_ads.scrape_page(url, max_scrolls=max_scrolls or config.META_RANK_SCROLLS, browser=browser)
+        res = meta_ads.scrape_page(url, max_scrolls=max_scrolls or config.META_RANK_SCROLLS, browser=browser,
+                                   sort_ui="impressions" if config.META_RANK_UI else None)
         if res.blocked:
             raise meta_ads.MetaBlocked(res.note)
+        ui = f" [sort control: {res.sort_ui}]" if res.sort_ui else ""
+        if res.sort_ui.startswith("sort control not found"):
+            # a layout we do not recognise: other country views will not have it either; report what was seen
+            notes.append(f"{country}: {len(res.ads)} ads{ui}")
+            if res.ads:
+                last = record_ranks(conn, store_id, today, res.ads, query, [])   # n=0 -> not informative, no ranks stored
+                last["note"], last["country"] = res.note, country
+            break
         if not res.ads:
-            notes.append(f"{country}: 0 ads")
+            notes.append(f"{country}: 0 ads{ui}")
             continue
         if country == "ALL":
             baseline: list[str] | None = list(default_ids)
@@ -154,10 +163,10 @@ def scrape_ranks(conn: sqlite3.Connection, browser, store: dict, store_id: int, 
             with conn:
                 conn.execute("UPDATE rank_checks SET informative = 1 WHERE store_id = ? AND snapshot_date = ?", (store_id, today))
                 conn.execute("UPDATE stores SET sort_informative = 1, rank_checked_at = ? WHERE id = ?", (today, store_id))
-            notes.append(f"{country}: {len(res.ads)} ads, informative (confirmed earlier this week)")
+            notes.append(f"{country}: {len(res.ads)} ads, informative (confirmed earlier this week){ui}")
         else:
             notes.append(f"{country}: {len(res.ads)} ads, {out['same_position']}/{out['n']} in the same position as that view's newest-first"
-                         f" -> {'informative' if out['informative'] else 'same order'}")
+                         f" -> {'informative' if out['informative'] else 'same order'}{ui}")
         out["note"], out["country"] = res.note, country
         last = out
         if out["informative"]:

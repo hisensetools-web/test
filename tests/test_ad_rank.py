@@ -259,3 +259,44 @@ class StaleRankTests(unittest.TestCase):
         self.assertEqual(ad_rank.ad_rank_metrics(conn, sid, TODAY)["products"]["p"]["ads_in_top5"], 5)
         conn.execute("UPDATE stores SET sort_informative = 0 WHERE id = ?", (sid,))
         self.assertEqual(ad_rank.ad_rank_metrics(conn, sid, TODAY)["products"], {})
+
+
+class UiSortTests(unittest.TestCase):
+    """The in-page sort control is used (the URL's sort_data is ignored by Meta). Against the fake Ad Library, which
+    reverses the order when its control says impressions, the re-sorted list must differ from newest-first."""
+
+    @classmethod
+    def setUpClass(cls):
+        import threading
+        from http.server import HTTPServer
+        from tests.fake_ad_library import make_handler
+        from tests.test_fb_observer import browser_or_skip
+        cls.pw, cls.browser = browser_or_skip()
+        cls.srv = HTTPServer(("127.0.0.1", 0), make_handler(batches=2, block=False))
+        threading.Thread(target=cls.srv.serve_forever, daemon=True).start()
+        cls.base = f"http://127.0.0.1:{cls.srv.server_port}/ads/library/"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.browser.close()
+        cls.pw.stop()
+
+    def test_sort_control_is_used_and_reported(self):
+        with mock.patch.object(meta_ads.config, "META_WAIT_MIN", 0.1), mock.patch.object(meta_ads.config, "META_WAIT_MAX", 0.2):
+            plain = meta_ads.scrape_page(self.base + "?q=x", max_scrolls=2, browser=self.browser)
+            sorted_ = meta_ads.scrape_page(self.base + "?q=x", max_scrolls=2, browser=self.browser, sort_ui="impressions")
+        self.assertEqual(plain.sort_ui, "")
+        self.assertTrue(sorted_.sort_ui.startswith("select option"), sorted_.sort_ui)
+        a, b = [x["ad_id"] for x in plain.ads], [x["ad_id"] for x in sorted_.ads]
+        self.assertEqual(set(a), set(b))
+        self.assertNotEqual(a[:3], b[:3])
+        self.assertFalse(ad_rank.compare_orders(a, b)["identical"])
+
+    def test_missing_control_is_reported_not_fatal(self):
+        with mock.patch.object(meta_ads.config, "META_WAIT_MIN", 0.1), mock.patch.object(meta_ads.config, "META_WAIT_MAX", 0.2), \
+             mock.patch.object(meta_ads, "SORT_WANT_RE", __import__("re").compile("zzz-no-such-option")):
+            res = meta_ads.scrape_page(self.base + "?q=x", max_scrolls=1, browser=self.browser, sort_ui="impressions")
+        self.assertTrue(res.sort_ui.startswith("sort control not found"), res.sort_ui)
+        self.assertIn("Newest | Impressions", res.sort_ui)
+        self.assertTrue(res.ads)

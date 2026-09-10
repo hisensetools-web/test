@@ -490,6 +490,7 @@ class ScrapeResult:
     responses: int = 0
     blocked: bool = False
     note: str = ""
+    sort_ui: str = ""          # what the in-page sort control did (sort_ui=...): "select option ...", "clicked ...", or why not
 
 
 def _wait(lo: float | None = None, hi: float | None = None) -> None:
@@ -499,11 +500,13 @@ def _wait(lo: float | None = None, hi: float | None = None) -> None:
 
 
 def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = None,
-                max_ads: int | None = None, browser=None) -> ScrapeResult:
+                max_ads: int | None = None, browser=None, sort_ui: str | None = None) -> ScrapeResult:
     """Open one Ad Library search and collect every ad record the page loads.
 
     Pass an existing Playwright `browser` to reuse it across stores (one concurrent
-    browser, a fresh context + user agent per store)."""
+    browser, a fresh context + user agent per store). sort_ui="impressions" chooses
+    "Impressions: high to low" in the page's own sort control after the first load
+    (the URL's sort_data is ignored by Meta's web app) and collects the re-sorted results."""
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout  # local import: optional dep
 
     max_scrolls = config.META_MAX_SCROLLS if max_scrolls is None else max_scrolls
@@ -551,6 +554,27 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
             _check_blocked(page, result)
             if result.blocked:
                 return
+            if sort_ui:
+                info = _apply_sort_ui(page, sort_ui)
+                result.sort_ui = info["how"] if info["applied"] else f"{info['how']} (seen: {'; '.join(info['controls'])[:300] or 'nothing'})"
+                if info["applied"]:
+                    before_ids = set(nodes)
+                    nodes.clear()
+                    dom_badges.clear()
+                    result.responses = 0
+                    _wait(3, 5)                     # the re-sorted first batch arrives through on_response
+                    _check_blocked(page, result)
+                    if result.blocked:
+                        return
+                    if not nodes:                   # some builds render the re-sorted list without a new request
+                        for html in page.evaluate(
+                            "() => Array.from(document.querySelectorAll('script[type=\"application/json\"]')).map(s => s.textContent)"
+                        ):
+                            if html and "ad_archive_id" in html:
+                                ingest(html)
+                    log.info("%s: sort control: %s; %d ads in the re-sorted first load (%d before)", _short(url), info["how"], len(nodes), len(before_ids))
+                else:
+                    log.info("%s: sort control: %s", _short(url), result.sort_ui)
             stale = 0
             log.info("%s: page open, %d ads in the first load; scrolling (%d-%ds between scrolls, up to %d scrolls)",
                      _short(url), len(nodes), int(config.META_WAIT_MIN), int(config.META_WAIT_MAX), max_scrolls)
@@ -654,6 +678,55 @@ def _short(url: str) -> str:
     from urllib.parse import parse_qs, urlparse as _up
     q = parse_qs(_up(url).query)
     return (q.get("q") or q.get("view_all_page_id") or ["?"])[0]
+
+
+SORT_WANT_RE = re.compile(r"impression", re.I)
+SORT_CONTROL_RE = re.compile(r"sort|newest|impression|relevance", re.I)
+
+
+def _apply_sort_ui(page, mode: str = "impressions") -> dict:
+    """Best-effort: pick 'Impressions: high to low' in the page's sort control. Returns {applied, how, controls}
+    where controls lists what was seen, so an unrecognised layout can be reported and the selectors adjusted."""
+    found: list[str] = []
+    # 1. a native <select> whose options mention impressions
+    try:
+        for i in range(min(page.locator("select").count(), 10)):
+            sel = page.locator("select").nth(i)
+            opts = [o.strip() for o in sel.locator("option").all_text_contents()]
+            found.append("select: " + " | ".join(opts)[:120])
+            for o in opts:
+                if SORT_WANT_RE.search(o):
+                    sel.select_option(label=o)
+                    return {"applied": True, "how": f"select option {o!r}", "controls": found}
+    except Exception as e:  # noqa: BLE001
+        found.append(f"select scan failed: {str(e)[:80]}")
+    # 2. a button / combobox mentioning sort or newest: open it, then click the entry mentioning impressions
+    try:
+        ctl = page.locator("[role=button], [role=combobox], button").filter(has_text=SORT_CONTROL_RE)
+        n = min(ctl.count(), 8)
+        for i in range(n):
+            try:
+                found.append("control: " + (ctl.nth(i).inner_text(timeout=1000) or "").strip().replace("\n", " ")[:80])
+            except Exception:  # noqa: BLE001
+                pass
+        for i in range(n):
+            c = ctl.nth(i)
+            try:
+                if not c.is_visible(timeout=800):
+                    continue
+                c.click(timeout=2000)
+                page.wait_for_timeout(800)
+                opt = page.locator("[role=menuitem], [role=option], [role=menuitemradio], [role=radio], li, label").filter(has_text=SORT_WANT_RE)
+                if opt.count() and opt.first.is_visible(timeout=1500):
+                    label = (opt.first.inner_text(timeout=1000) or "").strip().replace("\n", " ")[:80]
+                    opt.first.click(timeout=2000)
+                    return {"applied": True, "how": f"clicked control {i} -> {label!r}", "controls": found}
+                page.keyboard.press("Escape")
+            except Exception as e:  # noqa: BLE001
+                found.append(f"control {i} failed: {str(e)[:60]}")
+    except Exception as e:  # noqa: BLE001
+        found.append(f"control scan failed: {str(e)[:80]}")
+    return {"applied": False, "how": "sort control not found", "controls": found}
 
 
 def _dismiss_dialogs(page) -> None:

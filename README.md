@@ -645,16 +645,18 @@ sells a product with an unrelated handle still reads as prostate.
 
 ## Impression rank: where an ad sits when sorted "Impressions: high to low"
 
-**Status: off by default (`META_RANK=0`).** With the comparison done properly (each country view against
-its own newest-first list) the impressions-sorted URL came back in exactly the newest-first order for every
-store and every view tried (biorootlabs, holior: ALL, DE and NL, 20/20 ids in the same position). Meta's
-web app does not apply `sort_data[...]` from the URL; the sort is chosen in the page's dropdown, which
-issues its own request. Until the scrape drives that dropdown, the search costs 2-4 extra searches per store
-per night and returns nothing usable, so the pass is off and the rank columns stay blank. Ranks recorded
-before this finding were newest-first positions and are cleared once on the next database open (a
-`schema_migrations` step); `ads_in_top5` / `best_rank` only ever show for a store with a real informative
-verdict. The Signals / Early ranking falls through to the delivering signal (badge), which does work. Everything below describes
-the pass as built, for when it is switched on again (`META_RANK=1`, or `rank-check` by hand).
+**How the sort is applied.** Meta's web app ignores `sort_data[...]` in the URL: with each country view
+compared against its own newest-first list, the URL-sorted search came back in exactly the newest-first
+order for every store and view tried (20/20 ids in the same position). So the scrape now chooses
+"Impressions: high to low" in the page's own sort control after the first load (`META_RANK_UI=1`: a native
+`<select>` with an option mentioning impressions, else a button / combobox mentioning sort or newest whose
+menu has such an entry) and collects the re-sorted results. What the control did is recorded in
+`rank_checks.note` (`[sort control: select option 'Impressions: high to low']`, or `sort control not found
+(seen: ...)` listing the controls on the page so the selectors can be adjusted). When the control is not
+found the other country views are not tried. Ranks recorded before this (URL sort, wrong baseline) were
+newest-first positions and were cleared once (`schema_migrations`); `ads_in_top5` / `best_rank` only show
+for a store with a real informative verdict, so until `rank-check` confirms the control works on the live
+page those columns stay blank and the Signals / Early ranking falls through to the delivering signal.
 
 The second per-ad delivery signal. Every Meta pass runs the store's search a second time with the
 impressions sort (`sort_data[mode]=total_impressions`, `META_RANK_SCROLLS` (8) scrolls, top ranks only)

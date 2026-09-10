@@ -22,13 +22,15 @@ PAGE = """<!DOCTYPE html><html><head><title>Ad Library</title>
 <style>body{margin:0;font-family:sans-serif} .ad{height:420px;border:1px solid #ccc;margin:12px;padding:8px}</style>
 </head><body>
 <h1>Results for "%(q)s"</h1>
+<label>Sort by <select id="sort"><option value="">Newest</option><option value="total_impressions">Impressions: high to low</option></select></label>
 <div id="list"></div>
 <script>
-let batch = 0, done = false, loading = false;
+let batch = 0, done = false, loading = false, uiSort = null;
+document.getElementById('sort').onchange = (e) => { uiSort = e.target.value || null; batch = 0; done = false; document.getElementById('list').innerHTML = ''; load(); };
 async function load() {
   if (done || loading) return; loading = true;
   const r = await fetch('/api/graphql/', {method: 'POST', headers: {'Content-Type': 'application/x-www-form-urlencoded'},
-                                          body: 'doc_id=123&variables=' + encodeURIComponent(JSON.stringify({cursor: batch, q: new URLSearchParams(location.search).get('q') || new URLSearchParams(location.search).get('view_all_page_id') || '', sort: (location.search.match(/sort_data\\[mode\\]=([a-z_]+)/) || [null, null])[1]}))});
+                                          body: 'doc_id=123&variables=' + encodeURIComponent(JSON.stringify({cursor: batch, q: new URLSearchParams(location.search).get('q') || new URLSearchParams(location.search).get('view_all_page_id') || '', sort: uiSort || (location.search.match(/sort_data\\[mode\\]=([a-z_]+)/) || [null, null])[1]}))});
   const text = await r.text();
   const first = JSON.parse(text.split('\\n')[0]);
   const ads = [];
