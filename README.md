@@ -619,6 +619,21 @@ python tracker.py delivering-report --handle calming-diffuser --handle probiotic
 prints, per matching product, active ads vs delivering ads, badge counts, the week-ago count and trend,
 concepts alive before (search presence) and after (delivering), and the active ads with their badge.
 
+## Landing page -> product: what the page sells, not what it links to
+
+An ad that lands on `/pages/prostate` is counted for the product that page sells. The tracker fetches the
+lander and weighs every product it names: a buy action with a known variant (`/cart/add` form, `/cart/<variant>:1`
+permalink, a `?variant=` link) weighs 6, a link whose text or class is a call to action ("Order now", "Add to
+cart", `class="btn"`) weighs 4 on top of the link, a plain link or embedded product JSON weighs 1, and links
+inside `<header>`, `<nav>` and `<footer>` are ignored (menus list every product). Before this weighting the
+most-linked product won, and a menu or upsell block could beat the page's own button: elivorahealth.com's
+prostate lander was attributed to a berberine product linked from its upsell instead of the prostate
+softgels behind its Order Now button. Landers cached under the old rule are re-fetched over the next passes.
+
+`python tracker.py landing <url>` shows the evidence table and the pick for any page; `--apply` re-resolves the
+ads landing there right away. Signals shows the ad's own path in `landing_paths`, so a prostate funnel that
+sells a product with an unrelated handle still reads as prostate.
+
 ## Impression rank: where an ad sits when sorted "Impressions: high to low"
 
 **Status: off by default (`META_RANK=0`).** With the comparison done properly (each country view against

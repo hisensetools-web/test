@@ -26,9 +26,30 @@ class LandingParseTests(unittest.TestCase):
                 '<form action="/cart/add"><input name="id" value="4400000000001"></form>'
                 '<script>var p = {"handle":"hero-google"};</script>')
         ranked = ad_metrics.handles_from_html(html, {4400000000001: "hero"})
-        self.assertEqual(ranked[0][0], "hero")            # variant id -> handle, weight 2
-        self.assertEqual(ranked[1][0], "hero-google")     # link + json = 2 as well, alphabetical after
+        self.assertEqual(ranked[0][0], "hero")            # variant id -> handle: a buy action (W_BUY)
+        self.assertEqual(ranked[1][0], "hero-google")     # link + "buy" CTA + json
         self.assertIn(("other-thing", 1), ranked)
+
+    def test_the_cta_beats_menu_and_upsell_links(self):
+        """elivorahealth.com/pages/prostate: the header menu and an upsell block link the cinnamon product several
+        times; the page's own Order Now button goes to the prostate softgels. The softgels are what the page sells."""
+        html = ('<header><nav><a href="/products/elivora-berberine-with-ceylon-cinnamon-copy">Cinnamon</a>'
+                '<a href="/products/elivora-berberine-with-ceylon-cinnamon-copy">Cinnamon</a>'
+                '<a href="/products/elivora-prostate-urinary-support-softgels">Prostate</a></nav></header>'
+                '<main><h1>Prostate relief</h1><p>...</p>'
+                '<a class="btn" href="/products/elivora-prostate-urinary-support-softgels">Order Now</a>'
+                '<div class="upsell">Customers also bought <a href="/products/elivora-berberine-with-ceylon-cinnamon-copy">Berberine</a>'
+                '<a href="/products/elivora-berberine-with-ceylon-cinnamon-copy">See it</a></div></main>'
+                '<footer><a href="/products/elivora-berberine-with-ceylon-cinnamon-copy">Cinnamon</a></footer>')
+        ranked = ad_metrics.handles_from_html(html)
+        self.assertEqual(ranked[0][0], "elivora-prostate-urinary-support-softgels")
+        self.assertEqual(dict(ranked)["elivora-berberine-with-ceylon-cinnamon-copy"], 2)   # the two upsell links only
+        # a cart permalink / ?variant= link is the strongest evidence of all
+        html2 = html + '<a href="/cart/4400000000009:1">Checkout</a>'
+        ranked2 = ad_metrics.handles_from_html(html2, {4400000000009: "elivora-berberine-with-ceylon-cinnamon-copy"})
+        self.assertEqual(ranked2[0][0], "elivora-berberine-with-ceylon-cinnamon-copy")
+        # only menus name products: fall back to them
+        self.assertEqual(ad_metrics.handles_from_html('<nav><a href="/products/only-in-menu">x</a></nav><p>hi</p>')[0][0], "only-in-menu")
 
     def test_match_handle_variants(self):
         known = {"ceylon-cinnamon", "ceylon-cinnamon-google", "oregano-oil"}

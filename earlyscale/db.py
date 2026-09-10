@@ -449,6 +449,10 @@ MIGRATION_STEPS: list[tuple[str, str]] = [
         UPDATE stores SET sort_informative = NULL, rank_checked_at = NULL
         WHERE sort_informative IS NOT NULL AND id NOT IN (
             SELECT store_id FROM rank_checks WHERE note LIKE '%-> informative%' OR note LIKE '%-> same order%');"""),
+    ("2026-09-10-refetch-ambiguous-landers",
+     # landing pages that named more than one product were resolved by link count (menus and upsells could beat the
+     # buy button); mark them stale so the CTA-weighted resolver fetches them again, keeping the old handle meanwhile
+     """UPDATE landing_pages SET fetched_at = '2000-01-01' WHERE candidates LIKE '%,%' AND status = 200;"""),
 ]
 
 

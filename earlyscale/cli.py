@@ -1517,6 +1517,58 @@ def cmd_ads_metrics(args) -> int:
     return 0
 
 
+def cmd_landing(args) -> int:
+    """Which product does a landing page sell? Fetches the URL, prints every product the page names with its evidence
+    weight (buy action > call-to-action link > plain link; menus ignored), the product the tracker picks, and, with
+    --apply, re-resolves the store's ads that land there."""
+    from urllib.parse import urlparse
+    conn = db.connect(args.db)
+    host = urlparse(args.url).netloc
+    store = None
+    for r in conn.execute("SELECT id, store_domain FROM stores"):
+        if ad_metrics.same_store(host, r["store_domain"]):
+            store = r
+            break
+    if store is None:
+        console.print(f"[red]{host} is not a watchlist store[/] (add it first: python tracker.py add-store {host})")
+        return 2
+    known, v2h = ad_metrics._known_handles(conn, store["id"])
+    session = shopify.make_session()
+    try:
+        final, html, status = ad_metrics.fetch_landing(session, args.url)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]could not fetch {args.url}: {e}[/]")
+        return 1
+    console.print(f"{args.url} -> HTTP {status}, final {final}, {len(html)} bytes; store {store['store_domain']} ({len(known)} known handles)")
+    if not html:
+        return 1
+    ranked = ad_metrics.handles_from_html(html, v2h)
+    t = Table(title="products named on the page (what it sells first)")
+    for c in ("handle", "weight", "listed product", "note"):
+        t.add_column(c, justify="right" if c == "weight" else "left")
+    chosen = None
+    for h, w in ranked[:15]:
+        m = ad_metrics.match_handle(h, known)
+        junk = ad_metrics.is_junk_handle(m or h)
+        if chosen is None and m and not junk:
+            chosen = m
+        t.add_row(h, str(w), m or "-", "widget (ignored)" if junk else ("<- picked" if m == chosen and chosen else ""))
+    console.print(t)
+    console.print(f"picked: [bold]{chosen or '(none: no listed product named)'}[/]   "
+                  "(weights: buy action with a known variant 6, call-to-action link 4 + 1, plain link 1, product JSON 1; header/nav/footer ignored)")
+    if args.apply:
+        key = ad_metrics._strip(args.url)
+        conn.execute("DELETE FROM landing_pages WHERE url = ?", (key,))
+        conn.commit()
+        today = _parse_date(None)
+        _post_process_store(conn, store["id"], store["store_domain"], today, session, fetch_landings=True)
+        rows = conn.execute("""SELECT product_handle, COUNT(*) n FROM meta_ads WHERE store_id = ? AND landing_url LIKE ?
+                               GROUP BY product_handle ORDER BY n DESC""", (store["id"], key + "%")).fetchall()
+        console.print("ads landing here, by the product they now count for: " + (", ".join(f"{r['product_handle'] or '(unresolved)'}={r['n']}" for r in rows) or "none")
+                      + ". Run `python tracker.py sync-sheets` to push.")
+    return 0
+
+
 def cmd_ads_report(args) -> int:
     conn = db.connect(args.db)
     as_of = _parse_date(args.date) if args.date else (
@@ -1964,6 +2016,11 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--date")
     s.add_argument("--limit", type=int, default=20)
     s.set_defaults(fn=cmd_delivering_report)
+
+    s = sub.add_parser("landing", help="which product does a landing page sell? shows the evidence; --apply re-resolves the ads landing there")
+    s.add_argument("url")
+    s.add_argument("--apply", action="store_true", help="re-resolve the store's ads that land on this URL and write the result")
+    s.set_defaults(fn=cmd_landing)
 
     s = sub.add_parser("ads-report", help="per-page status, products by ads, concepts, lineage, alerts (--raw for ad rows)")
     s.add_argument("--date", help="snapshot date (default: latest)")

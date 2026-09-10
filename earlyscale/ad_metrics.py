@@ -91,26 +91,61 @@ def is_junk_handle(h: str | None) -> bool:
     return bool(h) and bool(JUNK_HANDLE_RE.search(h))
 
 
+CHROME_RE = re.compile(r"<(header|nav|footer)\b[^>]*>.*?</\1\s*>", re.I | re.S)     # menus and footers link every product
+ANCHOR_RE = re.compile(r"<a\b([^>]*)>(.*?)</a\s*>", re.I | re.S)
+HREF_PRODUCT_RE = re.compile(r"href=[\"']([^\"']*/products/([a-z0-9][a-z0-9\-_.%]*)[^\"']*)", re.I)
+CTA_RE = re.compile(r"add\s*to\s*(?:cart|bag)|\bbuy\b|\border\b|shop\s*now|get\s*(?:yours|started|it|mine|my|the\s*offer|\d+)|claim|"
+                    r"check\s*out|\btry\b|purchase|subscribe|select\s*(?:package|bundle|offer|plan)|choose\s*(?:your|a|package|bundle)|"
+                    r"yes[,!]?\s*i\s*want|\bgrab\b|start\s*(?:now|my|your)|unlock|apply\s*discount|save\s*\d", re.I)
+BTN_ATTR_RE = re.compile(r"(?:class|id|data-[a-z\-]+)=[\"'][^\"']*(?:btn|button|cta|buy|order|checkout|add-to-cart|purchase)", re.I)
+CART_PERMALINK_RE = re.compile(r"/cart/(\d{9,16}):\d+", re.I)
+TAG_RE = re.compile(r"<[^>]+>")
+W_LINK, W_JSON, W_CTA, W_BUY = 1, 1, 4, 6
+
+
 def handles_from_html(html: str, variant_to_handle: dict[int, str] | None = None) -> list[tuple[str, int]]:
-    """Product handles referenced by a landing page, most-referenced first.
-    Looks at /products/<handle> links, /cart/add + variant ids, and embedded product JSON."""
+    """Product handles referenced by a landing page, strongest evidence first: what the page SELLS, not what it
+    links to. A buy action (a /cart/add form or /cart/<variant>:<qty> link with a known variant, a ?variant= link)
+    weighs W_BUY; a link whose text or class is a call to action ("Order now", "Add to cart", class=btn) weighs
+    W_CTA on top of the link; plain links and embedded product JSON weigh 1 each. Links inside <header>, <nav> and
+    <footer> (menus that list every product) are ignored unless nothing else names a product."""
     counts: dict[str, int] = defaultdict(int)
-    for m in PRODUCT_RE.finditer(html):
-        h = clean_handle(m.group(1))
+    body = CHROME_RE.sub(" ", html)
+
+    def add(raw: str, w: int) -> None:
+        h = clean_handle(raw)
         if h and h not in ("json", "js"):
-            counts[h] += 1
+            counts[h] += w
+
+    for m in PRODUCT_RE.finditer(body):
+        add(m.group(1), W_LINK)
+    for m in ANCHOR_RE.finditer(body):
+        attrs, inner = m.group(1), m.group(2)
+        hm = HREF_PRODUCT_RE.search(attrs)
+        if not hm:
+            continue
+        text = TAG_RE.sub(" ", inner)
+        if "variant=" in hm.group(1).lower():
+            add(hm.group(2), W_BUY)
+        elif CTA_RE.search(text) or BTN_ATTR_RE.search(attrs) or CTA_RE.search(attrs):
+            add(hm.group(2), W_CTA)
     if not counts:
-        for m in GENERIC_PRODUCT_RE.finditer(html):
-            h = clean_handle(m.group(1))
-            if h:
-                counts[h] += 1
+        for m in GENERIC_PRODUCT_RE.finditer(body):
+            add(m.group(1), W_LINK)
     if variant_to_handle:
-        for m in VARIANT_RE.finditer(html):
+        for m in VARIANT_RE.finditer(body):
             h = variant_to_handle.get(int(m.group(1)))
             if h:
-                counts[h] += 2   # a buy button is stronger evidence than a link
-    for m in HTML_PRODUCT_JSON_RE.finditer(html):
-        counts[clean_handle(m.group(1))] += 1
+                counts[h] += W_BUY   # a buy button with a known variant: the strongest evidence
+        for m in CART_PERMALINK_RE.finditer(body):
+            h = variant_to_handle.get(int(m.group(1)))
+            if h:
+                counts[h] += W_BUY
+    for m in HTML_PRODUCT_JSON_RE.finditer(body):
+        add(m.group(1), W_JSON)
+    if not counts:   # only menus name a product: better than nothing
+        for m in PRODUCT_RE.finditer(html):
+            add(m.group(1), W_LINK)
     # widgets like shipping protection appear on every page; sort them last
     return sorted(counts.items(), key=lambda kv: (is_junk_handle(kv[0]), -kv[1], kv[0]))
 
