@@ -844,6 +844,13 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
 - Pagination stops on an empty page, a short page, a repeated page (some themes ignore
   `page=`), or after 60 pages.
 - A configurable pause (`REQUEST_DELAY_S`, default 1s) sits between requests to the same store.
+- **`database is locked`** means another tracker command holds `data/tracker.db` for writing (a Meta pass
+  still running, the scheduled task, or a python process that never exited). Opening the database now does
+  no write at all when the schema is already at the code's version (stamped in `PRAGMA user_version`), so
+  read-only commands (`sync-sheets`, `report`, `product`) work while a pass is running; when a schema update
+  is needed and the file is busy, connect waits and retries a few times instead of failing. To find the
+  holder: `Get-Process python | Select-Object Id, StartTime, CPU`, then `Stop-Process -Id <id>` if it is a
+  leftover from a run that should have finished.
 
 ## Tests and offline end-to-end
 

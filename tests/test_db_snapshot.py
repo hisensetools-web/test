@@ -56,3 +56,55 @@ class SnapshotTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ConnectSetupTests(unittest.TestCase):
+    """The schema check runs once per code version (stamped in user_version) and waits for a busy database."""
+
+    def test_stamp_is_written_and_a_stale_database_is_migrated_again(self):
+        import sqlite3
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "t.db"
+            conn = db.connect(path)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.schema_stamp())
+            conn.execute("ALTER TABLE rank_checks DROP COLUMN note")
+            conn.execute("PRAGMA user_version = 0")
+            conn.commit()
+            conn.close()
+            conn = db.connect(path)
+            self.assertIn("note", {r[1] for r in conn.execute("PRAGMA table_info(rank_checks)")})
+            conn.close()
+            # a matching stamp means no schema work: connect must not write (open a second connection holding the write lock)
+            holder = sqlite3.connect(str(path), timeout=1)
+            holder.execute("BEGIN IMMEDIATE")
+            try:
+                conn = db.connect(path)
+                self.assertEqual(conn.execute("SELECT COUNT(*) FROM stores").fetchone()[0], 0)
+                conn.close()
+            finally:
+                holder.rollback()
+                holder.close()
+
+    def test_setup_waits_for_a_locked_database(self):
+        import sqlite3
+        import tempfile
+        import threading
+        from pathlib import Path
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "t.db"
+            db.connect(path).close()
+            holder = sqlite3.connect(str(path), timeout=1, check_same_thread=False)
+            holder.execute("PRAGMA user_version = 0")   # force the schema pass on the next connect ...
+            holder.commit()
+            holder.execute("BEGIN IMMEDIATE")           # ... and hold the write lock while it runs
+            threading.Timer(0.5, lambda: (holder.rollback(), holder.close())).start()
+            real_connect = sqlite3.connect
+            with mock.patch.object(sqlite3, "connect", lambda p, timeout=60: real_connect(p, timeout=0.05)):
+                real_sleep = db.time.sleep
+                with mock.patch.object(db.time, "sleep", lambda s: real_sleep(0.3)), self.assertLogs("earlyscale.db", level="WARNING"):
+                    conn = db.connect(path)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], db.schema_stamp())
+            conn.close()

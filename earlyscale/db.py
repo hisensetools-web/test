@@ -6,11 +6,16 @@ across days. Re-running the same day upserts that day's rows (idempotent).
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
+import time
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path
 
 from . import config
+
+log = logging.getLogger("earlyscale.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS stores (
@@ -426,59 +431,86 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.executescript(SCHEMA)
-    _migrate(conn)
-    conn.execute("""INSERT OR IGNORE INTO radar_ad_hits (ad_id, source, query, landing_domain, seen)
-                    SELECT ad_id, source, query, landing_domain, first_seen FROM radar_ads WHERE source IS NOT NULL""")
-    conn.commit()
+    stamp = schema_stamp()
+    if conn.execute("PRAGMA user_version").fetchone()[0] != stamp:
+        _setup(conn, stamp)
     return conn
 
 
+def schema_stamp() -> int:
+    """Checksum of the schema + migration list: the database carries it in user_version once set up, so a
+    connection whose code version matches does no write at all on open (read-only commands never take a lock)."""
+    return zlib.crc32(SCHEMA.encode() + repr(MIGRATION_COLUMNS).encode()) & 0x7FFFFFFF
+
+
+def _setup(conn: sqlite3.Connection, stamp: int, attempts: int = 6) -> None:
+    """Create / migrate the schema once per code version, inside one write transaction. If another tracker command
+    (a running ads pass, the scheduled task) holds the database, wait and retry instead of failing on open."""
+    for attempt in range(attempts):
+        try:
+            conn.executescript(SCHEMA)
+            conn.execute("BEGIN IMMEDIATE")
+            _migrate(conn)
+            conn.execute("""INSERT OR IGNORE INTO radar_ad_hits (ad_id, source, query, landing_domain, seen)
+                            SELECT ad_id, source, query, landing_domain, first_seen FROM radar_ads WHERE source IS NOT NULL""")
+            conn.execute(f"PRAGMA user_version = {int(stamp)}")
+            conn.commit()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" not in str(e).lower() or attempt == attempts - 1:
+                raise
+            conn.rollback()
+            wait = 5 + 5 * attempt
+            log.warning("database is in use by another tracker command; waiting %ds before retrying the schema check (%d/%d)",
+                        wait, attempt + 1, attempts - 1)
+            time.sleep(wait)
+
+
+MIGRATION_COLUMNS = {   # columns added after the table was first created (ALTER is idempotent via the column check)
+    "meta_ads": [("concept_id", "TEXT"), ("lineage_of", "TEXT"), ("lineage_similarity", "REAL"),
+                 ("landing_resolved_via", "TEXT"), ("landing_handle", "TEXT"), ("page_ignored", "INTEGER"),
+                 ("post_url", "TEXT"), ("engagement_type", "TEXT"), ("reach_keys", "TEXT"),
+                 # part 2 (A): delivery from the single-ad page, page facts, creative fingerprint
+                 ("last_delivered", "TEXT"), ("delivery_status", "TEXT"), ("switched_off_date", "TEXT"),
+                 ("detail_fetched_date", "TEXT"), ("page_profile_id", "TEXT"), ("page_categories", "TEXT"),
+                 ("creative_hash", "TEXT"), ("lineage_via", "TEXT"),
+                 # part 2 (B): matched feed post and its latest counts
+                 ("post_id", "TEXT"), ("post_permalink", "TEXT"), ("low_impressions_key", "TEXT")],
+    "meta_concepts_daily": [("ads_delivering", "INTEGER"), ("survival_source", "TEXT")],
+    "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
+                      ("store_domain", "TEXT")],
+    "alerts": [("dedupe_key", "TEXT")],
+    "rank_checks": [("country", "TEXT"), ("note", "TEXT")],
+    "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
+               ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),
+               ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT"),
+               ("sort_informative", "INTEGER"), ("rank_checked_at", "TEXT")],
+    "variants_daily": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT"), ("stock", "INTEGER")],
+    "products_daily": [("unlisted", "INTEGER DEFAULT 0"), ("url_path", "TEXT")],
+    "hero_variants": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
+    "meta_ads_daily": [("low_impressions", "INTEGER"),   # 1 = 'Low impression count' badge on the card, 0 = no badge, NULL = unknown
+                       ("impression_rank", "INTEGER"),   # 1-based position in the "Impressions: high to low" search, NULL = not in it
+                       ("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
+                       ("engagement_per_day", "REAL"),
+                       # reach curve (EU exact, UK exact or range) and the comment curve
+                       ("uk_reach", "INTEGER"), ("reach_range_lower", "INTEGER"), ("reach_range_upper", "INTEGER"),
+                       ("reach_source", "TEXT"), ("reach_delta_1d", "INTEGER"), ("reach_slope_7d", "REAL"),
+                       ("reach_slope_prev_7d", "REAL"), ("comment_delta_1d", "INTEGER"), ("post_status", "TEXT")],
+
+}
+
 def _migrate(conn: sqlite3.Connection) -> None:
-    """Small, idempotent schema fixes for databases created by earlier versions."""
+    """Small, idempotent schema fixes for databases created by earlier versions (runs inside _setup's transaction)."""
     # ads_daily was a placeholder from build step 1; Part B replaced it with meta_ads*.
     if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ads_daily'").fetchone():
         if conn.execute("SELECT COUNT(*) FROM ads_daily").fetchone()[0] == 0:
             conn.execute("DROP TABLE ads_daily")
     # Part B increment 2 columns (ALTER is idempotent via the column check).
-    wanted = {
-        "meta_ads": [("concept_id", "TEXT"), ("lineage_of", "TEXT"), ("lineage_similarity", "REAL"),
-                     ("landing_resolved_via", "TEXT"), ("landing_handle", "TEXT"), ("page_ignored", "INTEGER"),
-                     ("post_url", "TEXT"), ("engagement_type", "TEXT"), ("reach_keys", "TEXT"),
-                     # part 2 (A): delivery from the single-ad page, page facts, creative fingerprint
-                     ("last_delivered", "TEXT"), ("delivery_status", "TEXT"), ("switched_off_date", "TEXT"),
-                     ("detail_fetched_date", "TEXT"), ("page_profile_id", "TEXT"), ("page_categories", "TEXT"),
-                     ("creative_hash", "TEXT"), ("lineage_via", "TEXT"),
-                     # part 2 (B): matched feed post and its latest counts
-                     ("post_id", "TEXT"), ("post_permalink", "TEXT"), ("low_impressions_key", "TEXT")],
-        "meta_concepts_daily": [("ads_delivering", "INTEGER"), ("survival_source", "TEXT")],
-        "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
-                          ("store_domain", "TEXT")],
-        "alerts": [("dedupe_key", "TEXT")],
-        "rank_checks": [("country", "TEXT"), ("note", "TEXT")],
-        "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
-                   ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),
-                   ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT"),
-                   ("sort_informative", "INTEGER"), ("rank_checked_at", "TEXT")],
-        "variants_daily": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT"), ("stock", "INTEGER")],
-        "products_daily": [("unlisted", "INTEGER DEFAULT 0"), ("url_path", "TEXT")],
-        "hero_variants": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
-        "meta_ads_daily": [("low_impressions", "INTEGER"),   # 1 = 'Low impression count' badge on the card, 0 = no badge, NULL = unknown
-                           ("impression_rank", "INTEGER"),   # 1-based position in the "Impressions: high to low" search, NULL = not in it
-                           ("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
-                           ("engagement_per_day", "REAL"),
-                           # reach curve (EU exact, UK exact or range) and the comment curve
-                           ("uk_reach", "INTEGER"), ("reach_range_lower", "INTEGER"), ("reach_range_upper", "INTEGER"),
-                           ("reach_source", "TEXT"), ("reach_delta_1d", "INTEGER"), ("reach_slope_7d", "REAL"),
-                           ("reach_slope_prev_7d", "REAL"), ("comment_delta_1d", "INTEGER"), ("post_status", "TEXT")],
-
-    }
-    for table, cols in wanted.items():
+    for table, cols in MIGRATION_COLUMNS.items():
         have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
         for name, typ in cols:
             if name not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
-    conn.commit()
 
 
 # ---------------------------------------------------------------- stores
