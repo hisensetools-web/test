@@ -122,3 +122,74 @@ class RankTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def _res(ids, handle="calming-diffuser"):
+    return meta_ads.ScrapeResult(url="u", ads=[_ad(a, "Brand", "2026-08-15", f"https://supp.com/products/{handle}", f"copy {a}") for a in ids])
+
+
+class ScrapeRanksTests(unittest.TestCase):
+    """Each country view is judged against its OWN newest-first order; an empty view is skipped, not the answer."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        self.sid = db.upsert_store(self.conn, "supp.com")
+        self.store = {"store_domain": "supp.com", "meta_page_name": "Brand"}
+        self.world = [f"w{i}" for i in range(25)]
+        self.calls = []
+
+    def _fake(self, script):
+        def scrape_page(url, **kw):
+            self.calls.append(url)
+            country = url.split("country=")[1].split("&")[0]
+            kind = "sorted" if "sort_data" in url else "newest"
+            return script[(country, kind)]
+        return scrape_page
+
+    def test_empty_view_is_skipped_and_eu_view_uses_its_own_baseline(self):
+        nl = [f"n{i}" for i in range(22)]
+        script = {("ALL", "sorted"): _res(self.world),            # worldwide: same order as newest -> ignored sort
+                  ("DE", "sorted"): _res([]),                      # no DE delivery
+                  ("NL", "sorted"): _res(list(reversed(nl))), ("NL", "newest"): _res(nl)}
+        with mock.patch.object(meta_ads, "scrape_page", self._fake(script)), mock.patch.object(meta_ads, "_wait"):
+            out = ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, TODAY, self.world, countries=["ALL", "DE", "NL"])
+        self.assertEqual((out["country"], out["informative"], out["ranked"]), ("NL", True, 22))
+        self.assertIn("DE: 0 ads", out["summary"])
+        self.assertIn("ALL: 25 ads, 20/20", out["summary"])
+        chk = self.conn.execute("SELECT country, informative, note FROM rank_checks WHERE store_id = ?", (self.sid,)).fetchone()
+        self.assertEqual((chk["country"], chk["informative"]), ("NL", 1))
+        self.assertIn("NL: 22 ads", chk["note"])
+        self.assertEqual(self.conn.execute("SELECT impression_rank FROM meta_ads_daily WHERE ad_id = 'n21'").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute("SELECT sort_informative FROM stores WHERE id = ?", (self.sid,)).fetchone()[0], 1)
+
+    def test_eu_view_identical_to_its_own_newest_order_is_not_informative(self):
+        de = [f"d{i}" for i in range(22)]   # differs from the worldwide list, but sorted == newest within the DE view
+        script = {("ALL", "sorted"): _res(self.world), ("DE", "sorted"): _res(de), ("DE", "newest"): _res(de), ("NL", "sorted"): _res([])}
+        with mock.patch.object(meta_ads, "scrape_page", self._fake(script)), mock.patch.object(meta_ads, "_wait"):
+            out = ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, TODAY, self.world, countries=["ALL", "DE", "NL"])
+        self.assertEqual((out["country"], out["informative"]), ("DE", False))
+        self.assertIn("DE: 22 ads, 20/20", out["summary"])
+        self.assertIn("NL: 0 ads", out["summary"])
+        self.assertEqual(self.conn.execute("SELECT sort_informative FROM stores WHERE id = ?", (self.sid,)).fetchone()[0], 0)
+
+    def test_no_view_with_ads_leaves_the_verdict_open(self):
+        script = {(c, "sorted"): _res([]) for c in ("ALL", "DE", "NL")}
+        with mock.patch.object(meta_ads, "scrape_page", self._fake(script)), mock.patch.object(meta_ads, "_wait"):
+            out = ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, TODAY, self.world, countries=["ALL", "DE", "NL"])
+        self.assertEqual((out["ranked"], out["informative"], out["country"]), (0, None, None))
+        self.assertIsNone(self.conn.execute("SELECT sort_informative FROM stores WHERE id = ?", (self.sid,)).fetchone()[0])
+        self.assertEqual(self.conn.execute("SELECT note FROM rank_checks WHERE store_id = ?", (self.sid,)).fetchone()[0], "ALL: 0 ads; DE: 0 ads; NL: 0 ads")
+
+    def test_confirmed_country_goes_first_without_a_baseline_scrape(self):
+        nl = [f"n{i}" for i in range(22)]
+        script = {("NL", "sorted"): _res(list(reversed(nl))), ("NL", "newest"): _res(nl), ("ALL", "sorted"): _res(self.world), ("DE", "sorted"): _res([])}
+        fake = self._fake(script)
+        with mock.patch.object(meta_ads, "scrape_page", fake), mock.patch.object(meta_ads, "_wait"):
+            ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, WEEK_AGO, self.world, countries=["ALL", "DE", "NL"])
+            self.calls.clear()
+            out = ad_rank.scrape_ranks(self.conn, None, self.store, self.sid, TODAY, self.world, countries=["ALL", "DE", "NL"])
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("country=NL", self.calls[0])
+        self.assertEqual((out["country"], out["informative"]), ("NL", True))
+        self.assertIn("confirmed earlier", out["summary"])
+        self.assertEqual(self.conn.execute("SELECT informative FROM rank_checks WHERE store_id = ? AND snapshot_date = ?", (self.sid, TODAY)).fetchone()[0], 1)

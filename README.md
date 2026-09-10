@@ -553,13 +553,19 @@ impressions sort (`sort_data[mode]=total_impressions`, `META_RANK_SCROLLS` (8) s
 and stores each ad's 1-based position as `meta_ads_daily.impression_rank` for the day.
 
 **Is the sort informative?** For every store the sorted order is compared with the newest-first order of
-the same day (`rank_checks`: first `META_RANK_MIN_COMPARE` (20) ids, how many sit in the same position).
-In the worldwide view Meta ignored the sort for all five stores checked (20/20 ids in the same position):
-impressions are only published for EU delivery. So the search is tried per country view in
-`META_RANK_COUNTRIES` (default `ALL,DE,NL`) and the first informative one is kept (`rank_checks.country`).
+the *same view* on the same day (`rank_checks`: first `META_RANK_MIN_COMPARE` (20) ids, how many sit in
+the same position). In the worldwide view Meta ignored the sort for all five stores checked (20/20 ids in
+the same position): impressions are only published for EU delivery. So the views in `META_RANK_COUNTRIES`
+(default `ALL,DE,NL`) are tried in turn. The worldwide view is judged against the day's normal scrape; an EU
+view gets its own newest-first scrape as the baseline (a worldwide list is the wrong baseline: a DE-only
+subset always looks "different" from it). A view that returns 0 ads is skipped, not treated as the answer.
+The first informative view is kept (`rank_checks.country`) and is tried first on later days; while it was
+confirmed within the last 7 days the baseline scrape is skipped, so a confirmed store costs one extra search
+per day. `rank_checks.note` records what every view returned (e.g. `ALL: 150 ads, 20/20 ... -> same order;
+DE: 0 ads; NL: 41 ads, 2/20 ... -> informative`) and the ads log prints the same line per store.
 Identical orders everywhere mean the sort carries no information for that store: `stores.sort_informative`
 = false (shown on the Stores tab), the store is re-checked weekly instead of daily, and its rank columns
-stay blank. `python tracker.py rank-check --only a.com b.com c.com d.com e.com` does the comparison for a few
+stay blank. Stores judged before the per-view comparison existed are re-judged on the next pass. `python tracker.py rank-check --only a.com b.com c.com d.com e.com` does the comparison for a few
 stores on demand and prints the verdict per store.
 
 Derived per ad: `rank_7d_ago`, `rank_delta_7d` (negative = climbing), `top5_days` (days the ad held a

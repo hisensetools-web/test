@@ -559,7 +559,7 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
     return result
 
 
-CARD_BADGE_JS = """() => {
+CARD_BADGE_JS = r"""() => {
   // Every result card carries a 'Library ID: <id>' line. Walk up from that text to the card container and
   // report whether the card's text shows the 'Low impression count' badge.
   const out = {};

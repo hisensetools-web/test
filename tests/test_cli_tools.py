@@ -108,3 +108,28 @@ class EarlyTabTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RankDueTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        self.sid = db.upsert_store(self.conn, "x.com")
+
+    def _check(self, day, informative, note):
+        self.conn.execute("INSERT OR REPLACE INTO rank_checks (snapshot_date, store_id, informative, note) VALUES (?,?,?,?)", (day, self.sid, informative, note))
+        self.conn.execute("UPDATE stores SET sort_informative = ?, rank_checked_at = ? WHERE id = ?", (informative, day, self.sid))
+        self.conn.commit()
+
+    def test_unknown_or_informative_is_daily(self):
+        self.assertTrue(cli._rank_due(self.conn, self.sid, "2026-09-10"))
+        self._check("2026-09-10", 1, "ALL: 40 ads, 3/20 ... -> informative")
+        self.assertTrue(cli._rank_due(self.conn, self.sid, "2026-09-10"))
+
+    def test_not_informative_is_weekly(self):
+        self._check("2026-09-08", 0, "ALL: 40 ads, 20/20 ... -> same order; DE: 0 ads; NL: 0 ads")
+        self.assertFalse(cli._rank_due(self.conn, self.sid, "2026-09-10"))
+        self.assertTrue(cli._rank_due(self.conn, self.sid, "2026-09-15"))
+
+    def test_verdict_from_before_per_view_comparison_is_redone(self):
+        self._check("2026-09-09", 0, None)
+        self.assertTrue(cli._rank_due(self.conn, self.sid, "2026-09-10"))

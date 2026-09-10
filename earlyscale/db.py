@@ -347,6 +347,7 @@ CREATE TABLE IF NOT EXISTS rank_checks (
     informative     INTEGER,
     checked_at      TEXT,
     country         TEXT,                   -- the country view the ranks came from (ALL, or an EU country)
+    note            TEXT,                   -- what each view returned, e.g. 'ALL: 150 ads, same order; DE: 0 ads; NL: 41 ads, informative'
     PRIMARY KEY (snapshot_date, store_id)
 );
 
@@ -454,7 +455,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
         "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
                           ("store_domain", "TEXT")],
         "alerts": [("dedupe_key", "TEXT")],
-        "rank_checks": [("country", "TEXT")],
+        "rank_checks": [("country", "TEXT"), ("note", "TEXT")],
         "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
                    ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),
                    ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT"),

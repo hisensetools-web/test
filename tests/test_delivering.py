@@ -32,6 +32,10 @@ class ExtractTests(unittest.TestCase):
 
 
 class CardBadgeTests(unittest.TestCase):
+    def test_card_script_keeps_its_regex_escapes(self):
+        # a non-raw string turned \s into a SyntaxWarning on Python 3.12+ and would drop the escape at runtime
+        self.assertIn(r"Library ID:?\s*(\d{3,20})", meta_ads.CARD_BADGE_JS)
+
     def test_card_badges_override_payload_and_survive_a_second_scrape(self):
         ads = [{"ad_id": "1", "low_impressions": None}, {"ad_id": "2", "low_impressions": None}, {"ad_id": "3", "low_impressions": None}]
         n = meta_ads.apply_card_badges(ads, {"1": True, "2": False})

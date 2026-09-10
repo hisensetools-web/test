@@ -375,6 +375,10 @@ def post_payload(session: requests.Session, url: str, payload: dict, retries: in
             if r.status_code != 200:
                 raise SheetsSyncError(f"HTTP {r.status_code} from {r.url}: {r.text.strip()[:200]!r}")
             text = r.text.strip()
+            if text.lower() == "ok":
+                # doGet's health-check text: Google served the deployment's GET reply instead of the POST's
+                # one-time response (seen once in a while mid-sync); a fresh POST gets the real answer
+                raise _Retryable("got the script's health-check text ('ok') instead of the POST reply (transient)")
             if not text.startswith("{"):
                 raise SheetsSyncError(_explain_non_json(text, r.status_code))
             data = json.loads(text)

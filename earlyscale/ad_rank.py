@@ -79,27 +79,87 @@ def record_ranks(conn: sqlite3.Connection, store_id: int, today: str, sorted_ads
     return {"ranked": len(ids), **cmp}
 
 
+def _confirmed_country(conn: sqlite3.Connection, store_id: int, today: str, within_days: int = 7) -> str | None:
+    """The country view whose sort was found informative for this store within the last `within_days` days."""
+    r = conn.execute("SELECT country, snapshot_date FROM rank_checks WHERE store_id = ? AND informative = 1 AND country IS NOT NULL "
+                     "ORDER BY snapshot_date DESC LIMIT 1", (store_id,)).fetchone()
+    if not r:
+        return None
+    try:
+        return r["country"] if (date.fromisoformat(today) - date.fromisoformat(r["snapshot_date"])).days <= within_days else None
+    except ValueError:
+        return None
+
+
+def _newest_ids(store: dict, country: str, browser, max_scrolls: int | None) -> list[str]:
+    """Newest-first order of the same country view: the only valid baseline for that view's impressions sort."""
+    query = store.get("meta_page_name") or store["store_domain"].split("//")[-1]
+    url = meta_ads.build_search_url(query=None if store.get("meta_page_id") else query, page_id=store.get("meta_page_id") or None,
+                                    country=country)
+    res = meta_ads.scrape_page(url, max_scrolls=max_scrolls or config.META_RANK_SCROLLS, browser=browser)
+    if res.blocked:
+        raise meta_ads.MetaBlocked(res.note)
+    return [a["ad_id"] for a in res.ads]
+
+
 def scrape_ranks(conn: sqlite3.Connection, browser, store: dict, store_id: int, today: str, default_ids: list[str],
                  max_scrolls: int | None = None, countries: list[str] | None = None) -> dict:
-    """Run the impressions-sorted search for one store and record ranks + the comparison with the default order.
-    Meta ignores the sort in the worldwide view for most commercial ads (impressions are only published for EU
-    delivery), so when the order comes back identical the search is repeated per country in META_RANK_COUNTRIES
-    (EU views) and the first informative one is kept."""
-    countries = countries or config.META_RANK_COUNTRIES
-    last = None
+    """Run the impressions-sorted search for one store and record ranks + the comparison with the newest-first order
+    OF THE SAME VIEW. Meta ignores the sort in the worldwide view for most commercial ads (impressions are only
+    published for EU delivery), so the views in META_RANK_COUNTRIES are tried in turn: `default_ids` (the day's
+    worldwide newest-first list) is the baseline for ALL; an EU view gets its own newest-first scrape as baseline
+    (skipped when that view was confirmed informative within the last 7 days). A view with 0 ads is skipped, not
+    treated as the answer. The first informative view is kept; rank_checks.note records what every view returned."""
+    countries = list(countries or config.META_RANK_COUNTRIES)
+    confirmed = _confirmed_country(conn, store_id, today)
+    if confirmed in countries:
+        countries.remove(confirmed)
+        countries.insert(0, confirmed)
+    query = store.get("meta_page_name") or store["store_domain"].split("//")[-1]
+    notes: list[str] = []
+    last: dict | None = None
+    first = True
     for country in countries:
+        if not first:
+            meta_ads._wait()
+        first = False
         url, query = rank_url(store, country)
         res = meta_ads.scrape_page(url, max_scrolls=max_scrolls or config.META_RANK_SCROLLS, browser=browser)
         if res.blocked:
             raise meta_ads.MetaBlocked(res.note)
-        out = record_ranks(conn, store_id, today, res.ads, query, default_ids)
+        if not res.ads:
+            notes.append(f"{country}: 0 ads")
+            continue
+        if country == "ALL":
+            baseline: list[str] | None = list(default_ids)
+        elif country == confirmed:
+            baseline = None          # confirmed informative this week: rank without re-scraping the baseline
+        else:
+            meta_ads._wait()
+            baseline = _newest_ids(store, country, browser, max_scrolls)
+        out = record_ranks(conn, store_id, today, res.ads, query, baseline)
+        if baseline is None:
+            out["informative"] = True
+            with conn:
+                conn.execute("UPDATE rank_checks SET informative = 1 WHERE store_id = ? AND snapshot_date = ?", (store_id, today))
+                conn.execute("UPDATE stores SET sort_informative = 1, rank_checked_at = ? WHERE id = ?", (today, store_id))
+            notes.append(f"{country}: {len(res.ads)} ads, informative (confirmed earlier this week)")
+        else:
+            notes.append(f"{country}: {len(res.ads)} ads, {out['same_position']}/{out['n']} in the same position as that view's newest-first"
+                         f" -> {'informative' if out['informative'] else 'same order'}")
         out["note"], out["country"] = res.note, country
-        conn.execute("UPDATE rank_checks SET country = ? WHERE store_id = ? AND snapshot_date = ?", (country, store_id, today))
-        conn.commit()
         last = out
-        if out["informative"] or not res.ads:
+        if out["informative"]:
             break
-        meta_ads._wait()
+    if last is None:
+        # no view returned an ad: leave sort_informative untouched, record the attempt
+        record_ranks(conn, store_id, today, [], query, None)
+        last = {"ranked": 0, "n": 0, "identical": False, "overlap": 0, "same_position": 0, "informative": None, "note": "", "country": None}
+    summary = "; ".join(notes) or "no view returned an ad"
+    with conn:
+        conn.execute("UPDATE rank_checks SET country = ?, note = ? WHERE store_id = ? AND snapshot_date = ?",
+                     (last["country"], summary, store_id, today))
+    last["summary"] = (f"{last['ranked']} ads ranked from the {last['country']} view; " if last["country"] else "") + summary
     return last
 
 
