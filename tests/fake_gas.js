@@ -82,7 +82,7 @@ const spreadsheet = {
   moveActiveSheet: pos => { const i = order.indexOf(active); if (i < 0) throw new Error("no active sheet"); order.splice(i, 1); order.splice(pos - 1, 0, active); },
 };
 // ------------------------------------------------ fake Docs / Drive (the diag doc)
-const docs = {}; let docSeq = 0;
+const docs = {}; const props = {}; let docSeq = 0;
 class Doc {
   constructor(name) { this.id = "doc" + (++docSeq); this.name = name; this.text = ""; docs[this.id] = this; }
   getId() { return this.id; }
@@ -92,8 +92,9 @@ class Doc {
 }
 const sandbox = {
   SpreadsheetApp: { getActiveSpreadsheet: () => spreadsheet },
-  DriveApp: { getFilesByName: n => { const hits = Object.values(docs).filter(d => d.name === n); let i = 0; return { hasNext: () => i < hits.length, next: () => hits[i++] }; } },
   DocumentApp: { create: n => new Doc(n), openById: id => { if (!docs[id]) throw new Error("no such doc " + id); return docs[id]; } },
+  PropertiesService: { getScriptProperties: () => ({ getProperty: k => props[k] === undefined ? null : props[k], setProperty(k, v) { props[k] = String(v); return this; } }) },
+  Logger: { log: () => {} },
   ContentService: {
     MimeType: { JSON: "application/json", TEXT: "text/plain" },
     createTextOutput: t => { const o = { content: t, mime: "text/plain" }; o.setMimeType = m => { o.mime = m; return o; }; o.getContent = () => o.content; return o; },

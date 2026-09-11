@@ -829,8 +829,10 @@ ranks stored, landing-page resolver versions, applied migrations), the rank verd
 with their notes, one line per store (platform, last catalogue status, latest ads snapshot with active /
 badge-known / low / resolved counts, last error), and for the last 4 log files every ERROR / WARNING /
 Traceback line plus the last 30 lines. Size-capped by `OPS_DIAG_CHARS` (250k). `--print` shows it,
-`--no-push` only writes `logs/diag.txt`. The first deployment of a Code.gs with `writeDiag_` asks for the
-Docs and Drive permissions once.
+`--no-push` only writes `logs/diag.txt`. The web app needs the Google Docs permission once: in the Apps
+Script editor pick `authorizeDiag` in the function dropdown, Run, accept the prompt, then deploy a new version
+(a web app only holds the permissions its owner granted; a new version alone does not ask). The doc's id is
+kept in the script properties, so no Drive permission is needed.
 
 ## Scheduling (Windows)
 

@@ -149,17 +149,33 @@ function doPost(e) {
 // ---------------------------------------------------------------- helpers
 
 /** `python tracker.py diag`: the diagnostics report goes into a Google Doc named "EarlyScale Diag" in My Drive
- *  (created on first use, replaced on every push) so it can be read without pasting anything. Needs the Docs and
- *  Drive scopes: the first deployment after adding this asks for them. */
+ *  (created on first use, its id remembered in the script properties, replaced on every push) so it can be read
+ *  without pasting anything. Needs the Google Docs permission ONCE: in the Apps Script editor pick the function
+ *  `authorizeDiag` in the toolbar dropdown, click Run, accept the prompt, then Deploy > Manage deployments >
+ *  Edit > New version. (A web app only holds the permissions granted when its owner ran / authorized it.) */
 function writeDiag_(text) {
-  var name = "EarlyScale Diag";
-  var files = DriveApp.getFilesByName(name);
-  var doc = files.hasNext() ? DocumentApp.openById(files.next().getId()) : DocumentApp.create(name);
+  var props = PropertiesService.getScriptProperties();
+  var id = props.getProperty("diagDocId");
+  var doc = null;
+  if (id) {
+    try { doc = DocumentApp.openById(id); } catch (err) { doc = null; }   // deleted by hand: create a new one
+  }
+  if (!doc) {
+    doc = DocumentApp.create("EarlyScale Diag");
+    props.setProperty("diagDocId", doc.getId());
+  }
   var body = doc.getBody();
   body.clear();
   body.setText(text);
   doc.saveAndClose();
   return { ok: true, doc: doc.getUrl(), chars: text.length };
+}
+
+/** Run this once from the editor (dropdown > authorizeDiag > Run) to grant the Docs permission the web app needs. */
+function authorizeDiag() {
+  var r = writeDiag_("EarlyScale Diag: authorized on " + new Date().toISOString() + ". The tracker replaces this text on every push.");
+  Logger.log("ok: " + r.doc);
+  return r.doc;
 }
 
 function getOrCreateSheet_(name, spec) {
