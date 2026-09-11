@@ -118,6 +118,19 @@ def collect_diag(conn: sqlite3.Connection, notes: list[str] | None = None, max_c
         ads_txt = f"{ad[0]} {ad[1]} {ad[2] or 0} {ad[3] or 0} {ad[4] or 0}" if ad and ad[0] else "-"
         add(f"{s[1]} | {s[2] or '?'} | {(sr[0] + ' ' + sr[1]) if sr else '-'} | {ads_txt} | {((sr[2] or '') if sr else '')[:70]}")
     add("")
+    add("== landers -> product (latest snapshot; the attribution behind Signals, busiest first) ==")
+    try:
+        from urllib.parse import urlparse
+        for r in conn.execute("""SELECT s.store_domain, a.landing_url, a.product_handle, COUNT(*) n
+                                 FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id JOIN stores s ON s.id = a.store_id
+                                 WHERE d.is_active = 1 AND a.landing_url IS NOT NULL AND a.landing_url NOT LIKE '%/products/%'
+                                   AND d.snapshot_date = (SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = a.store_id)
+                                 GROUP BY s.store_domain, a.landing_url, a.product_handle ORDER BY n DESC LIMIT 80"""):
+            u = urlparse(r[1])
+            add(f"{r[0]:<26} {r[3]:>4} ads  {(u.netloc + u.path)[:70]:<70} -> {r[2] or '(unresolved)'}")
+    except Exception as e:  # noqa: BLE001
+        add(f"(lander section failed: {e})")
+    add("")
     add("== logs ==")
     logs_dir = ROOT / "logs"
     logs = sorted(logs_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)[:4] if logs_dir.exists() else []

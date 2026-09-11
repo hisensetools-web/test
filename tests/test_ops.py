@@ -24,8 +24,10 @@ class DiagContentTests(unittest.TestCase):
         conn.execute("INSERT INTO rank_checks (snapshot_date, store_id, informative, country, n_sorted, note) VALUES ('2026-09-10', ?, 0, 'ALL', 40, 'ALL: 40 ads [sort control: sort control not found (seen: nothing)]')", (sid,))
         conn.commit()
         text = ops.collect_diag(conn, ["after run_daily.bat day (exit code 0)"])
-        for section in ("== EarlyScale diag", "== scheduled tasks ==", "== database ==", "== rank verdicts", "== stores ==", "== logs =="):
+        for section in ("== EarlyScale diag", "== scheduled tasks ==", "== database ==", "== rank verdicts", "== stores ==", "== landers", "== logs =="):
             self.assertIn(section, text)
+        self.assertIn("elivorahealth.com/pages/prostate", text)
+        self.assertIn("-> elivora-prostate-urinary-support-softgels", text)
         self.assertIn("note: after run_daily.bat day", text)
         self.assertIn("elivorahealth.com | ? | - | 2026-09-10 1 1 0 1 |", text)
         self.assertIn("sort control not found", text)
