@@ -178,3 +178,16 @@ class RowBuilderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CategoriesUndatedTests(unittest.TestCase):
+    def test_a_category_with_no_dated_family_sorts_without_crashing(self):
+        # 2026-09-11: the morning sync died in the sort key ("<" between str and int) once new stores arrived whose
+        # catalogue carries no published dates
+        from earlyscale import signals
+        fams = [["a.com", "gummy", "Gummy", 1, "", "", 0, 0, 0, 1, "gummy"],
+                ["b.com", "gummy", "Gummy", 1, "2026-09-01T00:00:00Z", "", 1, 1, 1, 1, "gummy"],
+                ["c.com", "zzz-thing", "Thing", 1, "", "", 0, 0, 0, 1, "zzz-thing"]]
+        rows = signals.categories_rows(fams)
+        self.assertTrue(rows)
+        self.assertTrue(all(isinstance(r[3], str) for r in rows))

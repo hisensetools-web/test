@@ -351,5 +351,10 @@ def categories_rows(family_rows: list[list]) -> list[list]:
         newest = max((m["newest"] for m in members if m["newest"]), default="")
         rows.append([name, len(stores), len(members), newest, sum(m["n7"] for m in members),
                      ", ".join(stores[:8]), ", ".join(sorted({m["family"] for m in members})[:8])])
-    rows.sort(key=lambda r: (r[0] == "(uncategorised)", -r[1], -r[2], r[3] and -int(r[3][:4]), r[0]))
+    def year(v):   # newest published year, 0 when no family has a date (new stores with an undated catalogue)
+        try:
+            return -int(v[:4]) if v else 0
+        except (TypeError, ValueError):
+            return 0
+    rows.sort(key=lambda r: (r[0] == "(uncategorised)", -r[1], -r[2], year(r[3]), r[0]))
     return rows
