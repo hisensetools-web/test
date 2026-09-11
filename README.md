@@ -973,12 +973,24 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
 - Pagination stops on an empty page, a short page, a repeated page (some themes ignore
   `page=`), or after 60 pages.
 - A configurable pause (`REQUEST_DELAY_S`, default 1s) sits between requests to the same store.
+- **The laptop must not sleep during the night pass.** `KeepAwake` asks Windows not to sleep while a pass runs,
+  but a closed lid or a battery power plan overrides it: one pass showed a 3-minute store taking 381 minutes and
+  only 18 stores done in 8 hours. Settings > System > Power & battery > Screen and sleep: "When plugged in, put my
+  device to sleep after: Never"; Control Panel > Power Options > "Choose what closing the lid does": Do nothing
+  (plugged in). Time lost to sleep is given back to the budget, and `META_STOP_AT` (08:30, set by run_daily.bat)
+  ends the pass before the morning task regardless.
+- Two watchlist entries that share one Meta page (luma.viture.com, beast.viture.com and viture.com all advertise
+  as "VITURE") record the same ads under whichever was scraped last, and the other's counts drop to 0 (the pass
+  warns "already recorded today under another watchlist store"). Keep one domain per advertiser:
+  `python tracker.py remove-store luma.viture.com beast.viture.com`.
 - A missed 22:00 start (laptop asleep) that Task Scheduler catches up between 07:00 and 20:00 is skipped by
   `run_daily.bat meta` (logged), so the 8-hour night pass never runs on top of the morning task; tonight's start
   does it. A Chromium crash mid-pass ("Target crashed") is followed by a fresh browser for the next store.
-- Night pass budget: `META_MAX_SCROLLS` (20, ~350 ads: the newest come first) and `META_DETAIL_MAX` (15 single-ad
-  pages) per store keep one store under ~4 minutes so a 119-store watchlist fits one 8-hour night; the old 40 / 30
-  covered about 50 stores a night. Stores are still ordered least-recently-scraped first.
+- Night pass budget: `META_MAX_SCROLLS` (20, ~350 ads: the newest come first), `META_DETAIL_MAX` (8 single-ad
+  pages; the badge now carries delivery) and the impression-rank pass off (`META_RANK=0`: it cost ~3 minutes per
+  store for an order that stayed newest-first, see the rank section) keep one store near 3 minutes, so a 150-store
+  watchlist fits the 22:00-08:30 window (`META_NIGHT_MINUTES` 600, `META_STOP_AT` 08:30). Stores are ordered
+  least-recently-scraped first.
 - **The Sheets web app is unreachable** (DNS failure, no network): the GET is retried twice, then the sync
   reports `sheets sync failed: cannot reach the Apps Script web app` and exits 3. The snapshot is already in
   the database; the next sync pushes it. No traceback.

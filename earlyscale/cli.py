@@ -9,7 +9,7 @@ import re
 import sqlite3
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from rich.console import Console
@@ -471,6 +471,19 @@ def cmd_set_page(args) -> int:
     return 0
 
 
+def _stop_at_clock(hhmm: str, now: datetime | None = None) -> datetime | None:
+    """META_STOP_AT ('08:30') as the next occurrence of that local time (today if still ahead, else tomorrow)."""
+    if not hhmm:
+        return None
+    try:
+        h, m = (int(x) for x in hhmm.split(":"))
+    except ValueError:
+        return None
+    now = now or datetime.now()
+    t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return t if t > now else t + timedelta(days=1)
+
+
 def plan_meta_stores(conn, stores: list[dict], only: set[str] | None = None, scope: list[str] | None = None) -> list[dict]:
     """Stores for today's Meta pass: --only, else META_STORES if set, else all; least recently
     scraped first (never scraped first) so a watchlist bigger than the daily budget rotates."""
@@ -501,16 +514,18 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
     stores = plan_meta_stores(conn, stores, only)
     budget = (config.META_MAX_MINUTES if max_minutes is None else max_minutes) * 60
     deadline = time.monotonic() + budget
+    stop_at = _stop_at_clock(config.META_STOP_AT)
     ok = failed = 0
     session = shopify.make_session()   # for landing-page fetches
     with sync_playwright() as p, meta_ads.KeepAwake():
         handle = meta_ads.BrowserHandle(p, headless=headless)
         try:
             for i, s in enumerate(stores):
-                if time.monotonic() > deadline:
+                if time.monotonic() > deadline or (stop_at and datetime.now() >= stop_at):
                     left = [x["store_domain"] for x in stores[i:]]
-                    log.warning("Meta pass budget of %.0f min spent: %d store(s) deferred to the next run (%s%s)",
-                                budget / 60, len(left), ", ".join(left[:5]), ", ..." if len(left) > 5 else "")
+                    log.warning("Meta pass %s: %d store(s) deferred to the next run (%s%s)",
+                                f"stop time {config.META_STOP_AT} reached" if stop_at and datetime.now() >= stop_at else f"budget of {budget / 60:.0f} min spent",
+                                len(left), ", ".join(left[:5]), ", ..." if len(left) > 5 else "")
                     break
                 browser = handle.get()   # relaunched if the previous store killed it
                 domain = s["store_domain"]
@@ -573,8 +588,10 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                         handle.close()
                 took = time.monotonic() - t0
                 if took > 25 * 60:
-                    log.warning("%-28s took %.0f min for one store; the machine probably slept part of the way (the budget clock kept running)",
-                                domain, took / 60)
+                    # the machine slept: give the lost time back to the budget (the stop time, if set, still holds)
+                    deadline += took - 25 * 60
+                    log.warning("%-28s took %.0f min for one store; the machine probably slept part of the way (%.0f min given back to the budget)",
+                                domain, took / 60, (took - 25 * 60) / 60)
                 if i < len(stores) - 1:
                     meta_ads._wait()
         finally:

@@ -198,3 +198,14 @@ class LandingRefreshAllTests(unittest.TestCase):
             self.assertFalse(ad_metrics.POLITE_LANDING_FETCH)   # restored
             conn.close()
         srv.shutdown()
+
+
+class StopAtTests(unittest.TestCase):
+    def test_stop_time_is_the_next_occurrence(self):
+        from datetime import datetime
+        night = datetime(2026, 9, 11, 22, 5)
+        self.assertEqual(cli._stop_at_clock("08:30", night), datetime(2026, 9, 12, 8, 30))
+        morning = datetime(2026, 9, 12, 7, 0)
+        self.assertEqual(cli._stop_at_clock("08:30", morning), datetime(2026, 9, 12, 8, 30))
+        self.assertIsNone(cli._stop_at_clock("", night))
+        self.assertIsNone(cli._stop_at_clock("nope", night))

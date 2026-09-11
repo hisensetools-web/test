@@ -668,3 +668,22 @@ class NoLockAcrossFetchTests(unittest.TestCase):
             resolved, _, fetched = ad_metrics.resolve_store_landings(conn, sid, "supp.com", "2026-09-10", session=object())
         self.assertEqual((resolved, fetched, len(seen)), (4, 4, 4))
         self.assertEqual(seen, [False] * 4)
+
+
+class SharedConceptTests(unittest.TestCase):
+    def test_same_ads_under_two_watchlist_stores_do_not_crash_the_metrics(self):
+        """luma.viture.com / viture.com share one page: the second store's concepts collide on (day, concept_id)."""
+        conn = db.connect(":memory:")
+        a = db.upsert_store(conn, "luma.viture.com"); b = db.upsert_store(conn, "viture.com")
+        for sid in (a, b):
+            db.write_product_snapshot(conn, sid, "2026-09-11", [_prod(1, "glasses", "G")])
+        ads = [_ad("v1", "VITURE", "2026-09-01", "https://viture.com/products/glasses", "copy"),
+               _ad("v2", "VITURE", "2026-09-01", "https://viture.com/products/glasses", "copy")]
+        meta_ads.record_scrape(conn, a, "2026-09-11", ads, "VITURE")
+        ad_metrics.process_store(conn, a, "luma.viture.com", "2026-09-11", None, fetch_landings=False)
+        meta_ads.record_scrape(conn, b, "2026-09-11", ads, "VITURE")
+        out = ad_metrics.process_store(conn, b, "viture.com", "2026-09-11", None, fetch_landings=False)   # used to raise UNIQUE constraint failed
+        self.assertIsInstance(out, dict)
+        # and a second pass over the first store on the same day (a re-run) overwrites its own concept rows quietly
+        out = ad_metrics.process_store(conn, a, "luma.viture.com", "2026-09-11", None, fetch_landings=False)
+        self.assertIsInstance(out, dict)

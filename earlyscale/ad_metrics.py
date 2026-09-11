@@ -639,7 +639,7 @@ def write_concept_rows(conn: sqlite3.Connection, store_id: int, today: str) -> i
         launch = min((m["ad_start_date"] or m["first_seen_date"]) for m in members)
         m0 = members[0]
         conn.execute(
-            """INSERT INTO meta_concepts_daily
+            """INSERT OR REPLACE INTO meta_concepts_daily
                (snapshot_date, store_id, concept_id, page_name, landing_url, product_handle, page_handle, launch_date,
                 days_running, ads_ever, ads_active, ads_delivering, survival, survival_source)
                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
