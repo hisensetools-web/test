@@ -566,6 +566,11 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                                              time.monotonic() - t0)
                     log.error("%-28s FAILED: %s", domain, e)
                     failed += 1
+                    if meta_ads.browser_closed_error(e):
+                        # a heavy page took Chromium down ("Target crashed"); is_connected() can still say yes for a
+                        # moment, so drop the handle explicitly and the next store gets a fresh browser
+                        log.warning("%-28s browser crashed; relaunching for the next store", domain)
+                        handle.close()
                 took = time.monotonic() - t0
                 if took > 25 * 60:
                     log.warning("%-28s took %.0f min for one store; the machine probably slept part of the way (the budget clock kept running)",

@@ -35,6 +35,14 @@ if not defined PY (
 for /f %%v in ('%PY% -c "import sys; print(sys.version.split()[0])"') do set PYVER=%%v
 
 echo ==== %DATE% %TIME% start %MODE% (%PY% = Python %PYVER%) >> "%LOG%"
+REM A night start that Task Scheduler missed (laptop asleep at 22:00) is re-run "as soon as possible", which can be
+REM the next morning, on top of the 09:00 task. The night pass is 8 h of browser time: skip it between 07:00 and
+REM 20:00 and let tonight's start do it.
+for /f %%h in ('powershell -NoProfile -Command "(Get-Date).Hour"') do set HOUR=%%h
+if /i "%MODE%"=="meta" if %HOUR% GEQ 7 if %HOUR% LSS 20 (
+  echo ==== %DATE% %TIME% night start missed and caught up at %HOUR%:00 - skipped, tonight's start will run it >> "%LOG%"
+  endlocal & exit /b 0
+)
 if /i "%MODE%"=="meta" (
   %PY% tracker.py ads --max-minutes %META_NIGHT_MINUTES% >> "%LOG%" 2>&1
   set RC=!ERRORLEVEL!

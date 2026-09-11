@@ -973,6 +973,9 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
 - Pagination stops on an empty page, a short page, a repeated page (some themes ignore
   `page=`), or after 60 pages.
 - A configurable pause (`REQUEST_DELAY_S`, default 1s) sits between requests to the same store.
+- A missed 22:00 start (laptop asleep) that Task Scheduler catches up between 07:00 and 20:00 is skipped by
+  `run_daily.bat meta` (logged), so the 8-hour night pass never runs on top of the morning task; tonight's start
+  does it. A Chromium crash mid-pass ("Target crashed") is followed by a fresh browser for the next store.
 - Night pass budget: `META_MAX_SCROLLS` (20, ~350 ads: the newest come first) and `META_DETAIL_MAX` (15 single-ad
   pages) per store keep one store under ~4 minutes so a 119-store watchlist fits one 8-hour night; the old 40 / 30
   covered about 50 stores a night. Stores are still ordered least-recently-scraped first.
