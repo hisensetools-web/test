@@ -8,30 +8,26 @@ import unittest
 import urllib.request
 from pathlib import Path
 
-from earlyscale import config, db, meta_ads, ops
-from tests.test_ad_metrics import _ad, _prod
+from earlyscale import db, meta_ads, ops
+from tests.test_winners import ad, prod
 
 
 class DiagContentTests(unittest.TestCase):
     def test_report_has_every_section_and_per_store_lines(self):
         conn = db.connect(":memory:")
         sid = db.upsert_store(conn, "elivorahealth.com", "Elivora")
-        db.write_product_snapshot(conn, sid, "2026-09-10", [_prod(1, "elivora-prostate-urinary-support-softgels", "P")])
-        ads = [_ad("1001", "Elivora", "2026-09-01", "https://elivorahealth.com/pages/prostate", "t")]
+        db.write_product_snapshot(conn, sid, "2026-09-10", [prod(1, "elivora-prostate-urinary-support-softgels", "P", "2026-08-01")])
+        ads = [ad(str(i), "Elivora", "2026-09-01", "https://elivorahealth.com/pages/prostate") for i in range(4)] + \
+              [ad("9", "Elivora", "2026-09-01", "https://elivorahealth.com/pages/prostate", low=None)]
         meta_ads.record_scrape(conn, sid, "2026-09-10", ads, "Elivora")
-        conn.execute("UPDATE meta_ads SET product_handle = 'elivora-prostate-urinary-support-softgels'")
-        conn.execute("UPDATE meta_ads_daily SET low_impressions = 0")
-        conn.execute("INSERT INTO rank_checks (snapshot_date, store_id, informative, country, n_sorted, note) VALUES ('2026-09-10', ?, 0, 'ALL', 40, 'ALL: 40 ads [sort control: sort control not found (seen: nothing)]')", (sid,))
         conn.commit()
         text = ops.collect_diag(conn, ["after run_daily.bat day (exit code 0)"])
-        for section in ("== EarlyScale diag", "== scheduled tasks ==", "== database ==", "== rank verdicts", "== stores ==", "== landers", "== logs =="):
+        for section in ("== EarlyScale diag", "== scheduled tasks ==", "== database ==", "== stores ==", "== winners", "== logs =="):
             self.assertIn(section, text)
-        self.assertIn("elivorahealth.com/pages/prostate", text)
-        self.assertIn("-> elivora-prostate-urinary-support-softgels", text)
         self.assertIn("note: after run_daily.bat day", text)
-        self.assertIn("elivorahealth.com | ? | - | 2026-09-10 1 1 0 1 |", text)
-        self.assertIn("sort control not found", text)
-        self.assertIn("META_RANK=", text)
+        self.assertIn("elivorahealth.com | ? | - | - | 2026-09-10 5 4 1 1 |", text)      # active 5, delivering 4, badge unknown 1, one URL >= 3
+        self.assertIn("elivorahealth.com | elivorahealth.com/pages/prostate | 4 |", text)
+        self.assertIn("META_MAX_SCROLLS=", text)
         self.assertLess(len(ops.collect_diag(conn, max_chars=500)), 560)
 
 

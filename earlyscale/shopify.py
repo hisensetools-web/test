@@ -1,4 +1,4 @@
-"""Shopify storefront fetcher (public, unauthenticated) and product normaliser.
+"""Shopify storefront fetcher (public, unauthenticated: /products.json) and product normaliser.
 
 Network and parsing are separated so the parsing/normalising half can be tested
 against fixture JSON without a network.
@@ -212,35 +212,15 @@ def fetch_all_pages(session: requests.Session, url: str) -> tuple[list[dict], in
     return products, pages
 
 
-def fetch_store(store_domain: str, session: requests.Session | None = None) -> tuple[list[dict], dict[int, int], int]:
-    """Fetch /products.json and /collections/all/products.json for one store.
-    Returns (raw_products, {product_id: collection_position}, pages_fetched).
-    The collection fetch is best-effort: failure there still yields products."""
+def fetch_store(store_domain: str, session: requests.Session | None = None) -> tuple[list[dict], int]:
+    """Fetch /products.json for one store. Returns (raw_products, pages_fetched)."""
     session = session or make_session()
     base = resolve_base_url(session, store_domain)
     raw, pages = fetch_all_pages(session, f"{base}/products.json")
-    pages += 1  # the resolve probe
-    positions: dict[int, int] = {}
-    try:
-        _polite_pause()
-        coll, coll_pages = fetch_all_pages(session, f"{base}/collections/all/products.json")
-        pages += coll_pages
-        positions = {p["id"]: i for i, p in enumerate(coll) if "id" in p}
-    except (StoreFetchError, requests.RequestException) as e:
-        log.warning("%s: collections/all failed (%s); positions left NULL", store_domain, e)
-    return raw, positions, pages
+    return raw, pages + 1  # + the resolve probe
 
 
 # ---------------------------------------------------------------- parsing (pure)
-
-def _to_float(v) -> float | None:
-    if v is None or v == "":
-        return None
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
 
 def _tags(v) -> list[str]:
     if isinstance(v, list):
@@ -250,22 +230,8 @@ def _tags(v) -> list[str]:
     return []
 
 
-def normalise_product(p: dict, collection_position: int | None = None) -> dict:
-    """Flatten one products.json record into the columns we store."""
-    variants = []
-    for v in p.get("variants") or []:
-        variants.append({
-            "variant_id": int(v["id"]),
-            "title": v.get("title"),
-            "sku": v.get("sku") or None,
-            "price": _to_float(v.get("price")),
-            "compare_at_price": _to_float(v.get("compare_at_price")),
-            "available": bool(v.get("available", False)),
-            # only some stores expose these in products.json; the .js product endpoint fills them in for hero variants
-            "inventory_management": v.get("inventory_management") or None,
-            "inventory_policy": v.get("inventory_policy") or None,
-        })
-    prices = [v["price"] for v in variants if v["price"] is not None]
+def normalise_product(p: dict) -> dict:
+    """The columns kept per product: id, handle, title, the dates (+ vendor / type / tags for Radar's query building)."""
     return {
         "product_id": int(p["id"]),
         "handle": p["handle"],
@@ -276,23 +242,18 @@ def normalise_product(p: dict, collection_position: int | None = None) -> dict:
         "created_at": p.get("created_at"),
         "published_at": p.get("published_at"),
         "updated_at": p.get("updated_at"),
-        "variant_count": len(variants),
-        "sold_out_variants": sum(1 for v in variants if not v["available"]),
-        "min_price": min(prices) if prices else None,
-        "max_price": max(prices) if prices else None,
-        "collection_position": collection_position,
-        "variants": variants,
+        "url_path": f"/products/{p['handle']}",
+        "variant_count": len(p.get("variants") or []),
     }
 
 
-def normalise_products(raw: list[dict], positions: dict[int, int] | None = None) -> list[dict]:
-    positions = positions or {}
+def normalise_products(raw: list[dict]) -> list[dict]:
     out = []
     for p in raw:
         if "id" not in p or not p.get("handle"):
             log.warning("skipping malformed product record: %r", {k: p.get(k) for k in ("id", "handle", "title")})
             continue
-        out.append(normalise_product(p, positions.get(p["id"])))
+        out.append(normalise_product(p))
     return out
 
 

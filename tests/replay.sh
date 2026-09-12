@@ -1,17 +1,16 @@
 #!/usr/bin/env bash
 # Two-day offline replay of the scheduled sequence (morning: run --no-ads; night: ads, radar, sync-sheets) against
 # the fakes: mock Shopify stores, the fake Ad Library (Playwright + local Chromium) and the real Code.gs inside
-# tests/fake_gas.js (node). Day 1 = 2026-09-03, day 2 = 2026-09-10 (mutated catalogues, ads a week older), so every
-# delta and week-over-week column is exercised. Linux / macOS / WSL.
+# tests/fake_gas.js (node). Day 1 = 2026-09-03, day 2 = 2026-09-10 (mutated catalogues, ads a week older), so the
+# week-over-week columns of the Winners tab are exercised. Linux / macOS / WSL.
 #
 #   bash tests/replay.sh            # ~5 min; prints each step's exit code, then the sheet-vs-database table
 #   META_CHROMIUM_PATH=/path/to/chrome bash tests/replay.sh   # if Playwright's Chromium is not installed
 set -u
 cd "$(dirname "$0")/.."
-WORK=${REPLAY_DIR:-$(mktemp -d)}
+WORK=${REPLAY_DIR:-$(mktemp -d)}; mkdir -p "$WORK"
 export TRACKER_DB=$WORK/tracker.db SHEETS_WEBHOOK_URL=http://127.0.0.1:8090/exec META_AD_LIBRARY_BASE=http://127.0.0.1:8095/ads/library/
-export META_WAIT_MIN=0.2 META_WAIT_MAX=0.5 INVENTORY_WAIT_MIN=0.2 INVENTORY_WAIT_MAX=0.5 META_DETAIL_MAX=5
-export INVENTORY_STORES=http://127.0.0.1:8001 RADAR_WEB_SEARCH=0 RADAR_MAX_MINUTES=2 ALERTS_DIR=$WORK/alerts
+export META_WAIT_MIN=0.2 META_WAIT_MAX=0.5 RADAR_WEB_SEARCH=0 RADAR_MAX_MINUTES=2
 WL=tests/watchlist.mock.csv
 PIDS=()
 cleanup() { for p in "${PIDS[@]}"; do kill "$p" 2>/dev/null; done; }
@@ -50,7 +49,8 @@ for DAY in 1 2; do
   stop_stores
 done
 kill $GAS 2>/dev/null
-echo "--- day 2 sync verification:"; grep -A14 "sheet vs database" "$WORK/day2_sync-sheets.log" | tail -13
+echo "--- day 2 sync verification:"; grep -A8 "sheet vs database" "$WORK/day2_sync-sheets.log" | tail -7
+echo "--- day 2 winners:"; TRACKER_DB=$WORK/tracker.db python tracker.py report --date 2026-09-10 2>/dev/null | head -20
 echo "--- tracebacks / errors in any log:"; grep -l "Traceback\|ERROR" "$WORK"/day*.log || echo none
 echo "logs in $WORK"
 exit $FAIL

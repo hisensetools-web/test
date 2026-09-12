@@ -1,11 +1,8 @@
 # Shopify Early-Scaling Tracker
 
-Detects Shopify products in their first weeks of paid-social scaling by snapshotting
-leading signals daily and alerting on week-over-week deltas. Full spec: [CLAUDE.md](CLAUDE.md).
-
-**Status: build steps 1–2 of 6, Sheets sync, Part A, Part B** — `products.json` fetcher, SQLite schema, daily snapshot,
-delta calculations and the `report` / `product` commands. Meta Ad Library (step 3),
-landing-URL join (4), alerts (5) and the full cron/README pass (6) are not built yet.
+Finds landing URLs whose paid-social delivery is growing week over week, before traffic tools can see them.
+Six data points a day, one derived table, one sheet tab that matters. Spec: [CLAUDE.md](CLAUDE.md); the day-to-day
+command sheet for Windows: [COMMANDS.md](COMMANDS.md).
 
 ## PDP cloner (`pdp.py`)
 
@@ -74,650 +71,162 @@ prompts), `upload --handle x` / `--product-id N` (attach to an existing product)
 `--dry-run` on `generate` and `upload`. A starter template is in `templates/pdp_template.example.md`.
 Tests: `python -m unittest tests.test_pdpkit tests.test_pdpkit_shopify tests.test_pdpkit_higgsfield_cli`.
 
+## What is collected
+
+Once per day per watchlist store, and nothing else:
+
+| data point | source | stored in |
+|---|---|---|
+| per ad: `ad_archive_id`, `page_name`, `page_id`, landing URL (raw and normalised to host + path without query string), `first_seen` (the Ad Library's start date), `still_active` (in today's active search), `low_impressions` (the "Low impression count" badge on the card, true/false) | Meta Ad Library, public page, headless Chromium | `ads`, `ads_daily` |
+| per store: `shop_id` and myshopify handle | storefront HTML, once | `stores` |
+| per product: `id`, `handle`, `title`, `created_at`, `published_at` | `products.json` (other platforms: their adapter) | `products_daily` |
+
+There is no product resolution: the landing URL is the key. A `/pages/prostate` advertorial is a row of its own,
+never attributed to a product by guessing which product the page links to.
+
 ## Setup
 
 ```bash
-python3.11 -m venv .venv && source .venv/bin/activate
+python3.11 -m venv .venv && source .venv/bin/activate     # Windows: py -3 -m venv .venv; .venv\Scripts\activate
 pip install -r requirements.txt
-cp .env.example .env          # optional; nothing is required for step 1
+python -m playwright install chromium
+cp .env.example .env          # SHEETS_WEBHOOK_URL for the sheet; everything else optional
 python tracker.py init-db     # creates data/tracker.db
 ```
+
+`watchlist.csv` ships with three test stores. Add yours with `python tracker.py add-store somestore.com` (finds the
+Facebook page link in the storefront footer; `find-page` searches the Ad Library when there is none) or drop a list
+into `radar/imports/`.
+
+**Updating from the previous version:** the first command after `git pull` converts `data/tracker.db` to the new
+layout (ads and their daily rows are kept, the tables of the deleted signals are dropped, the file is compacted; a
+few minutes for a 1.4 GB file, once). Then paste `sheets/Code.gs` again and deploy a new version.
 
 ## Daily run
 
 ```bash
-python tracker.py run                 # snapshot every store in watchlist.csv for today
-python tracker.py run --only gymshark.com
-python tracker.py run --date 2026-09-05   # backfill/replace a specific day
-python tracker.py status              # recent runs + per-store summary
+python tracker.py run                    # catalogues + shop ids for every store, then a Sheets sync (~10 min for 150 stores)
+python tracker.py ads --max-minutes 480  # Ad Library pass, least recently scraped store first, within the budget (~3 min per store)
+python tracker.py radar                  # store discovery (Sundays: weekly sweeps, then triage)
+python tracker.py sync-sheets            # Winners / Stores / Candidates -> the Google Sheet, with a row-count check
 ```
 
-Start running this daily as soon as it works for you. Week-over-week metrics need
-at least 7–14 days of history before they mean anything.
+`run --ads` (or `META_ADS=1`) chains the Meta pass after the catalogues. Every pass writes as it goes; Ctrl+C keeps
+what is done and the next run continues from the database (`ads` picks the stores it has not scraped for longest).
 
-## Report
+## The Winners tab
+
+One row per landing URL with at least 3 delivering ads in the store's latest scrape, from `url_daily`:
+
+| column | meaning |
+|---|---|
+| `store`, `landing_url` | the watchlist store and the normalised URL (host + path, lower-case, no query string) |
+| `delivering` | active ads on the URL whose card shows no "Low impression count" badge. An ad whose card never rendered (badge unknown) is not delivering: a smaller number, never a wrong one |
+| `delivering_7d_ago` | the same from the scrape 6-8 days earlier (blank without one) |
+| `delivering_wow` | `delivering / delivering_7d_ago`; `new` when it was 0 a week ago; blank without history. The tab sorts on it (`new` first, blank last), then on `delivering` |
+| `proven_days` | age of the oldest still-delivering ad on the URL |
+| `pages`, `pages_new_7d` | distinct Facebook pages with a delivering ad on the URL; those whose first delivering ad here is under 7 days old |
+| `top_page` | the page with the most delivering ads |
+| `family_age_days` | only for `/products/<handle>` URLs: days since the oldest `created_at` in the product family. Blank for landers |
+| `store_age_days` | from `shop_id` through `calibration/shop_ids.csv` (see below); blank without a calibration |
+| `ads_as_of` | the scrape date the row comes from |
+
+**Product families.** Merchants duplicate a product for every channel (`glow-serum`, `glow-serum-copy`,
+`glow-serum-1`, `glow-serum-otp`, `glow-serum-es`). Handles on a store are grouped by product id where one product
+carried several handles over time, else by the handle or the normalised title with those suffixes stripped; the
+family's age is the oldest `created_at` in it, so a fresh duplicate of an old product does not read as a new product.
+
+**Store age.** Shopify shop ids are sequential. `calibration/shop_ids.csv` (columns `shop_id,created_date`; not in
+the repo) holds stores whose creation date is known; every store's date is interpolated from it and from the earliest
+product `created_at` of the stores in the database (a store exists before its first product). Without the file the
+column stays blank.
+
+Terminal views of the same data:
 
 ```bash
-python tracker.py report                 # stores sorted by change score, then product-level changes
-python tracker.py report --date 2026-09-05 --top 20 --changes 100
-python tracker.py product <handle>       # time series for one handle (add --store domain to narrow)
+python tracker.py report                                  # the Winners tab
+python tracker.py url https://elivorahealth.com/pages/prostate   # one URL: delivering per day + the ads behind it, badge per ad
+python tracker.py status                                  # per store: products, ads, delivering, winners, last status
+python tracker.py rebuild                                 # recompute url_daily from the stored ads (no scraping)
 ```
-
-Per store the report shows:
-
-| column | needs | meaning |
-|---|---|---|
-| `new 7d` | 1 day | products whose `published_at` is within the 7 days ending on the snapshot date (UTC) |
-| `upd 7d` | 1 day | same, for `updated_at` |
-| `sold-out` | 1 day | variants with `available: false` today |
-| `Δ sold-out` | 2 days | change in that count vs the previous snapshot |
-| `price Δ` | 2 days | variants whose price differs from the previous snapshot (new variants don't count) |
-| `+handles` / `-handles` | 2 days | products that appeared / disappeared from products.json |
-| `score` | — | `new 7d + |Δ sold-out| + price Δ + +handles + -handles`, the sort key. `upd 7d` is excluded on purpose: inventory apps touch every product daily, so it equals the catalogue size on most stores |
-
-"Previous snapshot" is the store's most recent earlier snapshot, not calendar yesterday, so
-a missed day doesn't break the comparison. With one day of history the 2-day columns show
-`n/a` and the `vs` column says `1 day`. The product changes table lists new handles,
-sold-out / restocked products (with `(ALL)` when every variant is gone), price changes and
-removed handles, ordered by store score.
-
-**Freshness on the Signals tab.** `published_at` resets every time a product is unpublished and
-republished; `created_at` never does. Signals carries both: `days_since_published` / `published_at` and
-`days_since_created` / `created_at`. When the two differ by more than 30 days the row is flagged
-`relaunch` (an old product put back on sale, not a new one), and the youngest-first ordering uses
-`created_at`. Holior's wormwood, created in April and republished in August, reads as 5 months old
-with `relaunch`, not 26 days old.
 
 ## Google Sheets sync
 
-Pushes the latest snapshot and the report numbers into a Google Sheet through a Google
-Apps Script **web app**. No Google Cloud project, no service account, no API keys: you paste
-one file into the Apps Script editor and copy one URL back. The code you paste is
-[`sheets/Code.gs`](sheets/Code.gs).
+Pushes the three tabs into a Google Sheet through a Google Apps Script **web app**. No Google Cloud project, no
+service account, no API keys: you paste one file into the Apps Script editor and copy one URL back. The code you
+paste is [`sheets/Code.gs`](sheets/Code.gs).
 
 ### One-time setup (about 5 minutes)
 
 1. **Create the spreadsheet.** Go to <https://sheets.new>, name it e.g. *Shopify Tracker*.
 2. **Open the script editor from inside that sheet.** Menu *Extensions* > *Apps Script*.
-   A new tab opens with a file called `Code.gs` containing an empty `myFunction`.
-3. **Replace its contents.** Select everything in the editor (Ctrl+A), delete it, then
-   paste the entire contents of `sheets/Code.gs` from this repo. Click the disk icon
-   (or Ctrl+S) to save. Don't run anything.
-4. **Deploy it as a web app.** Click the blue **Deploy** button (top right) > **New
-   deployment**. Click the gear next to *Select type* and choose **Web app**. Fill in:
-   - Description: anything, e.g. `tracker`
-   - **Execute as: Me**
-   - **Who has access: Anyone**  (this is what lets the tracker POST without logging in)
-
-   Click **Deploy**. Google asks you to authorise: pick your account, click *Advanced* >
-   *Go to ... (unsafe)* if it warns the app is unverified (it is your own script), then *Allow*.
-5. **Copy the Web app URL.** It ends in `/exec`. Click *Copy*, then *Done*.
-6. **Put the URL in `.env`.** In the project folder copy `.env.example` to `.env` if you
-   have not already, and set:
-
-   ```
-   SHEETS_WEBHOOK_URL=https://script.google.com/macros/s/AKfy.../exec
-   ```
-
-   `.env` is listed in `.gitignore`, so the URL never reaches GitHub. Anyone who has the
-   URL can write to your sheet, so treat it like a password.
+3. **Replace its contents.** Select everything in the editor (Ctrl+A), delete it, then paste the entire contents of
+   `sheets/Code.gs` from this repo. Ctrl+S to save.
+4. **Deploy it as a web app.** **Deploy** > **New deployment** > gear > **Web app**: *Execute as: Me*,
+   *Who has access: Anyone*. Deploy, authorise (Advanced > Go to ... (unsafe) > Allow: it is your own script).
+5. **Copy the Web app URL** (ends in `/exec`) into `.env` as `SHEETS_WEBHOOK_URL=...`. Anyone who has the URL can
+   write to your sheet, so treat it like a password.
+6. **Once, for the diagnostics doc:** in the editor's function dropdown pick `authorizeDiag`, click Run, accept the
+   prompt, then Deploy > Manage deployments > pencil > New version.
 
 ### Test it
 
 ```bash
 python tracker.py sync-sheets --dry-run     # shows what would be sent, sends nothing
-python tracker.py sync-sheets               # sends it
+python tracker.py sync-sheets               # sends it, then compares the sheet's row counts with the database
 ```
-
-Open the /exec URL in a browser: it should show the word `ok`. After a sync the sheet has
-three tabs, each with a bold frozen header row:
 
 | tab | rows | behaviour |
 |---|---|---|
-| **Signals** | one per product (latest snapshot) | overwritten every sync; `ads_as_of` (the date of the ad snapshot the row's Meta numbers come from) sits right after the handle, because rows from different nights must not be compared as if they were the same day; sorted by `ads_launched_7d` desc, then `ads_pointing_here` desc, then youngest product first. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then the Meta columns (`ads_pointing_here`, `ads_launched_7d`, `ads_launched_prev_7d`, `ad_velocity_wow` = launches this week / last week, `ads_as_of` = the date of the scrape those numbers come from, engagement, days running, concept status) and the six inventory columns (`signal_source`, `inventory_tracked`, `stock_level`, `units_sold_1d`, `units_per_day_7d`, `units_per_day_wow`) filled by the stock probe |
-| **Ads** | one per active ad (latest snapshot, delivering first, newest first, 100 per store) | overwritten; page name, ad id, started, days running, delivering, low_impressions, impression_rank, landing_path, resolved_product, primary text (120 chars): the attribution behind every Signals number |
-| **Families** | one per product family per store | overwritten; a family = handles sharing a base name or normalised title. Handle count, newest/oldest published_at, launches in 7/14/30 days, best rank, handle list. Sorted by 7-day launches |
-| **Categories** | one per keyword category | overwritten; categories are title unigrams/bigrams shared by 2+ stores (nothing hardcoded), with store/family counts and newest publish date. Families with no shared keyword fall into `(uncategorised)` |
-| **Stores** | one per store in watchlist.csv | fully overwritten every sync, sorted by change score |
-| **Products** | one per product, every watched store, latest snapshot | the **full current catalogue**, rewritten every sync (no per-store cap). History is not in the sheet: `python tracker.py product <handle>` reads it from the DB |
-| **Alerts** | one per alert | appended; duplicates (date + store + handle + rule + detail) skipped |
+| **Winners** | one per landing URL with >= 3 delivering ads | rewritten every sync; columns and sort as above |
+| **Stores** | one per store in watchlist.csv | store, shop_id, store_age_days, products, ads_as_of, last error |
+| **Candidates** | one per Radar domain (candidates first) | rewritten after the `promote` column has been read back |
 
-From then on `python tracker.py run` syncs automatically at the end whenever
-`SHEETS_WEBHOOK_URL` is set (use `--no-sync` to skip). `run_daily.bat` needs no change: the
-tracker reads `.env` itself. Exit code 3 means the run succeeded but the sync failed.
-
-### Early tab and the header contract
-
-**Early** is Signals filtered to products created in the last 90 days (`EARLY_MAX_AGE_DAYS`) with at least
-one ad or launch this week, youngest by `created_at` first, with the columns that matter for an early call.
-Signals itself is never capped; Early exists so a reader that only takes the first rows of a tab still
-sees the early products instead of the biggest launchers.
-
-Every sync first asks the deployed `Code.gs` (`?tabs=1`) which headers it writes and refuses to send rows
-when they differ from this code's columns, naming the tabs, so a stale deployment can no longer put prices
-under `days_since_created`. An old deployment that does not report headers only gets a warning.
-
-### Checking the sheet holds everything
-
-Every sync ends by reading row counts back from the sheet and comparing them with the database,
-per tab and, for Products, per store. A mismatch is printed and the command exits 3. To check
-without sending anything:
-
-A retried chunk is never sent twice by accident: when Google loses the reply to a POST (its response
-host answers a 404 page, a redirect loop, or the plain `ok` health check), the sync first asks the sheet
-how many rows the tab holds; if the chunk is already there it moves on instead of re-sending it. Before
-this, every lost reply on a replace-mode tab added its rows a second time (967 duplicate Candidates rows
-from 8 retries in one sync).
-
-```bash
-python tracker.py sync-sheets --verify-only
-```
-
-This needs the current `Code.gs` (its `doGet` answers `?tabs=1` and `?tab=Products&group=1`);
-an older deployment answers plain `ok` and the check says so. Two things the sync now does
-that older versions did not: it grows the sheet's grid before writing (Apps Script throws for a
-range past the grid, and a new sheet has 1000 rows, so a big catalogue used to stop part-way),
-and Products is rewritten in full each time instead of appended, so it no longer grows by a
-whole catalogue per day.
+Every sync first asks the deployed `Code.gs` which headers it writes and refuses to send rows when they differ
+from this code's columns (a stale deployment would put every value under the wrong header); it ends by reading the
+row counts back and exits 3 on a mismatch (a mismatched tab is pushed again once). One sync at a time per database
+(`data/sync.lock`). A retried chunk is never sent twice by accident: when Google loses the reply to a POST, the sync
+first asks the sheet how many rows the tab holds.
 
 ### After updating Code.gs
 
-Whenever this repo's `sheets/Code.gs` changes (new tabs, new columns), paste the new file
-over the old one in the Apps Script editor, save, then Deploy > **Manage deployments** >
-pencil icon > Version: **New version** > Deploy. The URL stays the same. Tabs that already
-exist keep their data; new tabs are created on the next sync.
+Paste the new file over the old one in the Apps Script editor, save, then Deploy > **Manage deployments** > pencil >
+Version: **New version** > Deploy. The URL stays the same.
 
 ### If something goes wrong
 
-- **"Apps Script returned a web page instead of JSON"** - the deployment is not set to
-  *Anyone*, or you pasted the wrong URL (it must be the `/exec` one).
-- **You edited Code.gs and nothing changed** - a web app serves the *deployed version*.
-  Deploy > *Manage deployments* > pencil icon > Version: *New version* > Deploy.
-- **"unknown tab"** or another Apps Script error - the message comes straight from the
-  script; check the paste was complete.
-- **Sheet getting big** - Products grows by (products across all stores) rows per day.
-  Google Sheets caps a file at 10 million cells (about 1 million Products rows). Delete
-  old rows from the Products tab when needed; the SQLite database keeps full history.
+- **"Apps Script returned a web page instead of JSON"**: the deployment is not set to *Anyone*, or the URL is not the `/exec` one.
+- **You edited Code.gs and nothing changed**: a web app serves the *deployed version*; deploy a new version.
+- **"the deployed Code.gs writes different columns"**: paste and deploy the current `Code.gs`, then sync again.
 - Advanced: `SHEETS_CHUNK_BYTES` (default 40000) sets the payload size per POST.
 
-## Meta Ad Library (Part B)
+## Meta Ad Library pass
 
-`python tracker.py ads` opens the public Ad Library in headless Chromium, one browser, one
-page at a time, with random 3-8 s pauses between scrolls and a rotating desktop
-User-Agent. Instead of scraping the obfuscated page markup it captures the GraphQL
-responses the page itself loads while scrolling; those carry structured ad records
-(archive id, page, start date, active flag, primary text, headline, landing URL,
-creative type and asset, EU reach). A recursive extractor finds ad records wherever Meta
-nests them, so wrapper changes don't break it. Expect to maintain this anyway.
+`python tracker.py ads` opens the public Ad Library in headless Chromium, one browser, one store at a time, with a
+random 3-8 s pause between scrolls and stores. It searches the store's Meta page name (`watchlist.csv`; the domain
+when none is set) for active ads, scrolls `META_MAX_SCROLLS` (20, about 350 newest ads) times and captures the
+GraphQL responses the page loads: ad id, page, start date, landing link. The "Low impression count" badge is not in
+those payloads; it is read off every rendered result card (before each scroll and at the end), so an ad whose card
+was never on screen keeps an unknown badge and is not counted as delivering.
 
-**Setup once**
+Per store and day the pass writes `ads_daily` (still_active, low_impressions), marks ads of earlier days that did
+not come back as `still_active = 0`, and derives that day's `url_daily` rows. Stores are taken least recently
+scraped first within `--max-minutes` (the night task: `META_NIGHT_MINUTES` 600, hard stop at `META_STOP_AT` 08:30),
+so a watchlist bigger than one night rotates. A login wall stops the pass (logged as `blocked`); a store whose page
+crashes Chromium is logged and the next store gets a fresh browser.
 
-```bash
-pip install -r requirements.txt
-python -m playwright install chromium
-```
-
-**Try one page first** (search is by `meta_page_name` from watchlist.csv when set,
-`meta_page_id` if you have it, else by store domain as a keyword search):
-
-```bash
-python tracker.py ads --only somestore.com          # add --headed to watch the browser
-python tracker.py ads-report --store somestore.com  # per-page status + raw ad rows
-```
-
-`ads-report` shows, per ad: id, page, start date, days running, active Y/N, creative
-type, headline, primary text, landing URL, fingerprint (hash of creative asset + text),
-EU reach. Send that table back before enabling more stores.
-
-**What happens after each page is scraped** (also runnable on its own with
-`python tracker.py ads-metrics`, no browser needed):
-
-1. **Landing URL to product.** `/products/<handle>` on the store's domain matches
-   products.json directly (channel-suffixed handles match exactly; unknown suffixes fall back
-   to the longest known prefix). An advertised handle that is a live product page but absent
-   from products.json (offer / subscription variants are often published this way) is fetched
-   as `/products/<handle>.json` and recorded in `products_daily` with `unlisted = 1`, so it
-   gets its own Signals row (channel tag ends in `unlisted`), joins its family by title, and
-   the ads pointing at it are counted against it rather than folded into the listed product. `/pages/<x>` advertorials and other URLs are fetched once a
-   week and their buy links, `/cart/add` variant ids and embedded product JSON are read; the
-   best-supported known handle wins. Advertorials with no product link keep `page_handle`
-   and a blank product. Fetch results are cached in `landing_pages`.
-2. **Concepts.** Same page + same landing URL (sans query) + launch dates chaining within
-   1 day = one concept. Per day: ads ever, ads active, survival = active / ever, days running.
-3. **Lineage.** An ad whose Meta start date is within 7 days, whose headline+text is more
-   than 70% similar (word-trigram Jaccard) to an ad 14+ days old on the same page, is linked
-   to that ad.
-   **Page relevance.** A domain keyword search also returns unrelated advertisers. Any page
-   none of whose ads land on the store (or resolve to a product) is marked ignored in
-   `meta_pages_daily`; its ads stay in the database but are left out of concepts, lineage,
-   alerts and the Signals counts. `ads-report` lists ignored pages.
-4. **Per-ad daily metrics.** `days_running`, and `engagement`, `engagement_delta`,
-   `engagement_per_day` (7-day average) when engagement counts exist, which the Ad Library
-   does not provide, so these stay empty.
-5. **Alerts** (rules 5-7, appended to the `alerts` table, `alerts/YYYY-MM-DD.md`, and the
-   Alerts tab on the next sync):
-   - 5: `engagement_per_day` at least 2x its value a week earlier on a single ad.
-   - 6: a concept with every ad still active after 14+ days while the page's number of
-     active concepts fell versus a week earlier.
-   - 8: EU reach slope doubled week over week on one ad (see below).
-   - 7: new ads with lineage to an ad running 20+ days, one alert per (page, parent ad)
-     with the count, on the day they are first seen. A store launching 40 copies of one
-     proven ad yields one line.
-6. **Signals tab Meta columns:** `ads_pointing_here` (active ads resolved to that handle),
-   `engagement_per_day` (average, empty without engagement data), `days_running_max`,
-   `concept_status` (e.g. `2/3 concepts alive, intact 27d`).
-
-`ads-report` prints per-page status, products ranked by active ads pointing at them (with
-how they were resolved), the raw advertised handles (channel-suffixed handles that are not
-in products.json show "no" and which product they were resolved to), the landing pages
-that were fetched and what handles were found on them (unresolved first, so you can see
-why an advertorial did not map), concepts, lineage grouped by parent ad, and today's
-alerts; `--raw` adds the per-ad rows.
-
-**Reach curve and boosted-post comments (Part B, increment 3)**
-
-- Every ad's exact EU/EEA reach (`eu_total_reach`), exact UK reach when the country
-  breakdown carries a GB row, and any reach *range* (lower/upper bound) are stored per ad per
-  day. `reach_delta_1d` is the day-over-day change; `reach_slope_7d` is reach per day over the
-  last 7 days and `reach_slope_prev_7d` the 7 days before. Reach is cumulative in the
-  library, so the slope is the closest public proxy for daily budget, for any advertiser that
-  also delivers to the EU.
-- Rule 8: an ad's 7-day reach slope is at least 2x its prior-7-day slope (total reach at
-  least `META_REACH_MIN`, default 1000). Needs 14 days of snapshots.
-- Ads whose payload exposes an underlying Page or Instagram post get `engagement_type =
-  boosted` and `post_url`; the post is opened once a day in the browser (up to
-  `META_MAX_POSTS` per store) to read comment / reaction / share counts, from which
-  `comment_delta_1d` follows. Everything else is `dark`: blank is expected, not an error.
-  `post_status` records ok / login-wall / no-counts per day.
-- `python tracker.py ads-coverage` shows per store how measurable the ads are: % with exact
-  EU reach, % UK exact, % range only, % boosted, % of boosted posts whose counts were read,
-  % dark, plus which reach-related keys the raw payloads carried (so the parser can be
-  adjusted if Meta renames them). `ads-metrics --posts` re-derives everything from the stored
-  payloads and fetches posts without re-scraping.
-- Signals tab gains `eu_reach_slope_7d` and `comment_delta_1d` (summed over the active ads
-  pointing at each product).
-
-**Tables:** `meta_ads` (one row per ad ever seen, first/last seen dates, texts, links,
-copy fingerprint, product/page handle, concept id, lineage), `meta_ads_daily` (one row per
-ad per day; an ad that stops appearing in the active search gets an `is_active = 0` row
-that day, which is how disappearance is tracked), `meta_concepts_daily`, `landing_pages`,
-`meta_page_runs` (status per page per run: ok / blocked / error).
-
-**Sizing.** A store costs about 12 minutes (up to 80 scrolls, landing pages, 60 single-ad pages),
-so the pass cannot cover a 100-store watchlist daily. Two controls in `.env`: `META_STORES=a.com,b.com`
-limits the pass to those stores (default: every watchlist store), and `META_MAX_MINUTES` (90) is a
-wall-clock budget for the whole pass; stores are taken least-recently-scraped first, so a watchlist
-larger than the budget rotates through over several days and the run prints which stores were
-deferred. Per store, at most `META_MAX_LANDING_FETCH` (40) advertorial / redirect pages are fetched
-per run and `META_CREATIVES_PER_AD` (4) creatives are hashed per ad.
-
-**Daily run:** the Shopify pass never depends on Meta. Set `META_ADS=1` in `.env` (or pass
-`--ads`) and `python tracker.py run` scrapes after the Shopify pass, before the Sheets
-sync; a blocked or failing page is logged in `meta_page_runs` and the run continues.
-If Meta serves a login wall the pass stops for the day rather than hammering it.
-
-**Known limits**
-
-- Reactions / comments / shares are not exposed by the Ad Library. The columns exist and
-  stay empty unless a payload happens to carry them; the engagement-based metrics in the
-  spec will need another source.
-- The GraphQL payload shape is based on the library's current responses and was verified
-  offline against a local stand-in (`tests/fake_ad_library.py`), not against Meta from the
-  build environment. The first real run is the real test.
-- The concept, lineage and alert rules need a few days of snapshots before they say much:
-  rule 6 compares against a week earlier, rule 7 needs an ad older than 20 days on record.
-- If Playwright cannot download its browser, point `META_CHROMIUM_PATH` in `.env` at an
-  installed Chromium/Chrome binary.
-
-## Meta layer part 2: delivery, page likes, creatives, and feed-post engagement
-
-### A. Single-ad Ad Library pages (public, no login)
-
-`facebook.com/ads/library/?id={ad_archive_id}` embeds the ad record in the HTML (`data-sjs`
-script blocks, under `deeplink_ad_archive_result.deeplink_ad_archive`). There is no post id in
-it and the tracker does not look for one. The daily `ads` pass (and `python tracker.py ads-detail`)
-opens these pages headlessly for up to `META_DETAIL_MAX` (60) ads per store per day, most
-valuable first: ads named by an alert, ads started in the last 14 days, one ad per page (for the
-page-likes reading), then the rest; an ad already switched off is re-read weekly. The search
-results payload also carries `end_date` and `page_like_count`, so every scraped ad gets a free
-`list` reading each day and the single-ad page adds a `detail` reading (which wins).
-
-| field | stored as | derived |
-|---|---|---|
-| `end_date` | `meta_ad_detail_daily.end_date`, `meta_ads.last_delivered` | `delivery_status` = on while it advances; **off** when it has not moved for 2+ days (or lies 2+ days back), with `switched_off_date` = the last day it delivered. Concept survival (`ads_delivering / ads_ever`, rule 6, Signals `concept_status`) uses delivery whenever a concept has it, search presence otherwise |
-| `page_like_count` | `meta_page_likes_daily` (one row per page per day) | `likes_delta_1d`, `likes_slope_7d`, `likes_slope_prev_7d`; **rule 12** fires when the 7-day slope is at least twice the prior week's (and the prior week was at least `META_LIKES_MIN_SLOPE` likes/day) |
-| `snapshot.images[].original_image_url`, video URLs | `meta_creatives` (sha256 of the file, videos capped at `META_CREATIVE_MAX_BYTES`) and `meta_ads.creative_hash` | lineage by creative: a later ad on the same page with the same hash gets `lineage_of` the earliest one, `lineage_via = creative`, so image-only iterations are caught alongside the text-similarity lineage |
-| `page_profile_uri` id, `page_categories` | `meta_ads.page_profile_id`, `page_categories` (JSON) | shown in the reports |
-
-```bash
-python tracker.py ads-detail --only biorootlabs.com        # fetch now (default cap 60 per store)
-python tracker.py ads-detail --ads 1234567890123 ...       # one ad, prints what was parsed
-python tracker.py ads-detail-report --store biorootlabs.com --days 3
-```
-
-Single-ad pages are opened in a *light* browser context (images, media, fonts, stylesheets and
-external scripts are aborted: the record is in the server-rendered HTML; `META_DETAIL_LIGHT=0`
-turns that off), the context is recycled every `META_DETAIL_CONTEXT_PAGES` (20) pages, and a
-Chromium that dies mid-pass is relaunched and the ad retried once, so one heavy page cannot
-take the remaining stores down with it.
-
-`ads-detail-report` lists, for the ads named by that store's alerts (or `--ads`), the
-`end_date` read on each day (`L` = list payload), delivery status, last delivered and off-since
-dates, and lineage; then `page_like_count` per page per day with the deltas and slopes; then
-coverage (ads read, delivering, off, creatives hashed, lineage by creative).
-
-### B. Engagement on Sponsored posts: captured by hand, counted logged-out
-
-Dark ads carry reactions / comments / shares only as feed posts. The tracker does **not** drive
-a logged-in Facebook account for this (automating an account, throwaway or not, inside a
-logged-in session is exactly what Meta's terms forbid and litigate). Instead:
-
-1. **You capture.** When you see a Sponsored post from a watchlist brand in your own feed, open
-   it by hand (click its timestamp so the permalink is in the address bar) and either run
-   `python tracker.py fb-capture <permalink> --page "Brand" --text "the ad copy" --store brand.com`
-   or click the bookmarklet in `tools/fb_capture_bookmarklet.js` (it copies a JSON capture with the
-   permalink, page, selected text and visible counts to the clipboard) and run
-   `python tracker.py fb-capture --paste`. `--file` takes JSON lines or one URL per line.
-   Posts are deduped on `post_id`.
-2. **The tracker counts.** `python tracker.py fb-engagement` (and the daily `run`, once any post
-   is captured) opens every known permalink in a fresh, logged-out browser context and records
-   the public reaction / comment / share counts in `fb_posts_daily`, deriving `comment_delta_1d`
-   and `engagement_per_day_7d`. A permalink behind a login wall is marked `gated`, a dead one
-   `removed`; both are skipped afterwards.
-3. **Join.** A post is matched to an Ad Library ad on the same page (id, else name) when the
-   normalised primary text is at least 0.8 similar (word trigrams) or the creative hash matches.
-   The ad row gets `post_id` / `post_permalink`, its `meta_ads_daily` row gets the counts, and
-   `engagement_per_day` reaches the Signals tab through the existing product join (rule 5 sees it too).
-
-**Hands-free capture: the browser observer.** `tools/fb_observer/` is a small Chrome extension
-(Load unpacked at `chrome://extensions` with Developer mode on). It never scrolls, clicks or
-navigates: while *you* browse Facebook normally in that browser, it notices every Sponsored post
-Facebook renders, reads it off the page (page, permalink, copy, landing URL, visible counts) and
-sends it to `python tracker.py fb-listen` (a listener on 127.0.0.1:8765). If the listener is not
-running the captures wait in the extension and are sent the next time it is, or you export them
-from the extension popup and run `fb-capture --file captures.json`. From then on the daily run
-counts each permalink logged-out. `python tracker.py fb-bait` opens the watchlist stores' hero
-product pages in your default browser so you can add to cart by hand, which is what makes those
-brands' ads appear in your feed within a day or two.
-
-```bash
-python tracker.py fb-listen        # leave running while you browse; Ctrl+C when done
-python tracker.py fb-bait          # open hero product pages to seed retargeting (add to cart yourself)
-python tracker.py fb-report        # captured posts, matches, count history
-```
-
-The observer's extraction code is exercised by `tests/test_fb_observer.py`, which loads
-`content.js` into real Chromium against a fake feed and checks both ways Facebook marks an ad, the
-timestamp link whose href only appears on hover, the `l.facebook.com` landing redirect, the counts,
-posts scrolled in after load, and that nothing is captured twice. Facebook's markup still changes
-without notice, so the popup shows the last capture it made: that is the thing to paste when a
-field comes back empty.
-
-Each capture's creative is downloaded once and hashed, which groups repeats of the same creative
-across sessions. It rarely matches an Ad Library `creative_hash` outright, because Facebook
-re-encodes a different rendition for the feed, so the post-to-ad join is carried by text
-similarity in practice.
-
-**Daily run:** with `META_ADS=1` the scheduled `run` now does: Shopify pass -> stock probe -> Ad
-Library search scrape -> single-ad pages (A) -> boosted-post counts -> captured-post counts (B)
--> Sheets sync. Nothing in `run_daily.bat` changes. Budget: the single-ad pages add roughly
-`META_DETAIL_MAX` x 4 s per store per day.
-
-## Inventory-delta sales tracking (store-side demand signal)
-
-Traffic tools see a store weeks late and the Ad Library gives no reach for US/UK advertisers,
-so the demand signal is read off the store itself: how fast its stock goes down.
-
-**Which variants can be counted.** Shopify exposes `inventory_management` per variant on the
-storefront `.js` product object (`/products/<handle>.js`; a few stores also carry it in `products.json`),
-and `inventory_policy` where present. The probe reads it once per hero handle and keeps it on
-`hero_variants` and the day's `variants_daily` row:
-
-| value | meaning | what the probe does |
-|---|---|---|
-| `shopify` + `deny` | stock is tracked and selling stops at 0 | rung-1 cart probe reads the count |
-| `shopify` + `continue` | tracked, but oversell allowed | the cart accepts any quantity; theme fallback, else `ads_only` with the reason in the message |
-| `none` (explicit null) | the store does not track this variant | no cart probe at all: theme fallback, else `ads_only` |
-| unknown (field absent) | older stores, `.js` unreachable | probed as before |
-
-A store whose latest `products.json` snapshot shows any variant with `inventory_management=shopify`
-joins the probe pool automatically, alongside `INVENTORY_STORES`.
-
-**Hero variants.** For every store in `INVENTORY_STORES` the daily run selects the top 15
-products of `/collections/all` (best-selling order) plus anything published in the last
-30 days, and skips shipping protection / package protection, warranties, insurance, gift
-cards, memberships, ebooks / digital downloads and $0 items. Every variant of a hero product
-is a hero variant, capped at `INVENTORY_MAX_VARIANTS` (40) per store per day, newest
-products first. A hidden bundle product in `products.json` is treated like any other
-product; when a bundle's own stock is not enforced at the cart and its page lists other
-products' variant ids, those components are probed too (`role = bundle_component`).
-
-**Probe.** Once per day per hero variant: `POST /cart/add.js` with quantity 9999 from a
-fresh session with browser headers. Shopify answers `422 "You can only add N ... to the
-cart"` when inventory is tracked, which is the stock level; `"sold out"` is 0. A `200`
-means the add went through (inventory not enforced), and the orphaned cart is cleared with
-`/cart/clear.js`. Probes are spaced by a random 5-15 s pause. The tracker never opens
-checkout and never creates an order (the mock store's `/checkout` returns 403 and a test
-asserts it is never hit).
-
-One session (one cart) per store: Shopify throttles an IP that keeps creating carts, so the
-product page is opened once per handle and every probe of that store reuses the session.
-A 429 waits `Retry-After` (else `INVENTORY_THROTTLE_WAIT`, 90 s) and retries once; a second
-429 ends the store for the day and its remaining variants are retried tomorrow. The probe
-pass runs right after the Shopify pass, before the Meta pass fetches landing pages.
-
-**Fallback chain**, recorded per reading in `signal_source`:
-
-| rung | when | what is stored |
-|---|---|---|
-| `cart_probe` | 422 with a count or a sold-out message | `stock_level` from the message |
-| `theme_inventory` | add succeeded, but the product page JSON carries `inventory_quantity` for the variant | that number |
-| `ads_only` | neither | `inventory_tracked = 0`; the variant is not probed again, it is only followed via ads |
-| `blocked` | 401/403/429/430/503, redirect or captcha | no reading; retried tomorrow (`consecutive_failures` counts) |
-
-**Derived numbers** (`inventory_daily`): `units_sold_1d` = previous available reading minus
-today's, floored at 0 and compared against the previous *available* reading rather than
-calendar yesterday, so a blocked day does not lose the sales. A rise is a restock: logged in
-`restock_units`, excluded from sales, and the interval containing it is dropped from the
-units/day maths. `units_per_day_7d` and `units_per_day_prev_7d` are units per measured day
-over the last 7 and the 7 before; `units_per_day_wow` is their ratio. The Signals tab sums
-these over a product's hero variants.
-
-**Alerts** (rules 9-11, written to `alerts/YYYY-MM-DD.md` and the Alerts tab):
-
-- 9: published < 30 days ago, `units_per_day_wow` >= 2.0 and `units_per_day_7d` >= 5
-- 10: >= 50 units/day and not in the store's top 10 (`collection_position <= 10`) in the snapshot a week ago
-- 11: stock hit 0 within 14 days of publish
-
-**Commands**
-
-```bash
-python tracker.py inventory                      # probe INVENTORY_STORES now (any date: --date)
-python tracker.py inventory --only a.com b.com   # probe specific stores regardless of .env
-python tracker.py inventory-report [--store a.com] [--days 14] [--raw]
-```
-
-`inventory-probe <store>` does one live probe and prints the HTTP status, the response
-headers that identify a bot wall (`cf-mitigated`, `x-shopify-stage`, redirects) and the body,
-so a store whose readings come back `blocked` can be diagnosed from one paste. After
-`INVENTORY_MAX_BLOCKED` (3) consecutive blocks the rest of that store's variants are recorded
-as blocked without another request, and the store is retried the next day.
-
-`inventory-report` shows, per store, how many hero variants landed on each rung of the
-chain, then one row per hero variant with the raw `stock_level` reading for every day
-(`ads` = not tracked, `blk` = blocked, `-` = no reading), and the inventory alerts.
-
-**Rollout:** set `INVENTORY_STORES=neuro-bella.com,tryorgatics.com,metabolae.com,holior.com` in `.env`
-and the scheduled `python tracker.py run` probes those three after the Shopify pass, before
-the Meta pass and the Sheets sync. `INVENTORY=1` (or `run --inventory`) probes every watchlist store; do that
-only after the readings from the first stores look right. `--no-inventory` skips the pass.
-Budget: about 40 probes x 10 s = 7 minutes per store per day.
+The pass never logs in and never touches a store's cart or checkout. Two watchlist entries that share one Facebook
+page (luma.viture.com and viture.com both advertising as "VITURE") each get the same ads recorded under their own
+store; keep one domain per advertiser to avoid double rows on the Winners tab.
 
 ## Every storefront platform, not only Shopify
 
-`earlyscale/platforms.py` detects what a store runs on and reads its catalogue with a matching adapter.
-Every adapter returns the same product rows Shopify does, so snapshots, deltas, Signals, the landing
-join, the inventory pass and Radar work the same for all of them. The Stores tab shows the `platform`.
-
-| platform | detected by | catalogue from | dates | stock |
-|---|---|---|---|---|
-| `shopify` | `/products.json` answers | products.json + /collections/all order | created / published | cart probe (rung 1) |
-| `shopify_headless` | `cdn.shopify.com` assets, `<shop>.myshopify.com` in the page | the myshopify.com origin's products.json | created / published | cart probe on that origin |
-| `woocommerce` | `wp-content/plugins/woocommerce` | public Store API `/wp-json/wc/store/v1/products`, popularity order | `wp/v2/product` when the site exposes it | `low_stock_remaining` |
-| `squarespace` | `Static.SQUARESPACE_CONTEXT` | `/shop?format=json` (any commerce collection) | `addedOn` / `publishOn` | `qtyInStock` per variant |
-| `magento` | `Magento_`, `/static/version` | public `/graphql` products query | `created_at` | `only_x_left_in_stock` |
-| `bigcommerce` | `cdn11.bigcommerce.com`, stencil | sitemap + product pages (JSON-LD) | new-products RSS `pubDate` | JSON-LD `inventoryLevel` if present |
-| `wix`, `generic` | `wixstatic.com` / nothing known | sitemap product URLs + product pages (JSON-LD / OpenGraph) | none | JSON-LD `inventoryLevel` if present |
-
-**Dates a platform does not publish** come from `product_first_seen`: the day this tracker first saw
-the product URL. Products already there on a store's first snapshot get `created_at` NULL (unknown age,
-blank `days_since_created`) rather than "0 days", so a newly added store does not look like it launched
-its whole catalogue today. From the second snapshot on, a new URL is a new product.
-
-**Generic stores are read gradually.** The sitemap gives every product URL at once; product pages are
-read `CATALOGUE_MAX_PAGES` (60) per run, unread ones first, then pages older than
-`CATALOGUE_REFRESH_DAYS` (3), and cached in `product_pages`. Until a page has been read its row carries
-the slug as title and no price, so ads can already attach to it. The detected platform is trusted for
-`CATALOGUE_REDETECT_DAYS` (14); an adapter that fails falls back to the generic sitemap path.
-
-**Inventory:** platforms that publish stock counts feed the inventory pass directly
-(`signal_source=platform_json`, no probe). Non-Shopify stores get no cart probe.
-
-**Landing join:** ad landing URLs resolve to products on `/product/<slug>`, `/shop/p/<slug>`, `/p/<slug>`
-and bare `/<slug>.html` paths, not only `/products/<handle>`.
-
-**Radar** classifies any storefront platform, not only Shopify: the Candidates `type` column carries
-the platform name; `funnel` still means no catalogue found anywhere.
-
-## Delivering ads: the "Low impression count" badge
-
-Active is not delivering. Meta marks ads that are running but barely served with a "Low impression
-count" badge on the card; a product with 15 active ads and 11 badges has 4 ads actually spending.
-
-- The search payload carries no badge field (`ads-fields --grep impression` on 51,000 stored payloads
-  found only the EU `impressions_with_index` block, empty for worldwide views), so the badge is read from
-  the rendered card: after the scroll loop (and every 5 scrolls) the scraper walks every card with a
-  "Library ID" line and records whether its text shows "Low impression count". Stored per ad per day
-  (`meta_ads_daily.low_impressions`: 1 badge, 0 card seen without it, NULL not seen), key
-  `card:Low impression count` on `meta_ads.low_impressions_key`. A payload key containing
-  `low_impression` is still honoured if Meta ever adds one. Ads scraped before this cannot be back-filled:
-  the badge starts with the next Meta pass.
-- **Delivering** = active, no badge, and not switched off per the single-ad page (`delivery_status`). An
-  ad with no badge field counts as delivering.
-- Per product and per store: `ads_delivering`, `ads_low_impressions`, `ads_delivering_7d_ago` (the nearest
-  snapshot on or before 7 days earlier, same rule), `delivering_velocity_wow` (blank when the week-ago
-  snapshot carried no badge data, so an old scrape does not fake a drop), `concepts_delivering`.
-- Concept survival (`meta_concepts_daily.ads_delivering`, `survival_source` = badge / badge+delivery)
-  counts delivering ads only; `concept_status` on Signals follows.
-- **Ranking:** Signals and Early order by `ads_delivering`, then `delivering_velocity_wow`, then
-  `ads_launched_7d` (testing volume, kept as a secondary column), then youngest by `created_at`. Stores
-  carries the store-level `ads_delivering` / `ads_delivering_7d_ago` / `delivering_velocity_wow` / `ads_low_impressions`.
-
-```powershell
-python tracker.py delivering-report --handle calming-diffuser --handle probiotic-kombucha-gummy
-```
-
-prints, per matching product, active ads vs delivering ads, badge counts, the week-ago count and trend,
-concepts alive before (search presence) and after (delivering), and the active ads with their badge.
-
-## Landing page -> product: what the page sells, not what it links to
-
-An ad that lands on `/pages/prostate` is counted for the product that page sells. The tracker fetches the
-lander and weighs every product it names: a buy action with a known variant (`/cart/add` form, `/cart/<variant>:1`
-permalink, a `?variant=` link) weighs 6, a link whose text or class is a call to action ("Order now", "Add to
-cart", `class="btn"`) weighs 4 on top of the link, a plain link or embedded product JSON weighs 1, and links
-inside `<header>`, `<nav>` and `<footer>` are ignored (menus list every product). Before this weighting the
-most-linked product won, and a menu or upsell block could beat the page's own button: elivorahealth.com's
-prostate lander was attributed to a berberine product linked from its upsell instead of the prostate
-softgels behind its Order Now button. Landers cached under the old rule are re-fetched over the next passes.
-
-`python tracker.py landing <url>` shows the evidence table and the pick for any page; `--apply` re-resolves the
-ads landing there right away. `python tracker.py landing --refresh-all` re-fetches every cached lander of every
-watchlist store under the current rules (`REQUEST_DELAY_S` between fetches of one store, `LANDING_REFRESH_WORKERS`
-(4) stores in parallel) and re-resolves the ads in one pass, printing per store how many ads changed product; run
-`sync-sheets` afterwards. It only resolves landings (concepts and daily metrics are recomputed by the next Meta
-pass), pages already resolved under the current rules are skipped so an interrupted run resumes, and `--force`
-re-fetches everything. Budget: about 2 s per landing page per store, four stores at a time. The **Ads** tab lists, per store,
-the active ads of the latest snapshot (delivering first, newest first, `SHEETS_ADS_PER_STORE` = 100 per store)
-with page name, ad id, started, days running, delivering, low_impressions, impression_rank, landing_path,
-resolved_product and the first 120 characters of the primary text, so attribution can be checked by eye. Signals shows the ad's own path in `landing_paths`, so a prostate funnel that
-sells a product with an unrelated handle still reads as prostate.
-
-## Impression rank: where an ad sits when sorted "Impressions: high to low"
-
-**How the sort is applied.** Meta's web app ignores `sort_data[...]` in the URL: with each country view
-compared against its own newest-first list, the URL-sorted search came back in exactly the newest-first
-order for every store and view tried (20/20 ids in the same position). So the scrape now chooses
-"Impressions: high to low" in the page's own sort control after the first load (`META_RANK_UI=1`: a native
-`<select>` with an option mentioning impressions, else a button / combobox mentioning sort or newest whose
-menu has such an entry) and collects the re-sorted results. What the control did is recorded in
-`rank_checks.note` (`[sort control: select option 'Impressions: high to low']`, or `sort control not found
-(seen: ...)` listing the controls on the page so the selectors can be adjusted). When the control is not
-found the other country views are not tried. Ranks recorded before this (URL sort, wrong baseline) were
-newest-first positions and were cleared once (`schema_migrations`); `ads_in_top5` / `best_rank` only show
-for a store with a real informative verdict, so until `rank-check` confirms the control works on the live
-page those columns stay blank and the Signals / Early ranking falls through to the delivering signal.
-
-The second per-ad delivery signal. Every Meta pass runs the store's search a second time with the
-impressions sort (`sort_data[mode]=total_impressions`, `META_RANK_SCROLLS` (8) scrolls, top ranks only)
-and stores each ad's 1-based position as `meta_ads_daily.impression_rank` for the day.
-
-**Is the sort informative?** For every store the sorted order is compared with the newest-first order of
-the *same view* on the same day (`rank_checks`: first `META_RANK_MIN_COMPARE` (20) ids, how many sit in
-the same position). In the worldwide view Meta ignored the sort for all five stores checked (20/20 ids in
-the same position): impressions are only published for EU delivery. So the views in `META_RANK_COUNTRIES`
-(default `ALL,DE,NL`) are tried in turn. The worldwide view is judged against the day's normal scrape; an EU
-view gets its own newest-first scrape as the baseline (a worldwide list is the wrong baseline: a DE-only
-subset always looks "different" from it). A view that returns 0 ads is skipped, not treated as the answer.
-The first informative view is kept (`rank_checks.country`) and is tried first on later days; while it was
-confirmed within the last 7 days the baseline scrape is skipped, so a confirmed store costs one extra search
-per day. `rank_checks.note` records what every view returned (e.g. `ALL: 150 ads, 20/20 ... -> same order;
-DE: 0 ads; NL: 41 ads, 2/20 ... -> informative`) and the ads log prints the same line per store.
-Identical orders everywhere mean the sort carries no information for that store: `stores.sort_informative`
-= false (shown on the Stores tab), the store is re-checked weekly instead of daily, and its rank columns
-stay blank (a non-informative order is not stored as ranks at all: it is just newest-first, and would put the
-newest ads in the "top 5"). A store whose `meta_page_name` is shorter than 3 characters is searched by
-domain instead, with a warning: a one-letter "name" matches thousands of unrelated pages. Stores judged before the per-view comparison existed are re-judged on the next pass. `python tracker.py rank-check --only a.com b.com c.com d.com e.com` does the comparison for a few
-stores on demand and prints the verdict per store.
-
-Derived per ad: `rank_7d_ago`, `rank_delta_7d` (negative = climbing), `top5_days` (days the ad held a
-top-5 rank). Per product on Signals / Early: `ads_in_top5`, `best_rank`, `best_rank_delta_7d`.
-
-**Ranking on Signals and Early:** `ads_in_top5` (desc), `best_rank_delta_7d` (climbing first), then
-`delivering_velocity_wow` and `ads_delivering`, then `ads_launched_7d` as testing volume only, then youngest
-by `created_at`.
-
-Alerts: **15** an ad entered the top 5 for a product created < 30 days ago; **16** an ad climbed 5+ ranks
-in 7 days; **17** a product's delivering ads at least doubled week over week (from 2+).
-
-`delivering-report --handle <h>` adds, per product, the top-5 ads by impression rank with days running,
-rank a week ago, delta and top-5 days, plus the store's sort_informative verdict.
-
-## Scaling columns: pages per domain, landing paths, page-likes slope
-
-Three "is this store scaling" measurements, all derived from ads already in the database (no
-extra scraping). They land on the Signals and Stores tabs and on a new **Pages** tab.
-
-| column | tab | meaning |
-|---|---|---|
-| `pages_per_domain` | Stores | distinct Facebook pages with an active ad landing on this store. Scaling stores spread spend across several pages |
-| `pages_new_7d` | Stores / Signals | of those pages, how many were first seen in the last 7 days (Signals: pages pointing at *this product*) |
-| `pages_pointing_here` | Signals | distinct pages whose ads land on this product |
-| `landing_paths` | Signals | distinct landing URL paths (query string stripped) used by this product's ads: `/products/x`, `/pages/x-offer`, `/collections/x`... |
-| `landing_paths_new_7d` | Signals | how many of those paths first appeared in the last 7 days. New paths = new advertorials / offer pages = testing angles |
-| `page_likes_slope_max` | Stores | the fastest likes/day slope among the store's pages (from `meta_page_likes_daily`) |
-
-**Pages tab:** one row per (store, page): page name, `page_id`, `first_seen`, `active_ads`,
-`last_delivered`, `page_likes`, `page_likes_7d_slope`, `ads_as_of`. A page can appear under several
-stores if its ads land on several domains.
-
-Alerts (written to `alerts/YYYY-MM-DD.md` and the Alerts tab, at most once a week per target):
-
-- **rule 13** store gained 2 or more new advertising pages in 7 days
-- **rule 14** product gained 3 or more new landing paths in 7 days
-- **rule 12** (page likes slope doubled week over week) is the third one from the spec; it was already in place
-
-These columns only move on days the store was scraped (`ads_as_of` says which day), like every other ad number.
+`run` detects what a domain runs on and reads its catalogue with the matching adapter: Shopify (`/products.json`),
+headless Shopify (the `*.myshopify.com` origin behind a custom front), WooCommerce (Store API), Squarespace,
+Magento (GraphQL), BigCommerce / Wix / anything with a product sitemap and JSON-LD (`CATALOGUE_MAX_PAGES` product
+pages per run, cached in `product_pages`). Every adapter yields the same product record (id, handle, title, dates,
+page path). Dates a platform does not publish are filled with the day this tracker first saw the product; products
+already present on the store's first snapshot get no date (unknown age) rather than "today".
 
 ## Radar: finding stores before they are on the watchlist
 
@@ -731,9 +240,9 @@ after the Meta pass; on Sundays (`RADAR_SWEEP_WEEKDAY=6`) it also runs the weekl
    in the Ad Library (US, active ads, unordered keyword match, up to `RADAR_MAX_ADS_PER_QUERY=500`
    ads per phrase). Every ad is stored in `radar_ads` with its page name, page id, landing domain,
    body length and start date; the landing domain is what gets triaged.
-2. **Copycat search**: for every watchlist store's hero products (top 3 by collection rank plus
+2. **Copycat search**: for every watchlist store's hero products (the 3 newest by `created_at` plus
    anything published in the last 30 days) the distinctive words of the title, minus the store's
-   own brand words, become an Ad Library query, so stores selling the same product show up. The
+   own brand words (the domain label and any word that opens several titles), become an Ad Library query, so stores selling the same product show up. The
    same words go to a web search (DuckDuckGo HTML, `RADAR_WEB_SEARCH=1`, `RADAR_MAX_WEB_QUERIES`)
    and every result domain is kept for triage. Copycat queries rotate: `RADAR_MAX_COPYCAT_QUERIES`
    least-recently-searched ones per sweep.
@@ -775,8 +284,7 @@ last searched; a domain is not searched again within `RADAR_RESEARCH_DAYS` (7).
 **Promote** when `(store_age_days <= RADAR_MAX_AGE_DAYS (180) OR hot new product) AND active_ads >= RADAR_MIN_ACTIVE_ADS (10)`.
 Promotion appends the store to `watchlist.csv` with the note `radar: <source> <date>` (plus
 `via <lander>` when it was reached through a funnel page) and it gets its first Shopify snapshot on
-the next morning run. On the Signals tab its rows carry `store_badge=NEW` for
-`RADAR_NEW_BADGE_DAYS` (14) days.
+the next morning run.
 Everything else is a **candidate**: every night its facts are recomputed (age moves, new sweep ads,
 `promote` marks) and it is promoted the day it crosses; Shopify candidates get their catalogue re-read
 every `RADAR_REFRESH_DAYS` (7) so a new product makes them eligible. To force one, type `Y` in the
@@ -819,20 +327,15 @@ producers. Edit `radar/hooks.txt` accordingly; the next sweep picks up the new l
 
 ## Diagnostics without pasting: the "EarlyScale Diag" doc
 
-`python tracker.py diag` collects a read-only report and writes it to a Google Doc named **EarlyScale Diag**
-in the Drive of the account that owns the sheet (through the same Apps Script web app, `mode=diag`; the doc
-is created on first use and replaced on every push). Both scheduled tasks push it when they finish, so the
-doc always shows the latest state, and anyone with access to the Drive can read it directly instead of
-asking for log pastes. Contents: code version (commit, branch, local changes), config flags, the two
-scheduled tasks' last run / result / next run, database counts (latest snapshot dates, badge coverage,
-ranks stored, landing-page resolver versions, applied migrations), the rank verdicts of the last 3 days
-with their notes, one line per store (platform, last catalogue status, latest ads snapshot with active /
-badge-known / low / resolved counts, last error), and for the last 4 log files every ERROR / WARNING /
-Traceback line plus the last 30 lines. Size-capped by `OPS_DIAG_CHARS` (250k). `--print` shows it,
-`--no-push` only writes `logs/diag.txt`. The web app needs the Google Docs permission once: in the Apps
-Script editor pick `authorizeDiag` in the function dropdown, Run, accept the prompt, then deploy a new version
-(a web app only holds the permissions its owner granted; a new version alone does not ask). The doc's id is
-kept in the script properties, so no Drive permission is needed.
+`python tracker.py diag` collects a read-only report and writes it to a Google Doc named **EarlyScale Diag** in the
+Drive of the account that owns the sheet (through the same Apps Script web app, `mode=diag`; created on first use,
+replaced on every push). Both scheduled tasks push it when they finish, so the doc always shows the latest state and
+anyone with access to the Drive can read it instead of asking for log pastes. Contents: code version (commit,
+branch, local changes), config, the two scheduled tasks' last run / result / next run, database counts (latest
+snapshot dates, active ads, badge coverage, URL rows), one line per store (platform, shop id, last catalogue
+status, latest ads snapshot with active / delivering / badge-unknown / winner counts, last error), the top 40
+Winners rows, and for the last 4 log files every ERROR / WARNING / Traceback line plus the last 30 lines. Size-capped
+by `OPS_DIAG_CHARS` (250k). `--print` shows it, `--no-push` only writes `logs/diag.txt`.
 
 ## Scheduling (Windows)
 
@@ -840,29 +343,20 @@ Two tasks, so the morning numbers are ready quickly and the slow Meta pass runs 
 
 | task | when | what | takes |
 |---|---|---|---|
-| ShopifyTracker Daily | 09:00 | `run_daily.bat`: Shopify snapshot of every store, stock probe, Sheets sync | about 15 min for 100 stores |
-| ShopifyTracker Meta | 22:00 | `run_daily.bat meta`: Meta Ad Library for the watchlist (least recently scraped first) until `META_NIGHT_MINUTES` (480) is spent, then `radar` (triage daily, sweeps on Sundays, `RADAR_MAX_MINUTES`), then a Sheets sync | about 6 min per store at the defaults, so ~80 stores a night, plus up to 4 h of radar |
+| ShopifyTracker Daily | 09:00 | `run_daily.bat`: catalogues + shop ids, Sheets sync, diag | about 10 min for 150 stores |
+| ShopifyTracker Meta | 22:00 | `run_daily.bat meta`: Ad Library pass until `META_NIGHT_MINUTES` (600) or 08:30, then `radar`, then a Sheets sync, diag | about 3 min per store |
 
-
-`run_daily.bat` probes, in order, `.venv\Scripts\python.exe`, `py -3`, `python` and `python3`,
-and uses the first one that actually runs and reports Python 3.11 or newer (so a machine
-with only 3.14 and no `py` launcher works, and the Microsoft Store `python` stub is skipped).
-It then runs `tracker.py run` and appends stdout+stderr to `logs\run_YYYY-MM-DD.log`, with
-the chosen interpreter and version in the start line. If nothing qualifies it logs an error
-and exits with code 9009.
-Register it in Task Scheduler (09:00 daily by default; `-Time HH:MM` for another time, re-run to change it) from PowerShell in the project folder. The script also sets the tasks to run a missed start as soon as the machine is awake again, to wake it from sleep for the start, and to run on battery (a closed lid or a powered-off laptop still runs nothing):
+Register both from PowerShell in the project folder (re-run to change the times):
 
 ```powershell
-.\register_task.ps1
+.\register_task.ps1                      # or: .\register_task.ps1 -Time 07:30 -MetaTime 23:00
 ```
 
-which runs exactly:
-
-```
-schtasks /Create /TN "ShopifyTracker Daily" /TR "\"C:\path\to\run_daily.bat\"" /SC DAILY /ST 09:00 /F
-```
-
-Verify / test / remove:
+The tasks run through `run_hidden.vbs` (no console window, so closing a window cannot kill a run) and are set to
+run a missed start as soon as the machine is awake, to wake it from sleep for the start, and to run on battery.
+`run_daily.bat` picks the first Python 3.11+ it finds (`.venv`, `py -3`, `python`, `python3`), appends stdout+stderr
+to `logs\run_YYYY-MM-DD.log` / `logs\meta_YYYY-MM-DD.log`, and skips a night start that Task Scheduler catches up
+between 07:00 and 20:00. Verify / test / remove:
 
 ```
 schtasks /Query /TN "ShopifyTracker Daily" /V /FO LIST
@@ -870,197 +364,102 @@ schtasks /Run   /TN "ShopifyTracker Daily"
 schtasks /Delete /TN "ShopifyTracker Daily" /F
 ```
 
-Without `/RU` and `/RP` the task only fires while you are logged on. To run when logged off,
-open the task's Properties in Task Scheduler and pick "Run whether user is logged on or not"
-(or re-register with `/RU <user> /RP <password>`).
+Without `/RU` and `/RP` the task only fires while you are logged on. **The laptop must not sleep during the night
+pass**: `KeepAwake` asks Windows not to sleep while a pass runs, but a closed lid or a battery power plan overrides
+it (Settings > Power & battery > sleep when plugged in: Never; lid: Do nothing). Time lost to sleep is given back to
+the budget and the 08:30 stop still holds.
 
-### Running it on an always-on Linux box (VPS, mini PC, old laptop)
+### Running it on an always-on Linux box
 
-The code is the same; only the scheduler differs. One-time setup on Ubuntu/Debian:
+The code is the same; only the scheduler differs:
 
 ```bash
 sudo apt install -y git python3.11 python3.11-venv
 git clone <your repo url> tracker && cd tracker
 python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m playwright install --with-deps chromium
-# copy .env, watchlist.csv and data/tracker.db from the laptop (scp / WinSCP) to keep the history
+# copy .env, watchlist.csv, calibration/ and data/tracker.db from the laptop to keep the history
 mkdir -p logs && crontab -e
 ```
 
-Cron lines (same three jobs as the Windows tasks; times are the box's local time):
-
 ```
 0 9  * * * cd /home/you/tracker && .venv/bin/python tracker.py run --no-ads            >> logs/run_$(date +\%F).log  2>&1
-0 22 * * * cd /home/you/tracker && .venv/bin/python tracker.py ads --max-minutes 480   >> logs/meta_$(date +\%F).log 2>&1
-30 6 * * * cd /home/you/tracker && .venv/bin/python tracker.py radar                   >> logs/meta_$(date +\%F).log 2>&1 && .venv/bin/python tracker.py sync-sheets >> logs/meta_$(date +\%F).log 2>&1
+0 22 * * * cd /home/you/tracker && .venv/bin/python tracker.py ads --max-minutes 600   >> logs/meta_$(date +\%F).log 2>&1
+30 8 * * * cd /home/you/tracker && .venv/bin/python tracker.py radar                   >> logs/meta_$(date +\%F).log 2>&1 && .venv/bin/python tracker.py sync-sheets >> logs/meta_$(date +\%F).log 2>&1
 ```
 
-Two cautions. The Meta Ad Library pass runs a real Chromium for hours a day; from a datacenter IP
-(most VPS providers) Facebook shows login walls more often than from a home connection, so a small
-machine at home keeps the IP that has worked so far. And only one machine should run the passes:
-move `data/tracker.db` once and retire the Windows tasks (`schtasks /Delete /TN "ShopifyTracker Daily" /F`,
-same for `ShopifyTracker Meta`) so two copies do not scrape the same stores.
-
-`watchlist.csv` ships with three test stores (gymshark, allbirds, colourpop). Add more with:
-
-```bash
-python tracker.py add-store somestore.com            # tries to find facebook.com/<page> in the storefront HTML
-python tracker.py add-store somestore.com --meta-page SomeStore --notes "found via ad"
-python tracker.py remove-store bad1.com bad2.com     # drops them from watchlist.csv, keeps DB history
-```
+From a datacenter IP Facebook shows login walls more often than from a home connection, and only one machine should
+run the passes (move `data/tracker.db` once and delete the Windows tasks).
 
 ## What gets stored (`data/tracker.db`)
 
 | table | one row per | notes |
 |---|---|---|
-| `stores` | store | domain + Meta page name/id |
-| `products_daily` | (day, store, product) | handle, title, type, tags (JSON), created/published/updated, variant_count, sold_out_variants, min/max price, `collection_position` (index in `/collections/all`, often best-selling order) |
-| `variants_daily` | (day, store, variant) | price, compare_at_price, available |
-| `runs`, `store_runs` | run / (run, store) | status, error text, products seen, pages, duration |
-| `hero_variants` | (store, variant) | which variants are probed, role (new / rank / bundle_component), current rung, `inventory_tracked`, last probe date |
-| `inventory_daily` | (day, variant) | `stock_level`, `signal_source`, raw probe message, `units_sold_1d`, `restock_units`, `units_per_day_7d`, `units_per_day_prev_7d`, `units_per_day_wow` |
-| `meta_ad_detail_daily`, `meta_page_likes_daily`, `meta_creatives` | (day, ad) / (day, page) / (ad, creative) | single-ad page readings, page likes with slopes, creative hashes |
-| `fb_posts`, `fb_posts_daily` | post / (day, post) | captured Sponsored posts, their match to an ad, daily public counts |
-| `radar_domains`, `radar_ads`, `radar_runs` | domain / ad / search | triage result per discovered domain (type, status, age, ads, pages, promote flag), every ad a sweep saw (page, landing domain, start date), one row per search with counts |
-| `alerts` | alert | rules 1-4 (deltas), 5-8 (Meta), 9-11 (inventory), 12 (page likes), 13-14 (new pages / landing paths) |
+| `stores` | watchlist store | Meta page, platform, `shop_id`, myshopify handle, `store_created_est` |
+| `products_daily` | product per day | id, handle, title, created_at, published_at, updated_at, url_path |
+| `ads` | ad per store | page, raw + normalised landing URL, first_seen (Ad Library start date), first/last scraped |
+| `ads_daily` | ad per scrape day | still_active, low_impressions (1 / 0 / NULL unknown), position |
+| `url_daily` | landing path per store per scrape day | delivering, delivering_7d_ago, proven_days, pages, pages_new_7d, top_page, family |
+| `meta_page_runs`, `runs`, `store_runs` | pass / store run | status, errors, durations |
+| `radar_domains`, `radar_ads`, `radar_ad_hits`, `radar_runs` | Radar | see the Radar section |
 
-History is append-only across days. Re-running the same `--date` replaces only that day
-for that store, so a crashed or partial run can be repeated safely.
-
-## Looking at the data
-
-No `sqlite3` CLI? `python -c "import sqlite3; ..."` works the same.
-
-```sql
--- per-day totals
-SELECT snapshot_date, COUNT(*) products, SUM(sold_out_variants) sold_out
-FROM products_daily GROUP BY snapshot_date;
-
--- products published in the last 7 days
-SELECT store_id, handle, published_at FROM products_daily
-WHERE snapshot_date = date('now') AND published_at >= datetime('now', '-7 days');
-
--- variants whose price changed vs yesterday
-SELECT t.store_id, t.product_id, y.price AS yesterday, t.price AS today
-FROM variants_daily t JOIN variants_daily y
-  ON y.store_id = t.store_id AND y.variant_id = t.variant_id
- AND y.snapshot_date = date(t.snapshot_date, '-1 day')
-WHERE t.snapshot_date = date('now') AND t.price != y.price;
-```
+History is never overwritten; re-running a date replaces that date's rows for the store. `python tracker.py rebuild`
+recomputes `url_daily` from `ads` / `ads_daily` at any time.
 
 ## Behaviour on failure
 
-- Requests carry a Chrome User-Agent and `Accept-Language` (some storefront WAFs answer 406
-  to bot-looking agents, seen on olavita.co) and `Accept: application/json`. Do **not** send
-  an HTML-first Accept: Shopify then serves the storefront HTML for `/products.json` with a
-  200. If a store answers 406 to `application/json`, the request is repeated once with
-  `Accept: */*`. Override the agent with `USER_AGENT` in `.env` if needed.
-- An HTML or otherwise non-JSON body fails immediately with a descriptive
-  `got HTML, not JSON from <url> (HTTP <status>, content-type <type>)` error in
-  `store_runs.error`, never a JSON parse traceback.
-- Before paginating, the host is resolved once: `GET /products.json?limit=1` following
-  redirects, and the final origin (e.g. `https://www.store.com`) is reused for every later
-  request. If the apex host is unreachable (connection error / timeout, seen on
-  tryterrastrike.com), or answers with a 404 / HTML page because a marketing site sits on the apex
-  (pipitea.com), the `www.` and then the `shop.` variant are tried (`shop.pipitea.com`) before giving up.
-  Keep the apex domain in the watchlist: ads landing on any subdomain of it join to the store.
-- Every request has a connect/read timeout and up to 3 retries with exponential backoff
-  on connection errors, timeouts, HTTP 429/430 (Shopify rate limit) and 5xx.
-- 401/403 (password-protected), 406 (WAF), 404 (not Shopify) and HTML responses fail fast, no retry.
-- A failing store is logged in `store_runs.error` and the run continues with the next store.
-- If `/collections/all/products.json` fails but `/products.json` works, the snapshot is still
-  written with `collection_position = NULL`.
-- Pagination stops on an empty page, a short page, a repeated page (some themes ignore
-  `page=`), or after 60 pages.
-- A configurable pause (`REQUEST_DELAY_S`, default 1s) sits between requests to the same store.
-- **The laptop must not sleep during the night pass.** `KeepAwake` asks Windows not to sleep while a pass runs,
-  but a closed lid or a battery power plan overrides it: one pass showed a 3-minute store taking 381 minutes and
-  only 18 stores done in 8 hours. Settings > System > Power & battery > Screen and sleep: "When plugged in, put my
-  device to sleep after: Never"; Control Panel > Power Options > "Choose what closing the lid does": Do nothing
-  (plugged in). Time lost to sleep is given back to the budget, and `META_STOP_AT` (08:30, set by run_daily.bat)
-  ends the pass before the morning task regardless.
-- Two watchlist entries that share one Meta page (luma.viture.com, beast.viture.com and viture.com all advertise
-  as "VITURE") record the same ads under whichever was scraped last, and the other's counts drop to 0 (the pass
-  warns "already recorded today under another watchlist store"). Keep one domain per advertiser:
-  `python tracker.py remove-store luma.viture.com beast.viture.com`.
-- The scheduled tasks run through `run_hidden.vbs` (no console window): two runs died with a Ctrl+C exit code when
-  the window a task had opened was closed. Re-run `.\register_task.ps1` once after pulling this.
-- One `sync-sheets` at a time: a lock file (`data/sync.lock`, ignored after 3 h) refuses a second sync, because two
-  interleaved syncs leave a replace-mode tab with a random subset of rows (12 Sep: Signals held 5962 of 11114). A
-  tab whose row count still mismatches after a sync is pushed again once, automatically.
-- A missed 22:00 start (laptop asleep) that Task Scheduler catches up between 07:00 and 20:00 is skipped by
-  `run_daily.bat meta` (logged), so the 8-hour night pass never runs on top of the morning task; tonight's start
-  does it. A Chromium crash mid-pass ("Target crashed") is followed by a fresh browser for the next store.
-- Night pass budget: `META_MAX_SCROLLS` (20, ~350 ads: the newest come first), `META_DETAIL_MAX` (8 single-ad
-  pages; the badge now carries delivery) and the impression-rank pass off (`META_RANK=0`: it cost ~3 minutes per
-  store for an order that stayed newest-first, see the rank section) keep one store near 3 minutes, so a 150-store
-  watchlist fits the 22:00-08:30 window (`META_NIGHT_MINUTES` 600, `META_STOP_AT` 08:30). Stores are ordered
-  least-recently-scraped first.
-- **The Sheets web app is unreachable** (DNS failure, no network): the GET is retried twice, then the sync
-  reports `sheets sync failed: cannot reach the Apps Script web app` and exits 3. The snapshot is already in
-  the database; the next sync pushes it. No traceback.
-- **`database is locked`** means another tracker command holds `data/tracker.db` for writing (a Meta pass
-  still running, the scheduled task, or a python process that never exited). Opening the database now does
-  no write at all when the schema is already at the code's version (stamped in `PRAGMA user_version`), so
-  read-only commands (`sync-sheets`, `report`, `product`) work while a pass is running; when a schema update
-  is needed and the file is busy, connect waits and retries a few times instead of failing. To find the
-  holder: `python tracker.py db-check` tries a 2-second write lock and lists python / OneDrive / SQLite-viewer
-  processes; `Stop-Process -Id <id>` stops a leftover python. A SQLite viewer with unsaved changes, or OneDrive
-  syncing the Desktop, holds the file just the same.
+- Requests carry a Chrome User-Agent and `Accept: application/json`; a store that answers 406 to that gets one retry
+  with `Accept: */*`. HTML or non-JSON bodies fail fast with a descriptive error in `store_runs.error`.
+- Before paginating, the host is resolved once (`GET /products.json?limit=1`, redirects followed); if the apex host is
+  unreachable or serves a marketing site, `www.` and then `shop.` are tried. Keep the apex domain in the watchlist.
+- Every request has a connect/read timeout and up to 3 retries with exponential backoff on connection errors,
+  timeouts, HTTP 429/430 and 5xx. 401/403/406/404 fail fast. A failing store is logged and the run continues.
+- Pagination stops on an empty, short or repeated page, or after 60 pages. `REQUEST_DELAY_S` (1 s) sits between
+  requests to the same store.
+- **The Sheets web app is unreachable** (DNS failure, no network): retried twice, then `sheets sync failed: cannot
+  reach the Apps Script web app`, exit 3. The data is in the database; the next sync pushes it.
+- **`database is locked`**: another tracker command holds `data/tracker.db` for writing (a Meta pass, the scheduled
+  task, a python that never exited, a SQLite viewer, OneDrive syncing the folder). Opening the database does no write
+  when the schema is current, so read-only commands work while a pass runs; when a schema update is needed and the
+  file is busy, connect waits and retries. `python tracker.py db-check` tries a 2-second write lock and lists the
+  processes that could hold it.
+- Scheduled runs go through `run_hidden.vbs`; a Chromium crash mid-pass is followed by a fresh browser for the next
+  store; a missed 22:00 start caught up in daytime is skipped so the night pass never runs on top of the morning task.
 
 ## Tests and offline end-to-end
 
 ```bash
 python -m unittest discover -s tests -v
+bash tests/replay.sh                        # Linux / macOS / WSL, needs node: two scheduled days against the fakes
 ```
 
-`bash tests/replay.sh` (Linux / macOS / WSL, needs node) replays two scheduled days end to end against the
-fakes: the morning `run --no-ads`, the night `ads`, `radar` and `sync-sheets`, for 2026-09-03 and then
-2026-09-10 with mutated catalogues and ads a week older. It exercises every delta and week-over-week column,
-the badge read, the landing join, the alert rules and the real `Code.gs` (inside `tests/fake_gas.js`), and
-ends with the sheet-vs-database table. Every step must exit 0 and no log may contain a traceback.
-
-`tests/mock_store.py` is a fake Shopify storefront with real pagination semantics, so the
-whole pipeline can be exercised without network access:
-
-```bash
-python -m tests.mock_store --port 8001 --products 320 --seed 1 &
-python -m tests.mock_store --port 8002 --products 40  --seed 2 --fail-first 430 &   # tests retry
-python -m tests.mock_store --port 8003 --products 610 --seed 3 &
-python -m tests.mock_store --port 8004 --products 55  --seed 4 --require-browser &         # 406 to bot UA or explicit JSON Accept
-python -m tests.mock_store --port 8007 --products 90  --seed 7 --html-unless-json-accept &  # HTML for .json unless Accept asks JSON
-python -m tests.mock_store --port 8005 --products 1   --seed 5 --redirect-to http://127.0.0.1:8006 &   # apex -> "www"
-python -m tests.mock_store --port 8006 --products 130 --seed 5 &
-python tracker.py run --watchlist tests/watchlist.mock.csv --date 2026-09-05
-# restart the mocks with --mutate for a "day 2" with sold-outs, price cuts and 2 new products
-python tracker.py run --watchlist tests/watchlist.mock.csv
-python tracker.py status
-python tracker.py report
-```
+The replay runs the morning `run --no-ads`, the night `ads`, `radar` and `sync-sheets` for 2026-09-03 and then
+2026-09-10 (mutated catalogues, ads a week older) against mock Shopify stores (`tests/mock_store.py`), a fake Ad
+Library page with the badge on some cards (`tests/fake_ad_library.py`) and the real `Code.gs` inside
+`tests/fake_gas.js`, then prints the sheet-vs-database table and the day-2 Winners. Every step must exit 0 and no log
+may contain a traceback. `tests/test_winners.py` covers the derived numbers with fixture data;
+`tests/test_db_snapshot.py` covers the migration from the previous database layout.
 
 ## Layout
 
 ```
 tracker.py              CLI entry point
-run_daily.bat           Windows daily runner (logs to logs\run_YYYY-MM-DD.log)
-register_task.ps1       registers run_daily.bat in Task Scheduler (09:00 daily, -Time to change)
-earlyscale/cli.py       commands: init-db, add-store, remove-store, run, ads, inventory, radar, sync-sheets, report, product, status
-earlyscale/sheets.py    Google Sheets sync client (rows from SQLite, chunking, 302 + retry handling)
-sheets/Code.gs          Apps Script web app to paste into the Sheet's script editor
-earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + pure normaliser + Meta page discovery
-earlyscale/deltas.py    pure delta calculations (7d counts, sold-out/price/handle deltas) + DB loaders
-earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture), parser, SQLite recording
-earlyscale/ad_metrics.py landing-URL join, concepts, lineage, daily ad metrics, alert rules 5-8, Signals join
-earlyscale/ad_detail.py  single-ad Ad Library pages: delivery (end_date), page likes, creative fingerprints, rule 12
-earlyscale/fb_posts.py   captured Sponsored posts, logged-out counts, join to ads
-earlyscale/inventory.py  hero-variant selection, /cart/add.js stock probe + theme fallback, units-sold maths, alert rules 9-11
-earlyscale/scaling.py    pages per domain, landing paths per product, Pages tab rows, alert rules 13-14
-earlyscale/radar.py      store discovery: hook/copycat/web sweeps, triage, Candidates tab, watchlist promotion, hook yield
-earlyscale/store_age.py  store age estimate for radar triage (earliest product, optional shop-id calibration)
-radar/hooks.txt          hook phrases for the weekly sweep; radar/imports/ for manual domain lists
-earlyscale/db.py        schema + snapshot writers
+run_daily.bat           Windows daily runner (day / meta modes; logs to logs\)
+run_hidden.vbs          runs run_daily.bat without a console window (used by the scheduled tasks)
+register_task.ps1       registers the two Task Scheduler tasks
+earlyscale/cli.py       commands: run, ads, radar, sync-sheets, report, url, status, diag, rebuild, watchlist helpers
+earlyscale/db.py        schema, migration from the previous layout, snapshot writers
+earlyscale/winners.py   landing path normalisation, product families, url_daily, the Winners / Stores rows
+earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture + card badges), recording
+earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + normaliser + Meta page discovery
+earlyscale/platforms.py catalogue adapters for the other storefront platforms
+earlyscale/store_age.py shop id extraction and the store age estimate (calibration/shop_ids.csv)
+earlyscale/radar.py     store discovery: hook/copycat/web sweeps, triage, Candidates tab, watchlist promotion, hook yield
+earlyscale/sheets.py    Google Sheets sync client (rows, chunking, 302 + retry handling, verify, lock)
+earlyscale/ops.py       the diagnostics report
 earlyscale/watchlist.py watchlist.csv I/O
 earlyscale/config.py    paths, .env loader, tunables
-tests/                  unit tests, fixture JSON, mock store server, fake Apps Script runtime (Node),
-                        fake Ad Library page for the browser loop
+sheets/Code.gs          Apps Script web app to paste into the Sheet's script editor
+radar/hooks.txt         hook phrases for the weekly sweep; radar/imports/ for manual domain lists
+tests/                  unit tests, fixture JSON, mock store server, fake Apps Script runtime (node), fake Ad Library page, replay.sh
 ```

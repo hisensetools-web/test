@@ -27,16 +27,14 @@ load_dotenv()
 
 DB_PATH = Path(os.environ.get("TRACKER_DB", ROOT / "data" / "tracker.db"))
 WATCHLIST_PATH = ROOT / "watchlist.csv"
-ALERTS_DIR = Path(os.environ.get("ALERTS_DIR", ROOT / "alerts"))   # where alerts/YYYY-MM-DD.md go
 
 REQUEST_TIMEOUT = (10, 30)  # (connect, read) seconds
 REQUEST_RETRIES = 3
 REQUEST_DELAY_S = float(os.environ.get("REQUEST_DELAY_S", "1.0"))
 PAGE_LIMIT = 250
 MAX_PAGES = 60  # 60 * 250 = 15k products; safety cap against infinite pagination
-# Present as a desktop browser (some storefront WAFs answer 406 to bot-looking
-# User-Agents, seen on olavita.co) but ask for JSON explicitly: an HTML-first Accept
-# makes Shopify serve the storefront HTML for /products.json (regression, 2026-09).
+# Present as a desktop browser (some storefront WAFs answer 406 to bot-looking User-Agents, seen on olavita.co)
+# but ask for JSON explicitly: an HTML-first Accept makes Shopify serve the storefront HTML for /products.json.
 USER_AGENT = os.environ.get(
     "USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -52,43 +50,26 @@ BROWSER_HEADERS = {
 
 # Google Sheets sync (Apps Script web app, see sheets/Code.gs). Empty = disabled.
 SHEETS_WEBHOOK_URL = os.environ.get("SHEETS_WEBHOOK_URL", "").strip()
-SHEETS_ADS_PER_STORE = int(os.environ.get("SHEETS_ADS_PER_STORE", "100"))
-OPS_DIAG_CHARS = int(os.environ.get("OPS_DIAG_CHARS", "250000"))   # size cap of the "EarlyScale Diag" Google Doc written by `tracker.py diag`   # Ads tab rows per store (delivering first, newest first)
 SHEETS_CHUNK_BYTES = int(os.environ.get("SHEETS_CHUNK_BYTES", "40000"))
 SHEETS_TIMEOUT = (10, 90)  # Apps Script can take a while on big appends
+OPS_DIAG_CHARS = int(os.environ.get("OPS_DIAG_CHARS", "250000"))   # size cap of the "EarlyScale Diag" Google Doc written by `tracker.py diag`
 
-# Meta Ad Library scraper (Part B). META_ADS=1 in .env lets `run` call it after the Shopify pass.
+# Meta Ad Library scraper. META_ADS=1 in .env lets `run` call it after the Shopify pass.
 META_ADS_ENABLED = os.environ.get("META_ADS", "").strip() in ("1", "true", "yes")
 META_WAIT_MIN = float(os.environ.get("META_WAIT_MIN", "3"))
 META_WAIT_MAX = float(os.environ.get("META_WAIT_MAX", "8"))
-META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "20"))   # ~350 ads, ~2 min; the newest ads come first (40 covered only ~50 stores a night)
-# Which stores the Meta pass covers and how long it may run. META_STORES empty = every watchlist
-# store; META_MAX_MINUTES caps the whole pass (scrape + single-ad pages) per day, and stores are
-# taken least-recently-scraped first so a big watchlist rotates through over several days.
+META_MAX_SCROLLS = int(os.environ.get("META_MAX_SCROLLS", "20"))   # ~350 ads, ~2 min; the newest ads come first
+# Which stores the Meta pass covers and how long it may run. META_STORES empty = every watchlist store;
+# META_MAX_MINUTES caps the whole pass per day, and stores are taken least-recently-scraped first.
 META_STORES = [d.strip().lower() for d in os.environ.get("META_STORES", "").split(",") if d.strip()]
 META_MAX_MINUTES = float(os.environ.get("META_MAX_MINUTES", "90"))
-LANDING_REFRESH_WORKERS = int(os.environ.get("LANDING_REFRESH_WORKERS", "4"))   # `landing --refresh-all`: stores fetched in parallel (one host each)
-META_MAX_LANDING_FETCH = int(os.environ.get("META_MAX_LANDING_FETCH", "40"))   # advertorial / redirect pages fetched per store per run
-META_CREATIVES_PER_AD = int(os.environ.get("META_CREATIVES_PER_AD", "4"))     # images/videos hashed per ad
 META_MAX_ADS = int(os.environ.get("META_MAX_ADS", "3000"))
 META_NAV_TIMEOUT_MS = int(os.environ.get("META_NAV_TIMEOUT_MS", "45000"))
 META_CHROMIUM_PATH = os.environ.get("META_CHROMIUM_PATH", "").strip()  # optional explicit browser binary
 # Override only for offline testing against tests/fake_ad_library.py
 META_AD_LIBRARY_BASE = os.environ.get("META_AD_LIBRARY_BASE", "https://www.facebook.com/ads/library/")
-LANDING_REFRESH_DAYS = int(os.environ.get("LANDING_REFRESH_DAYS", "7"))  # re-fetch advertorial pages this often
-META_MAX_POSTS = int(os.environ.get("META_MAX_POSTS", "25"))     # boosted posts to fetch per store per run
-META_RANK = os.environ.get("META_RANK", "0").strip() in ("1", "true", "yes")       # impressions-sorted search per store per day (off: ~3 min/store for an order that stays newest-first; README)
-META_RANK_UI = os.environ.get("META_RANK_UI", "1").strip() not in ("0", "false", "no")   # choose the sort in the page's own control (the URL sort is ignored)
-META_RANK_SCROLLS = int(os.environ.get("META_RANK_SCROLLS", "8"))          # ~150 ads: only the top ranks matter
-META_RANK_COUNTRIES = [c.strip().upper() for c in os.environ.get("META_RANK_COUNTRIES", "ALL,DE,NL").split(",") if c.strip()]  # views tried until the sort is informative
-META_RANK_MIN_COMPARE = int(os.environ.get("META_RANK_MIN_COMPARE", "20")) # ids compared to decide whether the sort is informative
-META_DETAIL_MAX = int(os.environ.get("META_DETAIL_MAX", "8"))        # single-ad pages per store per day (~45 s; the badge now carries delivery)
 META_STOP_AT = os.environ.get("META_STOP_AT", "").strip()             # e.g. 08:30 - the pass stops at this local time (set by run_daily.bat meta)
-META_DETAIL_LIGHT = os.environ.get("META_DETAIL_LIGHT", "1").strip() not in ("0", "false", "no")   # block images/media/fonts/css/external js on single-ad pages
-META_DETAIL_CONTEXT_PAGES = int(os.environ.get("META_DETAIL_CONTEXT_PAGES", "20"))   # new browser context every N single-ad pages
-META_CREATIVE_MAX_BYTES = int(os.environ.get("META_CREATIVE_MAX_BYTES", str(2 * 1024 * 1024)))   # hash at most this much of a video
-META_LIKES_MIN_SLOPE = float(os.environ.get("META_LIKES_MIN_SLOPE", "5"))   # likes/day before a doubling counts
-FB_POSTS_MAX = int(os.environ.get("FB_POSTS_MAX", "60"))             # permalinks to re-fetch per day
+
 # Radar (store discovery)
 RADAR_MAX_ADS_PER_QUERY = int(os.environ.get("RADAR_MAX_ADS_PER_QUERY", "500"))
 RADAR_COUNTRY = os.environ.get("RADAR_COUNTRY", "US")
@@ -98,7 +79,6 @@ RADAR_MAX_TRIAGE = int(os.environ.get("RADAR_MAX_TRIAGE", "40"))            # ne
 RADAR_MAX_AGE_DAYS = int(os.environ.get("RADAR_MAX_AGE_DAYS", "180"))
 RADAR_MIN_ACTIVE_ADS = int(os.environ.get("RADAR_MIN_ACTIVE_ADS", "10"))
 RADAR_SWEEP_WEEKDAY = int(os.environ.get("RADAR_SWEEP_WEEKDAY", "6"))        # 6 = Sunday
-RADAR_NEW_BADGE_DAYS = 14
 RADAR_MAX_MINUTES = float(os.environ.get("RADAR_MAX_MINUTES", "240"))       # budget for one radar run (sweeps + triage)
 RADAR_MAX_COPYCAT_QUERIES = int(os.environ.get("RADAR_MAX_COPYCAT_QUERIES", "60"))   # per sweep, least recently searched first
 RADAR_FUNNEL_MIN_ADS = int(os.environ.get("RADAR_FUNNEL_MIN_ADS", "3"))     # non-Shopify lander needs this many sweep ads to be tracked as a funnel
@@ -114,15 +94,3 @@ CATALOGUE_MAX_SITEMAPS = int(os.environ.get("CATALOGUE_MAX_SITEMAPS", "15"))
 CATALOGUE_MAX_URLS = int(os.environ.get("CATALOGUE_MAX_URLS", "3000"))
 CATALOGUE_REFRESH_DAYS = int(os.environ.get("CATALOGUE_REFRESH_DAYS", "3"))    # re-read a product page this often
 CATALOGUE_REDETECT_DAYS = int(os.environ.get("CATALOGUE_REDETECT_DAYS", "14")) # trust the detected platform this long
-META_REACH_MIN = int(os.environ.get("META_REACH_MIN", "1000"))    # ignore reach-slope alerts below this reach
-
-# Inventory-delta sales tracking. INVENTORY_STORES = comma list of domains to probe daily (rollout gate);
-# INVENTORY=1 probes every watchlist store.
-INVENTORY_STORES = [d.strip().lower() for d in os.environ.get("INVENTORY_STORES", "").split(",") if d.strip()]
-INVENTORY_ALL = os.environ.get("INVENTORY", "").strip() in ("1", "true", "yes")
-INVENTORY_WAIT_MIN = float(os.environ.get("INVENTORY_WAIT_MIN", "5"))
-INVENTORY_WAIT_MAX = float(os.environ.get("INVENTORY_WAIT_MAX", "15"))
-INVENTORY_MAX_VARIANTS = int(os.environ.get("INVENTORY_MAX_VARIANTS", "40"))   # per store per day
-INVENTORY_PROBE_QTY = 9999
-INVENTORY_THROTTLE_WAIT = int(os.environ.get("INVENTORY_THROTTLE_WAIT", "90"))   # seconds to back off after a 429
-INVENTORY_MAX_BLOCKED = int(os.environ.get("INVENTORY_MAX_BLOCKED", "3"))   # consecutive blocks before giving up on a store for the day

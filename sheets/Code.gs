@@ -7,73 +7,38 @@
  * Put the resulting /exec URL in .env as SHEETS_WEBHOOK_URL.
  *
  * Protocol (one POST per chunk, JSON body):
- *   { "tab": "Signals" | "Early" | "Families" | "Categories" | "Stores" | "Pages" | "Candidates" | "Products" | "Alerts",
- *     "mode": "replace" | "append",
+ *   { "tab": "Winners" | "Stores" | "Candidates",
+ *     "mode": "replace",
  *     "chunk": 1, "chunks": 3,          // 1-based; replace clears the tab on chunk 1
  *     "rows": [[...], [...]] }           // values in header order
+ *   { "mode": "diag", "text": "..." }    // the diagnostics report -> Google Doc "EarlyScale Diag"
  * Reply: { "ok": true, "tab": "...", "received": n, "written": m, "skipped": k }
  *    or  { "ok": false, "error": "..." }
  *
  * Tabs are created with a bold, frozen header row and auto-sized columns the first
- * time they are written. "Alerts" is de-duplicated on its key columns so re-running a
- * sync never creates duplicate rows; every other tab is rewritten in full each sync.
+ * time they are written; every tab is rewritten in full each sync.
  */
 
 var TABS = {
-  Signals: {
-    headers: ["store", "product family", "handle", "ads_as_of", "channel tag", "days_since_published", "published_at", "days_since_created", "created_at", "relaunch", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_in_top5", "best_rank", "best_rank_delta_7d", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "ads_low_impressions", "concepts_delivering", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"],
-    keyCols: null, textCols: [0, 1, 2, 3, 4, 6, 8, 9, 11, 21, 26, 33, 36, 37, 42], position: 1
-  },
-  Early: {
-    headers: ["store", "handle", "ads_as_of", "product family", "days_since_created", "created_at", "relaunch", "days_since_published", "ads_in_top5", "best_rank", "best_rank_delta_7d", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "concepts_delivering", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d", "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level", "units_per_day_7d", "store_badge"],
-    keyCols: null, textCols: [0, 1, 2, 3, 5, 6, 13, 18, 23, 25, 29], position: 2
-  },
-  Families: {
-    headers: ["store", "family", "title", "handles", "newest published_at", "oldest published_at", "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"],
-    keyCols: null, textCols: [0, 1, 2, 3, 4, 5, 10], position: 3
-  },
-  Categories: {
-    headers: ["category", "stores", "families", "newest published_at", "families published 7d", "store list", "example families"],
-    keyCols: null, textCols: [0, 3, 5, 6], position: 4
+  Winners: {
+    headers: ["store", "landing_url", "delivering", "delivering_7d_ago", "delivering_wow", "proven_days", "pages", "pages_new_7d", "top_page", "family_age_days", "store_age_days", "ads_as_of"],
+    keyCols: null, textCols: [0, 1, 4, 8, 11], position: 1
   },
   Stores: {
-    headers: ["store", "meta page", "platform", "sort_informative", "last status", "products", "sold-out variants", "new products 7d", "updated products 7d", "sold-out delta", "price changes", "change score", "last snapshot date", "ads_scraped_on", "ads_active", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "ads_low_impressions", "new_ads_7d", "new_ads_prev_7d", "ad_velocity_wow", "pages_per_domain", "pages_new_7d", "page_likes_slope_max", "ads_to_products", "products_with_ads", "ads_not_attached (why)"],
-    keyCols: null,                 // fully overwritten each sync
-    textCols: [0, 1, 2, 3, 4, 12, 13, 17, 21, 27],   // keep dates / domains as text, not auto-parsed
-    position: 5
-  },
-  Pages: {
-    headers: ["store", "page name", "page_id", "first_seen", "active_ads", "last_delivered", "page_likes", "page_likes_7d_slope", "ads_as_of"],
-    keyCols: null, textCols: [0, 1, 2, 3, 5, 8], position: 6
-  },
-  Ads: {
-    headers: ["store", "page name", "ad_id", "started", "days_running", "delivering", "low_impressions", "impression_rank", "landing_path", "resolved_product", "primary_text"],
-    keyCols: null, textCols: [0, 1, 2, 3, 5, 6, 8, 9, 10], position: 7   // ad_id as text: 16-digit ids must not become 1.4E+15
+    headers: ["store", "shop_id", "store_age_days", "products", "ads_as_of", "last error"],
+    keyCols: null, textCols: [0, 1, 4, 5], position: 2   // shop_id as text: a 12-digit id must not become 1.2E+11
   },
   Candidates: {
     headers: ["domain", "type", "status", "first_seen", "store_age_days", "store_created_est", "store_first_created", "products", "active_ads", "ads_in_sweeps", "searched_at", "pages", "top page", "example ad text", "hot new product", "source", "lander_domain", "last_checked", "promote"],
     keyCols: null,                 // rewritten each sync AFTER the tracker has read the promote column back
-    textCols: [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 17, 18], position: 8
-  },
-  Products: {
-    headers: ["date", "store", "handle", "title", "published_at", "updated_at", "price", "available variants", "total variants", "collection position"],
-    keyCols: null,                 // the full latest catalogue of every store, rewritten each sync
-    textCols: [0, 1, 2, 3, 4, 5],  // (history stays in data/tracker.db: `python tracker.py product <handle>`)
-    moveToEnd: true,               // raw data lives at the end of the tab bar
-    hideCols: [7, 8]               // available / total variants (still there, just hidden)
-  },
-  Alerts: {
-    headers: ["date", "store", "handle", "rule", "detail", "created_at"],
-    keyCols: [0, 1, 2, 3, 4],      // date + store + handle + rule + detail (several alerts can share a rule)
-    textCols: [0, 1, 2, 3, 4, 5],
-    position: 9
+    textCols: [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 17, 18], position: 3
   }
 };
 
 /** Health check: open the /exec URL in a browser and you should see "ok".
- *  ?tabs=1            -> JSON {tab: rows} for every tab the script knows (rows exclude the header)
- *  ?tab=Products      -> JSON {tab, rows, maxRows}
- *  ?tab=Products&group=1 -> also {byValue: {value in column 1 (0-based): count}}, e.g. rows per store
+ *  ?tabs=1            -> JSON {tab: rows} for every tab the script knows (rows exclude the header) + the headers it writes
+ *  ?tab=Winners       -> JSON {tab, rows, maxRows}
+ *  ?tab=Winners&group=0 -> also {byValue: {value in column 0 (0-based): count}}, e.g. rows per store
  *  ?tab=Candidates&rows=1 -> also {rows: [[...]]} (the tracker reads the promote column back before rewriting);
  *  add &cols=domain,promote to get only those columns (by header name) */
 function doGet(e) {
@@ -99,7 +64,6 @@ function doGet(e) {
       var vals2 = sheet.getRange(2, 1, n, w).getValues();
       var fmt = function (r) { return r.map(function (v) { return v instanceof Date ? Utilities.formatDate(v, "UTC", "yyyy-MM-dd") : v; }); };
       if (p.cols) {
-        // ?cols=domain,promote -> only those columns (by header name), keeps the read-back small
         var head = sheet.getRange(1, 1, 1, w).getValues()[0].map(String);
         var idx = String(p.cols).split(",").map(function (c) { return head.indexOf(c); });
         res.cols = String(p.cols).split(",");
@@ -131,9 +95,7 @@ function doPost(e) {
     if (!spec) throw new Error("unknown tab: " + body.tab + " (expected one of " + Object.keys(TABS).join(", ") + ")");
     var rows = Array.isArray(body.rows) ? body.rows : [];
     var sheet = getOrCreateSheet_(body.tab, spec);
-    var result = (body.mode === "replace")
-      ? replaceRows_(sheet, spec, rows, body.chunk || 1)
-      : appendRows_(sheet, spec, rows);
+    var result = replaceRows_(sheet, spec, rows, body.chunk || 1);
     result.ok = true;
     result.tab = body.tab;
     result.chunk = body.chunk || 1;
@@ -188,10 +150,6 @@ function getOrCreateSheet_(name, spec) {
   }
   ensureHeader_(sheet, spec);
   if (isNew && spec.position) moveSheet_(ss, sheet, spec.position);
-  if (spec.moveToEnd) moveSheet_(ss, sheet, ss.getNumSheets());
-  if (spec.hideCols) {
-    for (var h = 0; h < spec.hideCols.length; h++) sheet.hideColumns(spec.hideCols[h] + 1);
-  }
   return sheet;
 }
 
@@ -203,7 +161,7 @@ function moveSheet_(ss, sheet, position) {
   ss.moveActiveSheet(target);
 }
 
-/** Stores: chunk 1 wipes everything below the header, later chunks append. */
+/** chunk 1 wipes everything below the header, later chunks append. */
 function replaceRows_(sheet, spec, rows, chunk) {
   if (chunk === 1) {
     var last = sheet.getLastRow();
@@ -213,28 +171,8 @@ function replaceRows_(sheet, spec, rows, chunk) {
   return { received: rows.length, written: rows.length, skipped: 0 };
 }
 
-/** Products / Alerts: append rows whose key is not already present. */
-function appendRows_(sheet, spec, rows) {
-  var existing = {};
-  var last = sheet.getLastRow();
-  var keyWidth = Math.max.apply(null, spec.keyCols) + 1;
-  if (last > 1) {
-    var vals = sheet.getRange(2, 1, last - 1, keyWidth).getValues();
-    for (var i = 0; i < vals.length; i++) existing[keyOf_(vals[i], spec.keyCols)] = true;
-  }
-  var fresh = [];
-  for (var j = 0; j < rows.length; j++) {
-    var key = keyOf_(rows[j], spec.keyCols);
-    if (existing[key]) continue;
-    existing[key] = true;
-    fresh.push(rows[j]);
-  }
-  writeRows_(sheet, spec, fresh);
-  return { received: rows.length, written: fresh.length, skipped: rows.length - fresh.length };
-}
-
 /** Header row = the spec's headers, always: tabs gain columns over time and a stale header is worse
- *  than none. Grows the grid first (a new sheet has 26 columns; Signals has more). */
+ *  than none. Grows the grid first (a new sheet has 26 columns). */
 function ensureHeader_(sheet, spec) {
   var width = spec.headers.length;
   if (sheet.getMaxColumns() < width) sheet.insertColumnsAfter(sheet.getMaxColumns(), width - sheet.getMaxColumns());
@@ -263,27 +201,19 @@ function writeRows_(sheet, spec, rows) {
   });
   var start = sheet.getLastRow() + 1;
   // A range past the grid throws in Apps Script ("coordinates or dimensions of the range are
-  // invalid"); new sheets have 1000 rows, so a full catalogue used to fail part-way. Grow first.
+  // invalid"); new sheets have 1000 rows. Grow first.
   var need = start + padded.length - 1 - sheet.getMaxRows();
   if (need > 0) sheet.insertRowsAfter(sheet.getMaxRows(), need);
   if (sheet.getMaxColumns() < width) sheet.insertColumnsAfter(sheet.getMaxColumns(), width - sheet.getMaxColumns());
   var range = sheet.getRange(start, 1, padded.length, width);
-  // Force text format on key/date columns BEFORE writing so "2026-09-06" and ISO
-  // timestamps stay strings (otherwise Sheets parses them into dates and the
-  // de-dup keys stop matching).
+  // Force text format on key/date columns BEFORE writing so "2026-09-06" stays a string.
   for (var i = 0; i < spec.textCols.length; i++) {
     sheet.getRange(start, spec.textCols[i] + 1, padded.length, 1).setNumberFormat("@");
   }
   range.setValues(padded);
 }
 
-function keyOf_(row, keyCols) {
-  var parts = [];
-  for (var i = 0; i < keyCols.length; i++) parts.push(cellText_(row[keyCols[i]]));
-  return parts.join("");
-}
-
-/** Normalise a cell for key comparison; dates that slipped through become yyyy-MM-dd. */
+/** Normalise a cell for grouping; dates that slipped through become yyyy-MM-dd. */
 function cellText_(v) {
   if (v === null || v === undefined) return "";
   if (Object.prototype.toString.call(v) === "[object Date]") {

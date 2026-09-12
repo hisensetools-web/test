@@ -1,13 +1,13 @@
 """Catalogue adapters for every D2C storefront, not only Shopify.
 
 Every adapter returns the same normalised product dicts that shopify.normalise_product produces
-(product_id, handle, title, created_at, published_at, updated_at, variants[...], collection_position,
-plus url_path), so the snapshot, deltas, Signals, landing join, inventory and Radar code do not care
-what the store runs on.
+(product_id, handle, title, created_at, published_at, updated_at, url_path), so the snapshot and Radar
+code do not care what the store runs on. The adapters read variants only to tell a product page that
+was read from a placeholder (variant_count); nothing about variants is stored.
 
   detect(session, domain)         one homepage GET (+ the Shopify probe): {platform, base, myshopify, evidence}
   fetch_catalogue(domain, ...)    detect (cached per store), then the adapter:
-    shopify                       /products.json (+ /collections/all order)                shopify.fetch_store
+    shopify                       /products.json                                           shopify.fetch_store
     shopify_headless              <shop>.myshopify.com/products.json behind a custom front (Hydrogen, Next.js)
     woocommerce                   /wp-json/wc/store/v1/products (public Store API), popularity order,
                                   dates from /wp-json/wp/v2/product when the site exposes it
@@ -399,11 +399,8 @@ def discover_product_urls(session: requests.Session, base: str, max_sitemaps: in
 # ---------------------------------------------------------------- adapters
 
 def catalogue_shopify(session: requests.Session, domain: str, base: str | None = None) -> Catalogue:
-    raw, positions, pages = shopify.fetch_store(base or domain, session)
-    products = shopify.normalise_products(raw, positions)
-    for p in products:
-        p["url_path"] = f"/products/{p['handle']}"
-    return Catalogue("shopify", base or shopify.base_url(domain), products, pages)
+    raw, pages = shopify.fetch_store(base or domain, session)
+    return Catalogue("shopify", base or shopify.base_url(domain), shopify.normalise_products(raw), pages)
 
 
 def catalogue_shopify_headless(session: requests.Session, domain: str, info: dict) -> Catalogue:
@@ -411,10 +408,8 @@ def catalogue_shopify_headless(session: requests.Session, domain: str, info: dic
     shop = info.get("myshopify")
     if not shop:
         raise PlatformError("headless Shopify front without a visible myshopify.com shop name")
-    raw, positions, pages = shopify.fetch_store(f"https://{shop}", session)
-    products = shopify.normalise_products(raw, positions)
-    for p in products:
-        p["url_path"] = f"/products/{p['handle']}"
+    raw, pages = shopify.fetch_store(f"https://{shop}", session)
+    products = shopify.normalise_products(raw)
     c = Catalogue("shopify_headless", info["base"], products, pages, note=f"catalogue via {shop}")
     c.extra["myshopify"] = shop
     return c

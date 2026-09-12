@@ -1,73 +1,65 @@
 # Shopify Early-Scaling Tracker
 
 ## Goal
-Detect Shopify products in their first 2–4 weeks of paid-social scaling, before traffic tools (SimilarWeb, TrendTrack) can see them. Do this by measuring *leading* signals daily and alerting on week-over-week deltas.
+Find landing URLs whose paid-social delivery is growing week over week, before traffic tools can see them.
+Six data points, collected daily; everything on the sheet is derived from them. Nothing else is collected.
 
-## Signals to collect (once per day per store)
+## Data points (once per day per store)
 
-### A. Shopify store side (free, no auth)
-- `GET https://{store}/products.json?limit=250` (paginate with `page=` until empty)
-  - Store every product: id, handle, title, created_at, published_at, updated_at, variants (id, price, available), tags, product_type
-- `GET https://{store}/collections/all/products.json?limit=250`
-  - Record collection sort position (stores often sort by best-selling)
-- Derived metrics:
-  - `new_products_7d`: products with published_at in last 7 days
-  - `updated_products_7d`: products with updated_at in last 7 days
-  - `sold_out_variants_delta`: change in count of `available: false` vs yesterday
-  - `price_changes`: variants whose price differs from yesterday
+### 1. Per ad (Meta Ad Library, Playwright scrape of the public page)
+- `ad_archive_id`, `page_name`, `page_id`
+- `landing_url`: raw, as shown on the card, and `landing_path`: normalised (host + path, lower-case, query string removed, no trailing slash)
+- `first_seen`: the Ad Library's start date
+- `still_active`: present in today's active-ads search
+- `low_impressions`: the "Low impression count" badge read off the rendered card, true/false. Unknown (card never rendered)
+  is stored as NULL and counts as NOT delivering. The sheet never shows a `?`.
+- No product resolution of any kind. The landing URL is the key.
 
-### B. Meta Ad Library side
-- For each store's Meta page name (and/or domain), collect:
-  - `active_ad_count`
-  - list of ad IDs with `first_shown` / start date
-  - for ads with EU delivery: reach and spend range
-- Prefer the official Ad Library API (`https://graph.facebook.com/v*/ads_archive`) when a token is present — set `META_ACCESS_TOKEN` in `.env`. Fields: `id, ad_delivery_start_time, ad_delivery_stop_time, page_name, eu_total_reach, spend, impressions, ad_creative_link_captions, ad_snapshot_url`.
-- Fallback: Playwright headless scrape of `https://www.facebook.com/ads/library/?active_status=active&ad_type=all&country=ALL&q={page}&search_type=page`. Handle infinite scroll, rate-limit politely (random 3–8s waits), rotate user agents, and never run more than 1 concurrent browser.
-- Derived metrics:
-  - `new_ads_7d`: ads whose start date is within last 7 days
-  - `ad_velocity_wow`: new_ads_7d / new_ads_prev_7d
-  - `creatives_per_product_url`: group ads by landing-page product handle; count distinct ads per product
-  - `eu_reach_wow`: sum of EU reach this week vs last week
+### 2. Per store
+- `shop_id` and the myshopify handle from the storefront HTML (once; they never change)
+- Every product's `id`, `handle`, `title`, `created_at`, `published_at` from `products.json` (other platforms: the adapter's equivalent)
 
-### C. Cross-reference
-- Join ad landing URLs to products.json handles → produces a per-product record: `first_ad_date, ad_count, eu_reach, published_at, price, sold_out_variants`
-- `days_since_first_ad` and `days_since_published` are the key "how early are we" fields.
+### 3. Product family
+- Handles on a store are grouped by product id where shared, else by the handle / normalised title with the duplicate
+  suffixes stripped (`-copy`, `-1`, `-2`, `-cc`, `-otp`, `-sub`, `-es` and similar)
+- `family_created` = oldest `created_at` in the family
 
-## Alert rules (start simple, tune later)
-Flag a product when ANY of:
-1. `published_at` within 14 days AND ≥ 5 ads point at it
-2. `ad_velocity_wow` for the store ≥ 2.0 AND store had ≥ 3 new ads this week
-3. `eu_reach_wow` ≥ 1.5 for a single product's ads
-4. A product that had 0 ads last week has ≥ 8 this week
+## Deleted (code removed, not only the sync)
+Concept clustering, lineage alerts, ads_launched velocity, impression sort / rank, collection rank, variant counts,
+sold-out flags, review scraping, engagement, EU reach, the inventory / cart probe, feed-post capture, the Categories,
+Families, Signals, Early, Pages, Ads, Products and Alerts tabs, and every alert rule that depended on them.
 
-Output alerts to `alerts/YYYY-MM-DD.md` and optionally post to a Slack/Discord webhook (`ALERT_WEBHOOK_URL` in `.env`).
+## Derived (per landing URL, per day; `url_daily`)
+- `delivering`: active ads on the URL without the badge
+- `delivering_7d_ago` (the scrape 6-8 days earlier; blank without one) and `delivering_wow = delivering / delivering_7d_ago`
+  (`new` when it was 0 a week ago)
+- `proven_days`: age of the oldest still-delivering ad on the URL
+- `pages`: distinct page_ids with a delivering ad on the URL; `pages_new_7d`: pages whose first delivering ad on the URL is < 7 days old
+- `top_page`: page name with the most delivering ads
+- product family (only when the URL is a `/products/` path; blank for `/pages/` landers, never guessed) and `family_age_days`
+- `store_age_days` from `shop_id` through `calibration/shop_ids.csv` (`shop_id,created_date`; not in the repo)
+
+## Sheet (Google Apps Script web app, `sheets/Code.gs`)
+- **Winners**: one row per landing URL with `delivering >= 3`. Columns in order: store, landing_url, delivering, delivering_7d_ago,
+  delivering_wow, proven_days, pages, pages_new_7d, top_page, family_age_days, store_age_days, ads_as_of.
+  Default sort: delivering_wow desc (`new` first, no history last), then delivering desc.
+- **Stores**: store, shop_id, store_age_days, products, ads_as_of, last error.
+- **Candidates**: the Radar's tab (hook sweeps, copycat search, manual imports; promote=Y read back).
+- Nothing else.
 
 ## Storage
-- SQLite at `data/tracker.db`. Tables: `stores`, `products_daily`, `ads_daily`, `alerts`.
-- Never overwrite history; every run appends a dated snapshot. Deltas are computed from the DB, not from memory.
+- SQLite at `data/tracker.db`: `stores`, `products_daily`, `ads`, `ads_daily`, `url_daily`, `meta_page_runs`, `runs`, `store_runs`,
+  the radar tables, `schema_migrations`. History is never overwritten; every run appends a dated snapshot.
+- A database from the previous layout is migrated on first open (ads copied, the rest dropped, then VACUUM).
 
-## Watchlist
-- `watchlist.csv` with columns: `store_domain, meta_page_name, meta_page_id (optional), notes`
-- Provide a `python tracker.py add-store <domain>` command that tries to auto-discover the Meta page name from the store's footer social links.
-
-## Scheduling
-- `python tracker.py run` does one full pass.
-- Document how to schedule daily via cron (Linux/Mac) or Task Scheduler (Windows). Target run time: under 30 min for 100 stores.
-
-## Reporting
-- `python tracker.py report` prints a table sorted by `ad_velocity_wow` desc, with the top flagged products, their `days_since_first_ad`, and store.
-- `python tracker.py product <handle>` shows the full time series for one product.
+## Commands
+`run` (catalogues + shop id), `ads` (Ad Library pass within a time budget, least recently scraped store first), `radar`,
+`sync-sheets`, `report` (the Winners tab in the terminal), `url <landing url>` (its time series), `status`, `diag`,
+`rebuild` (recompute url_daily from the stored ads), and the watchlist helpers (`add-store`, `remove-store`, `find-page`,
+`set-page`, `prune-dead`, `restore-stores`, `radar-add`, `radar-report`, `db-check`).
 
 ## Engineering rules
-- Python 3.11, `requests`, `playwright`, `sqlite3`, `rich` for tables. Keep dependencies minimal.
+- Python 3.11+, `requests`, `playwright`, `sqlite3`, `rich`. Keep dependencies minimal.
 - Every network call has a timeout and retry with backoff. A failing store must not abort the run; log it and continue.
-- Write tests for the delta/alert logic using fixture JSON — it's the part most likely to have silent bugs.
-- Respect robots and rate limits. This is read-only public data; do not attempt logins or checkout manipulation.
-
-## Build order
-1. products.json fetcher + SQLite schema + daily snapshot for 3 test stores
-2. Delta calculations and `report` command
-3. Meta Ad Library API path (if token) → then Playwright fallback
-4. Landing-URL → product join
-5. Alert rules + webhook
-6. Cron docs + README
+- Tests for the derived numbers use fixture data (`tests/test_winners.py`); `tests/replay.sh` replays two scheduled days offline.
+- Respect robots and rate limits. Read-only public data; no logins, no checkout or cart manipulation.

@@ -1,12 +1,18 @@
-"""SQLite schema and snapshot writers.
+"""SQLite schema, migration from the old layout, and the snapshot writers.
 
-History is never overwritten: every table keyed by snapshot_date is append-only
-across days. Re-running the same day upserts that day's rows (idempotent).
+History is never overwritten: every table keyed by snapshot_date is append-only across days.
+Re-running the same day replaces that day's rows for the store (idempotent).
+
+Six data points, nothing else (see CLAUDE.md):
+  ads / ads_daily      per ad: id, page, landing URL (raw + normalised path), first_seen, still_active, low_impressions
+  stores               shop_id + myshopify handle from the storefront HTML
+  products_daily       per product: id, handle, title, created_at, published_at
+  url_daily            derived per landing path per day (winners.py)
 """
 from __future__ import annotations
 
-import json
 import logging
+import re
 import sqlite3
 import time
 import zlib
@@ -24,7 +30,18 @@ CREATE TABLE IF NOT EXISTS stores (
     meta_page_name  TEXT,
     meta_page_id    TEXT,
     notes           TEXT,
-    added_at        TEXT NOT NULL
+    added_at        TEXT NOT NULL,
+    shop_id         INTEGER,                -- Shopify shop id from the storefront HTML (never changes)
+    myshopify       TEXT,                   -- x.myshopify.com
+    shop_id_source  TEXT,
+    shop_id_checked_at TEXT,
+    shop_id_error   TEXT,
+    store_created_est TEXT,                 -- from calibration/shop_ids.csv (store_age.py)
+    store_created_method TEXT,
+    platform        TEXT,                   -- shopify | shopify_headless | woocommerce | ... (platforms.py)
+    platform_base   TEXT,
+    platform_checked_at TEXT,
+    platform_note   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (
@@ -49,27 +66,21 @@ CREATE TABLE IF NOT EXISTS store_runs (
     PRIMARY KEY (run_id, store_id)
 );
 
+-- Every product of every store, once per day: id, handle, title and the two dates. Nothing else.
 CREATE TABLE IF NOT EXISTS products_daily (
-    snapshot_date       TEXT NOT NULL,
-    store_id            INTEGER NOT NULL REFERENCES stores(id),
-    product_id          INTEGER NOT NULL,
-    handle              TEXT NOT NULL,
-    title               TEXT,
-    vendor              TEXT,
-    product_type        TEXT,
-    tags                TEXT,               -- JSON array
-    created_at          TEXT,
-    published_at        TEXT,
-    updated_at          TEXT,
-    variant_count       INTEGER NOT NULL,
-    sold_out_variants   INTEGER NOT NULL,
-    min_price           REAL,
-    max_price           REAL,
-    collection_position INTEGER,            -- 0-based index in /collections/all, NULL if absent
-    fetched_at          TEXT NOT NULL,
-    url_path            TEXT,               -- /products/<handle> on Shopify; the product page path on other platforms
+    snapshot_date   TEXT NOT NULL,
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    product_id      INTEGER NOT NULL,
+    handle          TEXT NOT NULL,
+    title           TEXT,
+    created_at      TEXT,
+    published_at    TEXT,
+    updated_at      TEXT,
+    url_path        TEXT,                   -- /products/<handle> on Shopify; the product page path elsewhere
+    fetched_at      TEXT NOT NULL,
     PRIMARY KEY (snapshot_date, store_id, product_id)
 );
+CREATE INDEX IF NOT EXISTS idx_products_daily_handle ON products_daily(store_id, handle, snapshot_date);
 -- The day this tracker first saw a product URL: created_at for platforms that do not publish dates.
 CREATE TABLE IF NOT EXISTS product_first_seen (
     store_id        INTEGER NOT NULL REFERENCES stores(id),
@@ -85,190 +96,68 @@ CREATE TABLE IF NOT EXISTS product_pages (
     last_fetched    TEXT,
     status          INTEGER,
     lastmod         TEXT,
-    json            TEXT,                   -- parsed facts (title, brand, variants, dates)
+    json            TEXT,
     PRIMARY KEY (store_id, url_path)
 );
-CREATE INDEX IF NOT EXISTS idx_products_daily_handle ON products_daily(store_id, handle, snapshot_date);
 
-CREATE TABLE IF NOT EXISTS variants_daily (
-    snapshot_date       TEXT NOT NULL,
-    store_id            INTEGER NOT NULL REFERENCES stores(id),
-    product_id          INTEGER NOT NULL,
-    variant_id          INTEGER NOT NULL,
-    title               TEXT,
-    sku                 TEXT,
-    price               REAL,
-    compare_at_price    REAL,
-    available           INTEGER NOT NULL,   -- 0/1
-    inventory_management TEXT,              -- 'shopify' = stock is tracked (rung-1 cart probe applies); NULL = unknown/untracked
-    inventory_policy    TEXT,               -- deny (stop selling at 0) | continue (oversell allowed)
-    stock               INTEGER,            -- a stock count the platform itself published (Squarespace qtyInStock, Woo low_stock_remaining...)
-    PRIMARY KEY (snapshot_date, store_id, variant_id)
-);
-
--- Meta Ad Library (Part B). One row per ad ever seen; texts/links refreshed on each sighting.
-CREATE TABLE IF NOT EXISTS meta_ads (
-    ad_id               TEXT PRIMARY KEY,   -- ad_archive_id
-    store_id            INTEGER NOT NULL REFERENCES stores(id),
-    page_id             TEXT,
-    page_name           TEXT,
-    ad_start_date       TEXT,               -- start date shown in the library (first_seen in the spec)
-    ad_end_date         TEXT,
-    first_seen_date     TEXT NOT NULL,      -- our first snapshot containing it
-    last_seen_date      TEXT NOT NULL,
-    primary_text        TEXT,
-    headline            TEXT,
-    landing_url         TEXT,
-    landing_domain      TEXT,
-    caption             TEXT,
-    cta                 TEXT,
-    creative_type       TEXT,               -- image | video | carousel | ...
-    asset_url           TEXT,
-    platforms           TEXT,
-    fingerprint         TEXT,               -- sha1(asset url sans query + text)[:16]
-    page_handle         TEXT,               -- /pages/<handle> advertorials (increment 2)
-    product_handle      TEXT,               -- resolved product (increment 2)
-    query               TEXT,
-    raw_json            TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_meta_ads_store ON meta_ads(store_id, last_seen_date);
-CREATE INDEX IF NOT EXISTS idx_meta_ads_handle ON meta_ads(store_id, product_handle);
-
--- One row per ad per snapshot day. is_active=0 rows are written when a previously seen
--- ad no longer appears in the active search (that is how disappearance is tracked).
-CREATE TABLE IF NOT EXISTS meta_ads_daily (
-    snapshot_date       TEXT NOT NULL,
-    ad_id               TEXT NOT NULL REFERENCES meta_ads(ad_id),
-    store_id            INTEGER NOT NULL REFERENCES stores(id),
-    is_active           INTEGER NOT NULL,
-    position            INTEGER,            -- order in the search results
-    eu_total_reach      INTEGER,
-    reactions           INTEGER,            -- Ad Library does not expose these; NULL unless present
-    comments            INTEGER,
-    shares              INTEGER,
-    collation_count     INTEGER,
-    fetched_at          TEXT NOT NULL,
-    PRIMARY KEY (snapshot_date, ad_id)
-);
-CREATE INDEX IF NOT EXISTS idx_meta_ads_daily_store ON meta_ads_daily(store_id, snapshot_date);
-
--- One row per concept per day (concept = page + landing URL + launch dates within 1 day).
-CREATE TABLE IF NOT EXISTS meta_concepts_daily (
-    snapshot_date   TEXT NOT NULL,
+-- One row per ad ever seen for a store. The landing URL is the key to everything: no product resolution.
+CREATE TABLE IF NOT EXISTS ads (
+    ad_id           TEXT NOT NULL,          -- ad_archive_id
     store_id        INTEGER NOT NULL REFERENCES stores(id),
-    concept_id      TEXT NOT NULL,
-    page_name       TEXT,
-    landing_url     TEXT,
-    product_handle  TEXT,
-    page_handle     TEXT,
-    launch_date     TEXT,
-    days_running    INTEGER,
-    ads_ever        INTEGER,
-    ads_active      INTEGER,
-    survival        REAL,               -- ads_active / ads_ever
-    PRIMARY KEY (snapshot_date, concept_id)
-);
-
--- Per page per day: how much of a page's traffic lands on the store; pages that never do
--- are "ignored" (keyword search picked up an unrelated advertiser).
-CREATE TABLE IF NOT EXISTS meta_pages_daily (
-    snapshot_date   TEXT NOT NULL,
-    store_id        INTEGER NOT NULL REFERENCES stores(id),
-    page_name       TEXT NOT NULL,
-    page_id         TEXT,
-    ads             INTEGER NOT NULL,
-    ads_with_url    INTEGER NOT NULL,
-    on_store        INTEGER NOT NULL,   -- ads landing on the store domain or resolved to a product
-    ignored         INTEGER NOT NULL,
-    PRIMARY KEY (snapshot_date, store_id, page_name)
-);
-
--- Fetched ad landing pages (advertorials, redirectors) and what product they point at.
-CREATE TABLE IF NOT EXISTS landing_pages (
-    url             TEXT PRIMARY KEY,   -- sans query string
-    fetched_at      TEXT NOT NULL,
-    status          INTEGER,
-    final_url       TEXT,
-    product_handle  TEXT,
-    page_handle     TEXT,
-    candidates      TEXT                -- handle:count,... found on the page
-);
-
--- Inventory-delta sales tracking: which variants we probe and what they read each day.
--- Meta part 2 (A): per-ad readings from the single-ad Ad Library page (or the list payload).
-CREATE TABLE IF NOT EXISTS meta_ad_detail_daily (
-    snapshot_date   TEXT NOT NULL,
-    ad_id           TEXT NOT NULL,
-    store_id        INTEGER NOT NULL REFERENCES stores(id),
-    source          TEXT NOT NULL,      -- detail (single-ad page) | list (search results payload)
-    start_date      TEXT,
-    end_date        TEXT,               -- advances daily while the ad delivers
-    is_active       INTEGER,
-    page_like_count INTEGER,
-    status          TEXT,               -- ok | login-wall | no-record | error:<type>
-    fetched_at      TEXT NOT NULL,
-    PRIMARY KEY (snapshot_date, ad_id)
-);
-CREATE TABLE IF NOT EXISTS meta_page_likes_daily (
-    snapshot_date       TEXT NOT NULL,
-    page_id             TEXT NOT NULL,
-    store_id            INTEGER NOT NULL REFERENCES stores(id),
-    page_name           TEXT,
-    page_like_count     INTEGER,
-    likes_delta_1d      INTEGER,
-    likes_slope_7d      REAL,
-    likes_slope_prev_7d REAL,
-    page_categories     TEXT,
-    page_profile_id     TEXT,
-    fetched_at          TEXT NOT NULL,
-    PRIMARY KEY (snapshot_date, page_id)
-);
-CREATE INDEX IF NOT EXISTS idx_page_likes_page ON meta_page_likes_daily(page_id, snapshot_date);
-CREATE TABLE IF NOT EXISTS meta_creatives (
-    ad_id       TEXT NOT NULL,
-    kind        TEXT NOT NULL,           -- image | video
-    position    INTEGER NOT NULL,
-    url         TEXT,
-    sha256      TEXT,
-    bytes       INTEGER,
-    hash_scope  TEXT,                    -- full | first_<n>
-    fetched_at  TEXT NOT NULL,
-    status      TEXT,
-    PRIMARY KEY (ad_id, kind, position)
-);
-CREATE INDEX IF NOT EXISTS idx_meta_creatives_hash ON meta_creatives(sha256);
-
--- Meta part 2 (B): Sponsored posts captured by hand from a feed, and their public counts over time.
-CREATE TABLE IF NOT EXISTS fb_posts (
-    post_id         TEXT PRIMARY KEY,
     page_id         TEXT,
     page_name       TEXT,
-    permalink       TEXT NOT NULL,
+    landing_url     TEXT,                   -- raw, as shown on the card
+    landing_path    TEXT,                   -- normalised: host + path, lower-case, no query string, no trailing slash
+    first_seen      TEXT,                   -- the Ad Library's start date
+    first_scraped   TEXT NOT NULL,          -- our first snapshot containing it
+    last_scraped    TEXT NOT NULL,
     primary_text    TEXT,
-    headline        TEXT,
-    landing_url     TEXT,
-    image_url       TEXT,
-    image_hash      TEXT,
-    source          TEXT,               -- manual | paste | file
-    captured_at     TEXT NOT NULL,
-    store_id        INTEGER REFERENCES stores(id),
-    ad_id           TEXT,               -- matched Ad Library ad
-    match_via       TEXT,               -- text | creative
-    match_score     REAL,
-    status          TEXT,               -- ok | gated | removed | error:<type>
-    note            TEXT
+    PRIMARY KEY (ad_id, store_id)
 );
-CREATE TABLE IF NOT EXISTS fb_posts_daily (
-    snapshot_date           TEXT NOT NULL,
-    post_id                 TEXT NOT NULL REFERENCES fb_posts(post_id),
-    reactions               INTEGER,
-    comments                INTEGER,
-    shares                  INTEGER,
-    status                  TEXT,
-    fetched_at              TEXT NOT NULL,
-    comment_delta_1d        INTEGER,
-    engagement_per_day_7d   REAL,
-    PRIMARY KEY (snapshot_date, post_id)
+CREATE INDEX IF NOT EXISTS idx_ads_store_path ON ads(store_id, landing_path);
+
+-- One row per ad per scrape day. still_active = the ad was present in that day's active search;
+-- low_impressions = the 'Low impression count' badge on the card: 1 / 0, NULL only when the card never rendered
+-- (such an ad is never counted as delivering, and the sheet never shows a '?').
+CREATE TABLE IF NOT EXISTS ads_daily (
+    snapshot_date   TEXT NOT NULL,
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    ad_id           TEXT NOT NULL,
+    still_active    INTEGER NOT NULL,
+    low_impressions INTEGER,
+    position        INTEGER,                -- order in the search results
+    fetched_at      TEXT NOT NULL,
+    PRIMARY KEY (snapshot_date, store_id, ad_id)
+);
+CREATE INDEX IF NOT EXISTS idx_ads_daily_store ON ads_daily(store_id, snapshot_date);
+
+-- Derived per landing path per day (winners.py rewrites a store's rows for the day after each scrape).
+CREATE TABLE IF NOT EXISTS url_daily (
+    snapshot_date       TEXT NOT NULL,
+    store_id            INTEGER NOT NULL REFERENCES stores(id),
+    landing_path        TEXT NOT NULL,
+    delivering          INTEGER NOT NULL,   -- active ads on the URL without the badge
+    delivering_7d_ago   INTEGER,            -- NULL = no scrape 6-8 days earlier
+    proven_days         INTEGER,            -- age of the oldest still-delivering ad on the URL
+    pages               INTEGER NOT NULL,   -- distinct page_ids with a delivering ad
+    pages_new_7d        INTEGER NOT NULL,   -- pages whose first delivering ad on the URL is < 7 days old
+    top_page            TEXT,
+    family_key          TEXT,               -- only for /products/ paths
+    family_created      TEXT,               -- oldest created_at in the family
+    PRIMARY KEY (snapshot_date, store_id, landing_path)
+);
+
+CREATE TABLE IF NOT EXISTS meta_page_runs (
+    id              INTEGER PRIMARY KEY,
+    store_id        INTEGER NOT NULL REFERENCES stores(id),
+    snapshot_date   TEXT NOT NULL,
+    query           TEXT,
+    status          TEXT NOT NULL,          -- ok | blocked | error | skipped
+    detail          TEXT,
+    ads_found       INTEGER,
+    scrolls         INTEGER,
+    duration_s      REAL,
+    ran_at          TEXT NOT NULL
 );
 
 -- Radar: store discovery. One row per landing domain ever seen by a sweep or import.
@@ -279,7 +168,7 @@ CREATE TABLE IF NOT EXISTS radar_domains (
     source              TEXT,               -- hook:<phrase> | copycat:<handle> | web:<query> | manual
     first_seen          TEXT NOT NULL,
     last_checked        TEXT,
-    lander_domain       TEXT,               -- the non-Shopify domain the ads land on, when the store was found via its checkout link
+    lander_domain       TEXT,
     shop_id             INTEGER,
     store_created_est   TEXT,
     store_first_created TEXT,
@@ -288,18 +177,17 @@ CREATE TABLE IF NOT EXISTS radar_domains (
     active_ads          INTEGER,
     pages               INTEGER,
     top_page            TEXT,
-    hot_new_product     TEXT,               -- handle of a product published <= 30 days ago with >= 3 ads
+    hot_new_product     TEXT,
     example_text        TEXT,
-    promote_flag        TEXT,               -- Y from the Candidates tab
+    promote_flag        TEXT,
     promoted_at         TEXT,
     note                TEXT,
-    searched_at         TEXT,               -- last Ad Library search for this domain (active_ads is a sweep lower bound before that)
-    ads_in_sweeps       INTEGER,            -- distinct hook/copycat ads landing here
-    products_fetched    TEXT,               -- last catalogue read (weekly refresh for candidates)
-    handles_new         TEXT,               -- handles published <= 30 days ago at the last catalogue read
-    store_domain        TEXT                -- the Shopify store behind a lander row
+    searched_at         TEXT,
+    ads_in_sweeps       INTEGER,
+    products_fetched    TEXT,
+    handles_new         TEXT,
+    store_domain        TEXT
 );
--- Ads seen by Radar searches (hook phrases, copycat queries, domain checks).
 CREATE TABLE IF NOT EXISTS radar_ads (
     ad_id           TEXT PRIMARY KEY,
     query           TEXT,
@@ -316,7 +204,6 @@ CREATE TABLE IF NOT EXISTS radar_ads (
     is_active       INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_radar_ads_domain ON radar_ads(landing_domain);
--- Every (ad, search) pair: the yield report credits each phrase that returned the ad, not only the first one.
 CREATE TABLE IF NOT EXISTS radar_ad_hits (
     ad_id           TEXT NOT NULL,
     source          TEXT NOT NULL,
@@ -337,86 +224,31 @@ CREATE TABLE IF NOT EXISTS radar_runs (
     domains_found INTEGER,
     note        TEXT
 );
-
--- One row per store per day: does the impressions-sorted search order differ from the newest-first order?
-CREATE TABLE IF NOT EXISTS rank_checks (
-    snapshot_date   TEXT NOT NULL,
-    store_id        INTEGER NOT NULL REFERENCES stores(id),
-    query           TEXT,
-    n_default       INTEGER,
-    n_sorted        INTEGER,
-    n_compared      INTEGER,
-    overlap         INTEGER,
-    same_position   INTEGER,
-    identical       INTEGER,
-    informative     INTEGER,
-    checked_at      TEXT,
-    country         TEXT,                   -- the country view the ranks came from (ALL, or an EU country)
-    note            TEXT,                   -- what each view returned, e.g. 'ALL: 150 ads, same order; DE: 0 ads; NL: 41 ads, informative'
-    PRIMARY KEY (snapshot_date, store_id)
-);
-
-CREATE TABLE IF NOT EXISTS hero_variants (
-    store_id            INTEGER NOT NULL REFERENCES stores(id),
-    variant_id          INTEGER NOT NULL,
-    product_id          INTEGER NOT NULL,
-    handle              TEXT NOT NULL,
-    variant_title       TEXT,
-    price               REAL,
-    role                TEXT,               -- new | rank | bundle_component
-    bundle_like         INTEGER DEFAULT 0,
-    selected_at         TEXT NOT NULL,
-    last_selected_at    TEXT,
-    signal_source       TEXT,               -- cart_probe | theme_inventory | ads_only
-    inventory_tracked   INTEGER,            -- NULL unknown, 1 yes, 0 no (stop probing)
-    last_probe_date     TEXT,
-    consecutive_failures INTEGER DEFAULT 0,
-    note                TEXT,
-    PRIMARY KEY (store_id, variant_id)
-);
-
-CREATE TABLE IF NOT EXISTS inventory_daily (
-    snapshot_date       TEXT NOT NULL,
-    store_id            INTEGER NOT NULL REFERENCES stores(id),
-    variant_id          INTEGER NOT NULL,
-    product_id          INTEGER NOT NULL,
-    stock_level         INTEGER,            -- NULL when the rung gave no number
-    signal_source       TEXT NOT NULL,      -- cart_probe | theme_inventory | ads_only | blocked
-    raw_message         TEXT,
-    probed_at           TEXT NOT NULL,
-    prev_reading_date   TEXT,
-    units_sold_1d       INTEGER,
-    restock_units       INTEGER,
-    units_per_day_7d    REAL,
-    units_per_day_prev_7d REAL,
-    units_per_day_wow   REAL,
-    PRIMARY KEY (snapshot_date, variant_id)
-);
-
-CREATE TABLE IF NOT EXISTS meta_page_runs (
-    id              INTEGER PRIMARY KEY,
-    store_id        INTEGER NOT NULL REFERENCES stores(id),
-    snapshot_date   TEXT NOT NULL,
-    query           TEXT,
-    status          TEXT NOT NULL,          -- ok | blocked | error | skipped
-    detail          TEXT,
-    ads_found       INTEGER,
-    scrolls         INTEGER,
-    duration_s      REAL,
-    ran_at          TEXT NOT NULL
-);
-
--- Populated from build step 5.
-CREATE TABLE IF NOT EXISTS alerts (
-    id              INTEGER PRIMARY KEY,
-    snapshot_date   TEXT NOT NULL,
-    store_id        INTEGER NOT NULL REFERENCES stores(id),
-    product_handle  TEXT,
-    rule            INTEGER NOT NULL,
-    detail          TEXT,
-    created_at      TEXT NOT NULL
-);
+CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
 """
+
+# Tables of the previous layout that carry nothing the six data points need. Dropped by the migration.
+OBSOLETE_TABLES = ("variants_daily", "meta_ads_daily", "meta_ads", "meta_concepts_daily", "meta_pages_daily", "landing_pages",
+                   "meta_ad_detail_daily", "meta_page_likes_daily", "meta_creatives", "fb_posts_daily", "fb_posts", "rank_checks",
+                   "hero_variants", "inventory_daily", "alerts", "products_daily_old")
+
+# Columns added to a table after it was first created (ALTER is idempotent via the column check).
+MIGRATION_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
+               ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),
+               ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT")],
+    "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
+                      ("store_domain", "TEXT")],
+}
+
+# One-off steps, applied once each (recorded in schema_migrations) and part of the schema stamp. The names of the
+# steps of the previous layout are kept so a database that already ran them is not asked to run them again.
+MIGRATION_STEPS: list[tuple[str, str]] = [
+    ("2026-09-10-clear-non-informative-ranks", ""),
+    ("2026-09-10-refetch-ambiguous-landers", ""),
+    ("2026-09-10-landing-resolver-version", ""),
+    ("2026-09-13-six-data-points", "six_data_points"),      # python step, see _migrate_six_data_points
+]
 
 
 def utcnow_iso() -> str:
@@ -437,28 +269,6 @@ def connect(path: Path | str | None = None) -> sqlite3.Connection:
     return conn
 
 
-# One-off data fixes, applied once each (recorded in schema_migrations) and part of the schema stamp.
-MIGRATION_STEPS: list[tuple[str, str]] = [
-    ("2026-09-10-clear-non-informative-ranks",
-     # impression ranks recorded while the sort was judged against the wrong baseline are newest-first positions,
-     # not ranks: drop every rank not backed by a real per-view comparison, and the verdicts derived from them
-     """UPDATE meta_ads_daily SET impression_rank = NULL
-        WHERE impression_rank IS NOT NULL AND NOT EXISTS (
-            SELECT 1 FROM rank_checks c WHERE c.store_id = meta_ads_daily.store_id AND c.snapshot_date = meta_ads_daily.snapshot_date
-              AND c.informative = 1 AND c.note LIKE '%-> informative%');
-        UPDATE stores SET sort_informative = NULL, rank_checked_at = NULL
-        WHERE sort_informative IS NOT NULL AND id NOT IN (
-            SELECT store_id FROM rank_checks WHERE note LIKE '%-> informative%' OR note LIKE '%-> same order%');"""),
-    ("2026-09-10-refetch-ambiguous-landers",
-     # landing pages that named more than one product were resolved by link count (menus and upsells could beat the
-     # buy button); mark them stale so the CTA-weighted resolver fetches them again, keeping the old handle meanwhile
-     """UPDATE landing_pages SET fetched_at = '2000-01-01' WHERE candidates LIKE '%,%' AND status = 200;"""),
-    ("2026-09-10-landing-resolver-version",
-     # rows fetched on/after the day the CTA-weighted resolver shipped were resolved by it (the first refresh-all run)
-     """UPDATE landing_pages SET resolver = 2 WHERE resolver IS NULL AND fetched_at >= '2026-09-10';"""),
-]
-
-
 def schema_stamp() -> int:
     """Checksum of the schema + migration list: the database carries it in user_version once set up, so a
     connection whose code version matches does no write at all on open (read-only commands never take a lock)."""
@@ -470,13 +280,14 @@ def _setup(conn: sqlite3.Connection, stamp: int, attempts: int = 6) -> None:
     (a running ads pass, the scheduled task) holds the database, wait and retry instead of failing on open."""
     for attempt in range(attempts):
         try:
-            conn.executescript(SCHEMA)
+            conn.execute("PRAGMA foreign_keys=OFF")     # dropping the old tables must not trip on their references
             conn.execute("BEGIN IMMEDIATE")
-            _migrate(conn)
-            conn.execute("""INSERT OR IGNORE INTO radar_ad_hits (ad_id, source, query, landing_domain, seen)
-                            SELECT ad_id, source, query, landing_domain, first_seen FROM radar_ads WHERE source IS NOT NULL""")
+            vacuum = _migrate(conn)
             conn.execute(f"PRAGMA user_version = {int(stamp)}")
             conn.commit()
+            conn.execute("PRAGMA foreign_keys=ON")
+            if vacuum:
+                _vacuum(conn)
             return
         except sqlite3.OperationalError as e:
             if "locked" not in str(e).lower() or attempt == attempts - 1:
@@ -488,61 +299,104 @@ def _setup(conn: sqlite3.Connection, stamp: int, attempts: int = 6) -> None:
             time.sleep(wait)
 
 
-MIGRATION_COLUMNS = {   # columns added after the table was first created (ALTER is idempotent via the column check)
-    "meta_ads": [("concept_id", "TEXT"), ("lineage_of", "TEXT"), ("lineage_similarity", "REAL"),
-                 ("landing_resolved_via", "TEXT"), ("landing_handle", "TEXT"), ("page_ignored", "INTEGER"),
-                 ("post_url", "TEXT"), ("engagement_type", "TEXT"), ("reach_keys", "TEXT"),
-                 # part 2 (A): delivery from the single-ad page, page facts, creative fingerprint
-                 ("last_delivered", "TEXT"), ("delivery_status", "TEXT"), ("switched_off_date", "TEXT"),
-                 ("detail_fetched_date", "TEXT"), ("page_profile_id", "TEXT"), ("page_categories", "TEXT"),
-                 ("creative_hash", "TEXT"), ("lineage_via", "TEXT"),
-                 # part 2 (B): matched feed post and its latest counts
-                 ("post_id", "TEXT"), ("post_permalink", "TEXT"), ("low_impressions_key", "TEXT")],
-    "meta_concepts_daily": [("ads_delivering", "INTEGER"), ("survival_source", "TEXT")],
-    "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
-                      ("store_domain", "TEXT")],
-    "alerts": [("dedupe_key", "TEXT")],
-    "landing_pages": [("resolver", "INTEGER")],   # rule version the row was resolved with (ad_metrics.RESOLVER_VERSION)
-    "rank_checks": [("country", "TEXT"), ("note", "TEXT")],
-    "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
-               ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),
-               ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT"),
-               ("sort_informative", "INTEGER"), ("rank_checked_at", "TEXT")],
-    "variants_daily": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT"), ("stock", "INTEGER")],
-    "products_daily": [("unlisted", "INTEGER DEFAULT 0"), ("url_path", "TEXT")],
-    "hero_variants": [("inventory_management", "TEXT"), ("inventory_policy", "TEXT")],
-    "meta_ads_daily": [("low_impressions", "INTEGER"),   # 1 = 'Low impression count' badge on the card, 0 = no badge, NULL = unknown
-                       ("impression_rank", "INTEGER"),   # 1-based position in the "Impressions: high to low" search, NULL = not in it
-                       ("days_running", "INTEGER"), ("engagement", "INTEGER"), ("engagement_delta", "INTEGER"),
-                       ("engagement_per_day", "REAL"),
-                       # reach curve (EU exact, UK exact or range) and the comment curve
-                       ("uk_reach", "INTEGER"), ("reach_range_lower", "INTEGER"), ("reach_range_upper", "INTEGER"),
-                       ("reach_source", "TEXT"), ("reach_delta_1d", "INTEGER"), ("reach_slope_7d", "REAL"),
-                       ("reach_slope_prev_7d", "REAL"), ("comment_delta_1d", "INTEGER"), ("post_status", "TEXT")],
+def _vacuum(conn: sqlite3.Connection) -> None:
+    """Give the space of the dropped tables back to the file system (outside any transaction; may take minutes)."""
+    try:
+        before = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0]
+        log.info("vacuuming the database after dropping the old tables (%.0f MB; this can take a few minutes) ...", before / 1e6)
+        conn.execute("VACUUM")
+        after = conn.execute("PRAGMA page_count").fetchone()[0] * conn.execute("PRAGMA page_size").fetchone()[0]
+        log.info("vacuum done: %.0f MB -> %.0f MB", before / 1e6, after / 1e6)
+    except sqlite3.OperationalError as e:
+        log.warning("vacuum skipped (%s); the file keeps its old size until the next successful vacuum", e)
 
-}
 
-def _migrate(conn: sqlite3.Connection) -> None:
-    """Small, idempotent schema fixes for databases created by earlier versions (runs inside _setup's transaction)."""
-    # ads_daily was a placeholder from build step 1; Part B replaced it with meta_ads*.
-    if conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='ads_daily'").fetchone():
-        if conn.execute("SELECT COUNT(*) FROM ads_daily").fetchone()[0] == 0:
-            conn.execute("DROP TABLE ads_daily")
-    # Part B increment 2 columns (ALTER is idempotent via the column check).
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
+    return conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)).fetchone() is not None
+
+
+def _migrate(conn: sqlite3.Connection) -> bool:
+    """Bring any database (fresh, or from the previous layout) to the current schema. Returns True when tables
+    were dropped and a VACUUM is worth running."""
+    conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
+    done = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
+    dropped = False
+    # products_daily from the old layout carries many more columns: rebuild it minimal before CREATE TABLE IF NOT EXISTS
+    if _table_exists(conn, "products_daily") and "variant_count" in _columns(conn, "products_daily"):
+        _rebuild_products_daily(conn)
+        dropped = True
+    for stmt in re.sub(r"--[^\n]*", "", SCHEMA).split(";"):
+        if stmt.strip():
+            conn.execute(stmt)
     for table, cols in MIGRATION_COLUMNS.items():
-        have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+        have = _columns(conn, table)
         for name, typ in cols:
             if name not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {typ}")
-    conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL)")
-    done = {r[0] for r in conn.execute("SELECT name FROM schema_migrations")}
-    for name, sql in MIGRATION_STEPS:
+    for name, step in MIGRATION_STEPS:
         if name in done:
             continue
-        for stmt in sql.split(";"):
-            if stmt.strip():
-                conn.execute(stmt)
+        if step == "six_data_points":
+            dropped = _migrate_six_data_points(conn) or dropped
         conn.execute("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)", (name, utcnow_iso()))
+    return dropped
+
+
+def _rebuild_products_daily(conn: sqlite3.Connection) -> None:
+    """The old products_daily (variants, prices, tags, collection position) becomes the minimal one; unlisted rows
+    (products invented from ad URLs) are not carried over: only products.json is a data point."""
+    log.info("migrating products_daily to the minimal layout (id, handle, title, dates) ...")
+    have = _columns(conn, "products_daily")
+    unlisted = "COALESCE(unlisted, 0) = 0" if "unlisted" in have else "1 = 1"
+    url_path = "url_path" if "url_path" in have else "'/products/' || handle"
+    conn.execute("ALTER TABLE products_daily RENAME TO products_daily_old")
+    conn.execute("DROP INDEX IF EXISTS idx_products_daily_handle")
+    conn.execute("""CREATE TABLE products_daily (
+        snapshot_date TEXT NOT NULL, store_id INTEGER NOT NULL REFERENCES stores(id), product_id INTEGER NOT NULL,
+        handle TEXT NOT NULL, title TEXT, created_at TEXT, published_at TEXT, updated_at TEXT, url_path TEXT,
+        fetched_at TEXT NOT NULL, PRIMARY KEY (snapshot_date, store_id, product_id))""")
+    conn.execute(f"""INSERT OR IGNORE INTO products_daily (snapshot_date, store_id, product_id, handle, title, created_at, published_at,
+                       updated_at, url_path, fetched_at)
+                     SELECT snapshot_date, store_id, product_id, handle, title, created_at, published_at, updated_at,
+                            COALESCE({url_path}, '/products/' || handle), fetched_at
+                     FROM products_daily_old WHERE {unlisted}""")
+    conn.execute("DROP TABLE products_daily_old")
+
+
+def _migrate_six_data_points(conn: sqlite3.Connection) -> bool:
+    """Copy the ads of the previous layout (meta_ads / meta_ads_daily) into ads / ads_daily, then drop every table
+    that carried a deleted signal. Idempotent: runs once, recorded in schema_migrations."""
+    from .winners import normalise_landing_path
+    dropped = False
+    if _table_exists(conn, "meta_ads") and _table_exists(conn, "meta_ads_daily"):
+        n_ads = conn.execute("SELECT COUNT(*) FROM meta_ads").fetchone()[0]
+        log.info("migrating %d ads from the previous layout ...", n_ads)
+        rows = conn.execute("""SELECT ad_id, store_id, page_id, page_name, ad_start_date, first_seen_date, last_seen_date, landing_url,
+                                      substr(COALESCE(primary_text, ''), 1, 500) AS primary_text FROM meta_ads""").fetchall()
+        conn.executemany("""INSERT OR IGNORE INTO ads (ad_id, store_id, page_id, page_name, landing_url, landing_path, first_seen,
+                                                       first_scraped, last_scraped, primary_text) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                         [(r["ad_id"], r["store_id"], r["page_id"], r["page_name"], r["landing_url"], normalise_landing_path(r["landing_url"]),
+                           r["ad_start_date"] or r["first_seen_date"], r["first_seen_date"], r["last_seen_date"], r["primary_text"] or None)
+                          for r in rows])
+        have = _columns(conn, "meta_ads_daily")
+        low = "low_impressions" if "low_impressions" in have else "NULL"
+        conn.execute(f"""INSERT OR IGNORE INTO ads_daily (snapshot_date, store_id, ad_id, still_active, low_impressions, position, fetched_at)
+                         SELECT snapshot_date, store_id, ad_id, is_active, {low}, position, fetched_at FROM meta_ads_daily""")
+    for t in OBSOLETE_TABLES:
+        if _table_exists(conn, t):
+            conn.execute(f"DROP TABLE {t}")
+            dropped = True
+    for idx in ("idx_meta_ads_store", "idx_meta_ads_handle", "idx_meta_ads_daily_store", "idx_page_likes_page", "idx_meta_creatives_hash"):
+        conn.execute(f"DROP INDEX IF EXISTS {idx}")
+    # url_daily for the days already in the database, so the sheet shows history right after the update
+    if _table_exists(conn, "ads_daily"):
+        from .winners import rebuild_url_daily
+        rebuild_url_daily(conn)
+    return dropped
 
 
 # ---------------------------------------------------------------- stores
@@ -570,31 +424,23 @@ def upsert_store(conn: sqlite3.Connection, domain: str, meta_page_name: str | No
 # ---------------------------------------------------------------- runs
 
 def start_run(conn: sqlite3.Connection, snapshot_date: str, stores_total: int) -> int:
-    cur = conn.execute(
-        "INSERT INTO runs (snapshot_date, started_at, stores_total) VALUES (?,?,?)",
-        (snapshot_date, utcnow_iso(), stores_total),
-    )
+    cur = conn.execute("INSERT INTO runs (snapshot_date, started_at, stores_total) VALUES (?,?,?)",
+                       (snapshot_date, utcnow_iso(), stores_total))
     conn.commit()
     return int(cur.lastrowid)
 
 
 def finish_run(conn: sqlite3.Connection, run_id: int, ok: int, failed: int) -> None:
-    conn.execute(
-        "UPDATE runs SET finished_at = ?, stores_ok = ?, stores_failed = ? WHERE id = ?",
-        (utcnow_iso(), ok, failed, run_id),
-    )
+    conn.execute("UPDATE runs SET finished_at = ?, stores_ok = ?, stores_failed = ? WHERE id = ?", (utcnow_iso(), ok, failed, run_id))
     conn.commit()
 
 
 def record_store_run(conn: sqlite3.Connection, run_id: int, store_id: int, snapshot_date: str,
-                     status: str, error: str | None, products_seen: int, pages_fetched: int,
-                     duration_s: float) -> None:
+                     status: str, error: str | None, products_seen: int, pages_fetched: int, duration_s: float) -> None:
     conn.execute(
-        """INSERT OR REPLACE INTO store_runs
-           (run_id, store_id, snapshot_date, status, error, products_seen, pages_fetched, duration_s)
+        """INSERT OR REPLACE INTO store_runs (run_id, store_id, snapshot_date, status, error, products_seen, pages_fetched, duration_s)
            VALUES (?,?,?,?,?,?,?,?)""",
-        (run_id, store_id, snapshot_date, status, error, products_seen, pages_fetched, round(duration_s, 2)),
-    )
+        (run_id, store_id, snapshot_date, status, error, products_seen, pages_fetched, round(duration_s, 2)))
     conn.commit()
 
 
@@ -602,64 +448,26 @@ def record_store_run(conn: sqlite3.Connection, run_id: int, store_id: int, snaps
 
 def write_product_snapshot(conn: sqlite3.Connection, store_id: int, snapshot_date: str,
                            products: list[dict], fetched_at: str | None = None) -> int:
-    """Write one day's snapshot for a store. `products` are normalised records from
-    shopify.normalise_products(). Same-day re-runs replace that day's rows only."""
+    """Write one day's catalogue for a store: product id, handle, title, created_at, published_at (+ updated_at and
+    the page path). `products` are normalised records (shopify.normalise_products / platforms.make_product);
+    extra keys are ignored. Same-day re-runs replace that day's rows only."""
     fetched_at = fetched_at or utcnow_iso()
     with conn:  # single transaction: a crash mid-write leaves no partial day
-        conn.execute("DELETE FROM products_daily WHERE snapshot_date = ? AND store_id = ? AND COALESCE(unlisted, 0) = 0",
-                     (snapshot_date, store_id))
-        conn.execute("""DELETE FROM variants_daily WHERE snapshot_date = ? AND store_id = ? AND product_id NOT IN
-                        (SELECT product_id FROM products_daily WHERE snapshot_date = ? AND store_id = ? AND unlisted = 1)""",
-                     (snapshot_date, store_id, snapshot_date, store_id))
+        conn.execute("DELETE FROM products_daily WHERE snapshot_date = ? AND store_id = ?", (snapshot_date, store_id))
         conn.executemany(
-            """INSERT INTO products_daily
-               (snapshot_date, store_id, product_id, handle, title, vendor, product_type, tags,
-                created_at, published_at, updated_at, variant_count, sold_out_variants,
-                min_price, max_price, collection_position, fetched_at, url_path)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [
-                (snapshot_date, store_id, p["product_id"], p["handle"], p["title"], p["vendor"],
-                 p["product_type"], json.dumps(p["tags"]), p["created_at"], p["published_at"],
-                 p["updated_at"], p["variant_count"], p["sold_out_variants"], p["min_price"],
-                 p["max_price"], p["collection_position"], fetched_at, p.get("url_path") or f"/products/{p['handle']}")
-                for p in products
-            ],
-        )
-        # unlisted products discovered through ads are re-attached to the new day's snapshot
-        # (write_product_snapshot only replaces the listed catalogue)
-        conn.executemany(
-            """INSERT INTO variants_daily
-               (snapshot_date, store_id, product_id, variant_id, title, sku, price, compare_at_price, available,
-                inventory_management, inventory_policy, stock)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-            [
-                (snapshot_date, store_id, p["product_id"], v["variant_id"], v["title"], v["sku"],
-                 v["price"], v["compare_at_price"], 1 if v["available"] else 0,
-                 v.get("inventory_management"), v.get("inventory_policy"), v.get("stock"))
-                for p in products for v in p["variants"]
-            ],
-        )
+            """INSERT INTO products_daily (snapshot_date, store_id, product_id, handle, title, created_at, published_at, updated_at,
+                                           url_path, fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            [(snapshot_date, store_id, p["product_id"], p["handle"], p.get("title"), p.get("created_at"), p.get("published_at"),
+              p.get("updated_at"), p.get("url_path") or f"/products/{p['handle']}", fetched_at) for p in products])
     return len(products)
 
 
-def write_unlisted_product(conn: sqlite3.Connection, store_id: int, snapshot_date: str, p: dict,
-                           fetched_at: str | None = None) -> None:
-    """Add one product that is live on the store but absent from products.json (found because
-    ads point at it). Idempotent per (day, store, product)."""
-    fetched_at = fetched_at or utcnow_iso()
-    with conn:
-        conn.execute(
-            """INSERT OR REPLACE INTO products_daily
-               (snapshot_date, store_id, product_id, handle, title, vendor, product_type, tags,
-                created_at, published_at, updated_at, variant_count, sold_out_variants,
-                min_price, max_price, collection_position, fetched_at, unlisted)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
-            (snapshot_date, store_id, p["product_id"], p["handle"], p["title"], p["vendor"], p["product_type"],
-             json.dumps(p["tags"]), p["created_at"], p["published_at"], p["updated_at"], p["variant_count"],
-             p["sold_out_variants"], p["min_price"], p["max_price"], None, fetched_at))
-        conn.executemany(
-            """INSERT OR REPLACE INTO variants_daily
-               (snapshot_date, store_id, product_id, variant_id, title, sku, price, compare_at_price, available)
-               VALUES (?,?,?,?,?,?,?,?,?)""",
-            [(snapshot_date, store_id, p["product_id"], v["variant_id"], v["title"], v["sku"], v["price"],
-              v["compare_at_price"], 1 if v["available"] else 0) for v in p["variants"]])
+def latest_products(conn: sqlite3.Connection, store_id: int, as_of: str | None = None) -> tuple[str | None, list[dict]]:
+    """(snapshot_date, products) of the store's latest catalogue on or before as_of."""
+    d = conn.execute("SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = ? AND snapshot_date <= ?",
+                     (store_id, as_of or "9999")).fetchone()[0]
+    if not d:
+        return None, []
+    rows = conn.execute("""SELECT product_id, handle, title, created_at, published_at, updated_at, url_path
+                           FROM products_daily WHERE store_id = ? AND snapshot_date = ? ORDER BY handle""", (store_id, d))
+    return d, [dict(r) for r in rows]

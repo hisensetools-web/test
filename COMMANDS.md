@@ -3,40 +3,41 @@
 All commands run in PowerShell from `C:\Users\top2\Desktop\test`. Most days you run nothing:
 two scheduled tasks do the work and the Google Sheet updates itself.
 
-## 1. Set up once (do these now, in this order)
+## 1. After this update (once)
 
 ```powershell
-git pull                      # get the latest code (do this whenever I say "pushed")
-.\register_task.ps1           # registers the 09:00 morning task and the 22:00 Meta task
+git pull
+python tracker.py db-check        # the first command after the pull converts data/tracker.db to the new layout (a few minutes, once)
+python tracker.py status          # shows the converted database: ads, delivering, winners per store
+.\register_task.ps1               # only if you have not run it since the hidden-window change
 ```
 
-Then:
+Then paste `sheets\Code.gs` into your Apps Script project and deploy a new version (Deploy > Manage deployments >
+pencil > New version). The sheet now has three tabs: **Winners**, **Stores**, **Candidates**. The old tabs (Signals,
+Early, Families, Categories, Pages, Ads, Products, Alerts) are no longer written; delete them by hand when you like.
 
-1. Open `.env`. Remove the `META_STORES=...` line (or put `#` in front) so the night task covers every store.
-2. Paste `sheets\Code.gs` into your Apps Script project and deploy a new version. Needed whenever a tab gains columns; the sync tells you if the deployed script is stale.
-3. Optional, for engagement on ads: in Chrome open `chrome://extensions`, turn on Developer mode, Load unpacked, choose `tools\fb_observer`.
+`python tracker.py sync-sheets` refuses to write until the new `Code.gs` is deployed (it would put values under the
+wrong headers otherwise) and tells you so.
 
-## 1b. A whole day by hand (when you would rather run it yourself)
+## 1b. A whole day by hand
 
-Same order as the scheduled tasks. Run them one at a time in one PowerShell window; each finishes before the next starts.
+Same order as the scheduled tasks, one at a time in one PowerShell window:
 
 ```powershell
-git pull                                               # 0. latest code (only if I said "pushed")
-python tracker.py run --no-ads                         # 1. Shopify pass: catalogue snapshot of every store + stock probe + Sheets sync (~15 min)
-python tracker.py ads --max-minutes 480                # 2. Meta pass: Ad Library for the least recently scraped stores, stops after 8 h (~7 min/store)
-python tracker.py radar                                # 3. new-domain pass: triage of new landing domains + daily re-check (~30 min; Sundays it also sweeps, ~4 h)
-python tracker.py sync-sheets                          # 4. push everything to the Google Sheet and verify it
-python tracker.py radar-report                         # 5. optional: hook yield + Candidates in the terminal
+python tracker.py run --no-ads                         # 1. catalogues: id, handle, title, dates of every product + shop id (~10 min)
+python tracker.py ads --max-minutes 480                # 2. Meta pass: every ad of each store, badge read per card (~3 min/store)
+python tracker.py radar                                # 3. new-domain pass (~30 min; Sundays it also sweeps, ~4 h)
+python tracker.py sync-sheets                          # 4. push Winners / Stores / Candidates and verify the row counts
+python tracker.py report                               # 5. the Winners tab in the terminal
 ```
 
-Shorter versions of the same steps:
+Shorter versions:
 
 ```powershell
-python tracker.py run --only x.com y.com               # Shopify pass for a few stores
-python tracker.py ads --only x.com y.com               # Meta pass for a few stores (~7 min each)
-python tracker.py ads --max-minutes 120                # Meta pass, but stop after 2 h (the rest continue next time)
-python tracker.py inventory --only x.com               # stock probe only
-python tracker.py radar --sweep                        # force the weekly discovery sweep now (~4 h); a re-run continues where it stopped
+python tracker.py run --only x.com y.com               # catalogues for a few stores
+python tracker.py ads --only x.com y.com               # Meta pass for a few stores
+python tracker.py ads --max-minutes 120                # Meta pass, stop after 2 h (the rest continue next time)
+python tracker.py radar --sweep                        # force the weekly discovery sweep now; a re-run continues where it stopped
 python tracker.py radar --no-sweep                     # triage only, even on a Sunday
 ```
 
@@ -46,147 +47,93 @@ Nothing is lost if you stop a command with Ctrl+C: every pass writes as it goes,
 
 | when | task | what you get |
 |---|---|---|
-| 09:00 daily | Shopify snapshot, stock probe, Sheets sync | Signals, Early, Families, Categories, Stores, Products tabs refreshed; ~15 min |
-| 22:00 daily | Meta Ad Library, least recently scraped stores first, up to 8 h, then Radar (triage; sweeps on Sundays, up to 4 h), then Sheets sync | ad columns on Signals, concepts, lineage, delivery, page likes, Pages tab, Candidates tab, new stores on the watchlist |
+| 09:00 daily | catalogues + shop ids, Sheets sync | Stores tab refreshed, product families and ages current; ~10 min |
+| 22:00 daily | Meta Ad Library (least recently scraped stores first, until 08:30), then Radar, then Sheets sync | Winners tab (delivering per landing URL, week over week), Candidates tab, new stores on the watchlist |
 
-The machine must be on and logged in at those times (the tracker keeps Windows awake while a pass runs; a closed lid still sleeps it). Logs: `logs\run_YYYY-MM-DD.log` and `logs\meta_YYYY-MM-DD.log`.
+The machine must be on and logged in at those times (the tracker keeps Windows awake while a pass runs; a closed
+lid still sleeps it). Logs: `logs\run_YYYY-MM-DD.log` and `logs\meta_YYYY-MM-DD.log`. Both tasks end by writing
+the diagnostics report to the Google Doc "EarlyScale Diag".
 
-## 2b. Getting the data into the Google Sheet
+## 3. Reading the Winners tab
 
-You normally do nothing: both scheduled tasks end with a sync, and so does `python tracker.py run`.
-The sync only happens if `SHEETS_WEBHOOK_URL=...` is in `.env`. To push by hand at any time:
+One row per landing URL (host + path, query string removed) with at least 3 delivering ads in the store's latest scrape.
+
+| column | meaning |
+|---|---|
+| `delivering` | active ads on this URL whose card shows no "Low impression count" badge |
+| `delivering_7d_ago` | the same number from the scrape 6-8 days earlier; blank = no scrape then |
+| `delivering_wow` | delivering / delivering_7d_ago; `new` = 0 a week ago; the tab is sorted on it (`new` first, blank last), then on delivering |
+| `proven_days` | age of the oldest still-delivering ad on the URL (start date from the Ad Library) |
+| `pages` / `pages_new_7d` | distinct Facebook pages with a delivering ad here / those whose first delivering ad here is under 7 days old |
+| `top_page` | the page with the most delivering ads |
+| `family_age_days` | only for `/products/` URLs: days since the oldest `created_at` in the product family (duplicates like `-copy`, `-1`, `-otp` grouped). Blank for `/pages/` landers: the tracker does not guess what a lander sells |
+| `store_age_days` | from the shop id and `calibration\shop_ids.csv`; blank without a calibration |
+| `ads_as_of` | the scrape date the row comes from; rows from different nights are not the same day |
+
+In the terminal:
 
 ```powershell
-python tracker.py sync-sheets                # rewrite every tab from the database, then check row counts
-python tracker.py sync-sheets --verify-only  # check only, send nothing
+python tracker.py report                               # the Winners tab
+python tracker.py report --store elivorahealth.com     # one store
+python tracker.py url https://elivorahealth.com/pages/prostate   # one URL: delivering per day + the ads behind it (badge per ad)
+python tracker.py status                               # per store: products, ads, delivering, winners, last status
+python tracker.py radar-report                         # hook phrases by yield, radar totals, recent searches, Candidates
 ```
-
-Every sync ends with a "sheet vs database" table; every row should say `yes`. A sync refuses to write when the
-deployed `Code.gs` has different columns than the code (it would put values under the wrong headers): paste
-`sheets\Code.gs` again and deploy a new version, then re-run.
-
-The **Early** tab is Signals reduced to products created in the last 90 days that have at least one ad,
-youngest first: the rows a reader that only takes the top of a tab must not lose.
-
-## 3. Looking at the data
-
-The Google Sheet is the main view. In the terminal:
-
-```powershell
-python tracker.py status                      # what is in the database
-python tracker.py report                      # stores by how much changed, product-level changes
-python tracker.py product <handle>            # one product's history
-python tracker.py ads-report                  # per store: ads, where they land, products by ads, concepts, alerts
-python tracker.py ads-report --store x.com    # one store
-python tracker.py ads-detail-report --days 7  # delivery (end_date) per day, page likes, coverage
-python tracker.py inventory-report --raw      # stock readings per hero variant, fallback rung per store
-python tracker.py fb-report                   # captured Sponsored posts, matches, reactions over time
-python tracker.py radar-report                # hook phrases by yield, radar totals, recent searches, Candidates
-python tracker.py delivering-report --handle <handle>   # active vs delivering ads (low-impression badge) for a product, before/after
-python tracker.py ads-fields --grep impression          # which payload keys carry the badge (confirm Meta's field name)
-python tracker.py rank-check --only a.com b.com         # is the 'Impressions: high to low' sort informative for these stores?
-```
-
-Alerts also land in `alerts\YYYY-MM-DD.md` and the Alerts tab.
 
 ## 4. When something looks wrong
 
 ```powershell
-Get-Content logs\run_2026-09-08.log -Tail 40           # did the morning run happen, what failed
-Get-Content logs\meta_2026-09-08.log -Tail 40          # same for the night run
-python tracker.py sync-sheets --verify-only            # does the sheet hold what the DB holds (per tab, per store)
+python tracker.py diag                                 # writes the report to the Google Doc 'EarlyScale Diag' (+ logs\diag.txt); --print shows it
+Get-Content logs\run_2026-09-13.log -Tail 40           # did the morning run happen, what failed
+Get-Content logs\meta_2026-09-13.log -Tail 40          # same for the night run
+python tracker.py sync-sheets --verify-only            # does the sheet hold what the DB holds (per tab)
 python tracker.py sync-sheets                          # push everything to the sheet now
-python tracker.py inventory-probe x.com                # one live cart probe with status, headers, body
-python tracker.py ads-detail --ads <ad_id>             # one single-ad page, prints what was parsed
+python tracker.py db-check                             # 'database is locked'? shows whether tracker.db is free and what could be holding it
+python tracker.py rebuild                              # recompute the per-URL numbers from the stored ads (no scraping)
 dir logs                                               # which days actually ran (no file = the task did not run that day)
 schtasks /Query /TN "ShopifyTracker Daily" /V /FO LIST | findstr /C:"Last Run Time" /C:"Last Result" /C:"Next Run Time"
 schtasks /Query /TN "ShopifyTracker Meta"  /V /FO LIST | findstr /C:"Last Run Time" /C:"Last Result" /C:"Next Run Time"
 ```
 
-`Cannot find path 'logs\run_<today>.log'` means the morning task has not run yet today: either it is not
-09:00 yet, or the laptop was asleep / off / on the lock screen at 09:00. The 22:00 task names its log by
-the day it *started*, so last night is `meta_<yesterday>.log`. `register_task.ps1` (re-run it once after
-`git pull`) tells Windows to run a missed start as soon as the machine is awake and to wake it from sleep
-for the start; a closed lid or a shut-down laptop still cannot run anything. "Last Result: 0" = ran fine.
+`Cannot find path 'logs\run_<today>.log'` means the morning task has not run yet today. The 22:00 task names its
+log by the day it *started*, so last night is `meta_<yesterday>.log`. "Last Result: 0" = ran fine.
 
-## 5. Running a pass by hand (only when you do not want to wait for the schedule)
-
-```powershell
-python tracker.py run                                  # morning pass now (~15 min)
-python tracker.py ads --only x.com y.com               # Meta for specific stores (~6 min each)
-python tracker.py ads --max-minutes 60                 # Meta for the watchlist, capped at an hour
-python tracker.py inventory --only x.com               # stock probe for specific stores
-python tracker.py radar --sweep                        # weekly discovery sweeps now (~3-4 h), then triage; a re-run continues where it stopped
-python tracker.py radar                                # triage new / parked domains only (~30 min)
-```
-
-## 6. Watchlist
+## 5. Watchlist
 
 ```powershell
 python tracker.py add-store x.com                      # add a store (finds its Facebook page)
-python tracker.py add-store pipitea.com                # use the apex domain even when the shop is on shop.pipitea.com (found automatically)
 python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
-python tracker.py landing https://x.com/pages/prostate     # which product does this lander sell? evidence per product; --apply re-resolves the ads landing there
-python tracker.py landing --refresh-all                # re-fetch every cached lander under the current rules and re-resolve every store's ads (then sync-sheets)
-python tracker.py diag                                 # write the diagnostics report to the Google Doc 'EarlyScale Diag' (+ logs\diag.txt); --print shows it
-python tracker.py db-check                             # 'database is locked'? shows whether tracker.db is free and what could be holding it
-python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad (dead / non-Shopify)
+python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad
 python tracker.py prune-dead --apply                   # ...and remove them from the watchlist
 python tracker.py restore-stores --apply               # put removed stores back (all of them, or name domains after --apply)
 python tracker.py find-page tryhappyharvest.com        # find the store's Facebook page (footer, then Ad Library search); shows candidates
 python tracker.py find-page tryhappyharvest.com --set 1   # save candidate 1;  --query "Happy Harvest" to search another name
 python tracker.py set-page getdovi.com --name "Dovi" --page-id 1234567890   # set it by hand
-```
-
-A store without a Meta page name is searched by its domain, which finds nothing for most brands: set the page for every store that shows `ads_active` empty on the Stores tab after a night pass.
-
-Stores on WooCommerce, Squarespace, Magento, BigCommerce, Wix, headless Shopify or a plain site with a product sitemap are tracked the same way; the Stores tab's `platform` column says what each one runs on. `prune-dead` lists domains where no catalogue was found on any platform.
-
-Stores found by Radar are added automatically with the note `radar: <source> <date>` and show `store_badge=NEW` on Signals for 14 days. To add stores from an ad-spy export or by hand without triage:
-
-```powershell
 python tracker.py radar-add x.com https://y.com/products/z   # straight onto the watchlist (source=manual)
 ```
 
-or drop a `.txt` / `.csv` into `radar\imports\` (one domain per line, or a CSV with a domain/website/url column); the night run imports it and moves the file to `radar\imports\done\`.
+A store without a Meta page name is searched by its domain, which finds nothing for most brands: set the page for
+every store whose `ads_as_of` stays empty on the Stores tab after a night pass. Keep one domain per advertiser: two
+watchlist entries sharing one Facebook page (luma.viture.com and viture.com) each get the same ads.
 
-## 7. Engagement on ads (optional, only if you installed the extension)
+Or drop a `.txt` / `.csv` into `radar\imports\` (one domain per line, or a CSV with a domain/website/url column); the
+night run imports it and moves the file to `radar\imports\done\`.
 
-```powershell
-python tracker.py fb-bait                              # opens the stores' hero products in your browser; add to cart by hand
-python tracker.py fb-listen                            # leave running while you browse Facebook; Sponsored posts are captured
-python tracker.py fb-capture <permalink> --page "Brand" --text "the ad copy"   # capture one post by hand
-```
-
-Captured posts are re-counted by the morning run automatically.
-
-## 8. Settings (`.env`)
+## 6. Settings (`.env`)
 
 | line | effect |
 |---|---|
 | `SHEETS_WEBHOOK_URL=...` | your Apps Script /exec URL; without it there is no sync |
 | `META_ADS=1` | `run` includes the Meta pass when run by hand (the night task does it anyway) |
-| `META_STORES=a.com,b.com` | limit the Meta pass to these stores (default: all, rotating) |
-| `INVENTORY_STORES=a.com,b.com` | which stores get the stock probe (`INVENTORY=1` = all); stores whose products.json says `inventory_management=shopify` are probed anyway |
-| `META_MAX_SCROLLS=20` / `META_DETAIL_MAX=15` | how deep each store's Meta scrape goes (~3-4 min per store at these; 40 / 30 covered only ~50 stores a night) |
+| `META_STORES=a.com,b.com` | limit the Meta pass to these stores (default: all, least recently scraped first) |
+| `META_MAX_SCROLLS=20` | how deep each store's Meta scrape goes (~350 newest ads, ~3 min per store) |
 | `RADAR_MAX_MINUTES=240` | cap for one radar run (sweeps + triage); leftovers continue next time |
 | `RADAR_MAX_AGE_DAYS=180` / `RADAR_MIN_ACTIVE_ADS=10` | promotion thresholds: (age <= 180 d OR a product <= 30 d old with >= 3 ads) AND >= 10 active ads |
-| `RADAR_FUNNEL_MIN_ADS=3` | a non-Shopify lander needs this many sweep ads to be tracked as a funnel; fewer = discarded (1 keeps everything) |
-| `RADAR_MAX_TRIAGE=40` | Ad Library searches per run for candidates that could promote; the rest wait for the next night |
-| `RADAR_MAX_ADS_PER_QUERY=500` / `RADAR_COUNTRY=US` | how deep each hook / copycat search goes |
 | `RADAR_SWEEP_WEEKDAY=6` | which weekday the sweeps run (6 = Sunday) |
 
-## 9. Radar (finding new stores)
+## 7. Radar (finding new stores)
 
-Runs on its own inside the 22:00 task. What you do:
-
-- **Sunday night / Monday morning:** open the Candidates tab and `python tracker.py radar-report`.
-  The hook table says per phrase how many domains it found and how many were promoted; delete phrases
-  with a `delete` verdict from `radar\hooks.txt` after two sweeps, add siblings of the top producers.
-- **Any day:** type `Y` in the `promote` column of a Candidates row to force it onto the watchlist
-  (picked up by the next sync + radar run). Rows are re-checked daily and promote themselves the day
-  they cross the thresholds; `type=funnel` rows are non-Shopify landers whose ads are tracked anyway.
-- **Signals tab:** `store_badge=NEW` marks stores Radar added in the last 14 days.
-- **Reading a Candidates row:** `active_ads` is every ad radar has seen landing there; while `searched_at`
-  is empty that is only what the sweeps happened to catch. Young stores and stores with a hot new product
-  get an Ad Library search of their pages within the next nights (40 per night), then `active_ads` is real.
+Runs on its own inside the 22:00 task. Sunday night / Monday morning: open the Candidates tab and
+`python tracker.py radar-report`; delete hook phrases with a `delete` verdict from `radar\hooks.txt` after two sweeps,
+add siblings of the top producers. Any day: type `Y` in the `promote` column of a Candidates row to force it onto the
+watchlist (picked up by the next sync + radar run).

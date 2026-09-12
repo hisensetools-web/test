@@ -1,4 +1,4 @@
-"""Google Sheets sync client: row building, chunking, redirect/retry/error handling."""
+"""Google Sheets sync client: row building, chunking, redirect/retry/error handling, the Code.gs header contract."""
 import json
 import unittest
 from pathlib import Path
@@ -6,8 +6,7 @@ from unittest import mock
 
 import requests
 
-from earlyscale import config, db, sheets, shopify
-from tests.test_ad_metrics import _prod
+from earlyscale import config, db, meta_ads, sheets, shopify
 
 config.WATCHLIST_PATH = Path(__file__).parent / "fixtures" / "empty_watchlist.csv"
 
@@ -19,6 +18,11 @@ def load(name):
     return shopify.normalise_products(json.loads((FIX / name).read_text())["products"])
 
 
+def _ad(aid, url, low=0, start="2026-08-20"):
+    return {"ad_id": aid, "page_id": "p1", "page_name": "Example", "start_date": start, "end_date": None, "is_active": 1, "primary_text": "t",
+            "landing_url": url, "landing_domain": "example.com", "low_impressions": low}
+
+
 def two_day_db():
     conn = db.connect(":memory:")
     sid = db.upsert_store(conn, "example.com", "Example")
@@ -28,8 +32,8 @@ def two_day_db():
     db.record_store_run(conn, run_id, sid, D2, "ok", None, 3, 3, 1.0)
     dead = db.upsert_store(conn, "dead.com")
     db.record_store_run(conn, run_id, dead, D2, "error", "HTTP 404 (not a Shopify storefront?)", 0, 0, 0.1)
-    conn.execute("INSERT INTO alerts (snapshot_date, store_id, product_handle, rule, detail, created_at) "
-                 "VALUES (?,?,?,?,?,?)", (D2, sid, "launch-drop", 1, "test alert", "2026-09-06T06:00:00+00:00"))
+    meta_ads.record_scrape(conn, sid, D2, [_ad(str(i), "https://example.com/products/cloud-hoodie?utm=x") for i in range(4)]
+                           + [_ad("9", "https://example.com/pages/story", low=1)], "Example")
     return conn
 
 
@@ -41,74 +45,24 @@ class RowBuildingTests(unittest.TestCase):
         rows = sheets.stores_rows(self.conn)
         self.assertEqual(len(rows), 2)
         H = sheets.STORES_HEADERS
-        ok = next(r for r in rows if r[0] == "example.com")
-        self.assertEqual(len(ok), len(H))
-        self.assertEqual(ok[H.index("meta page")], "Example")
-        self.assertEqual(ok[H.index("last status")], "ok")
-        self.assertEqual(ok[H.index("products")], 3)              # products on latest day
-        self.assertEqual(ok[H.index("sold-out delta")], 0)        # sold-out delta 2 -> 2
-        self.assertEqual(ok[H.index("price changes")], 2)         # price changes
-        self.assertEqual(ok[H.index("last snapshot date")], D2)
-        dead = next(r for r in rows if r[0] == "dead.com")
-        self.assertTrue(dead[H.index("last status")].startswith("error: HTTP 404"))
-        self.assertEqual(dead[H.index("products")], "")           # no snapshot -> blanks, not zeros
+        ok = dict(zip(H, next(r for r in rows if r[0] == "example.com")))
+        self.assertEqual((ok["products"], ok["ads_as_of"], ok["last error"], ok["shop_id"], ok["store_age_days"]), (3, D2, "", "", ""))
+        dead = dict(zip(H, next(r for r in rows if r[0] == "dead.com")))
+        self.assertTrue(dead["last error"].startswith("HTTP 404"))
+        self.assertEqual((dead["products"], dead["ads_as_of"]), ("", ""))       # no snapshot -> blanks, not zeros
 
-    def test_stores_rows_single_day_blank_deltas(self):
-        conn = db.connect(":memory:")
-        sid = db.upsert_store(conn, "one.com")
-        db.write_product_snapshot(conn, sid, D2, load("products_page1.json"))
-        r = sheets.stores_rows(conn)[0]
-        H = sheets.STORES_HEADERS
-        self.assertEqual((r[H.index("sold-out delta")], r[H.index("price changes")]), ("", ""))
-        self.assertEqual(r[H.index("last status")], "never run")
+    def test_winners_rows_one_per_landing_url_with_three_delivering_ads(self):
+        rows = sheets.winners_rows(self.conn)
+        self.assertEqual(len(rows), 1)
+        r = dict(zip(sheets.WINNERS_HEADERS, rows[0]))
+        self.assertEqual((r["store"], r["landing_url"], r["delivering"], r["delivering_wow"], r["pages"], r["top_page"], r["ads_as_of"]),
+                         ("example.com", "example.com/products/cloud-hoodie", 4, "", 1, "Example", D2))
+        self.assertIsInstance(r["family_age_days"], int)      # created_at from the fixture
 
-    def test_products_rows_are_latest_snapshot_only(self):
-        rows = sheets.products_rows(self.conn)
-        self.assertEqual({r[0] for r in rows}, {D2})
-        self.assertEqual(len(rows), 3)
-        hoodie = next(r for r in rows if r[2] == "cloud-hoodie")
-        self.assertEqual(len(hoodie), len(sheets.PRODUCTS_HEADERS))
-        self.assertEqual(hoodie[6], 49.0)       # min price on day 2
-        self.assertEqual((hoodie[7], hoodie[8]), (1, 3))  # available, total
-        self.assertEqual(hoodie[9], "")         # no collection position in fixture
-        # as_of an earlier date picks that day's snapshot
-        self.assertEqual({r[0] for r in sheets.products_rows(self.conn, as_of=D1)}, {D1})
-
-    def test_alerts_rows(self):
-        rows = sheets.alerts_rows(self.conn)
-        self.assertEqual(rows, [[D2, "example.com", "launch-drop", 1, "test alert", "2026-09-06T06:00:00+00:00"]])
-        self.assertEqual(sheets.alerts_rows(db.connect(":memory:")), [])
-
-
-class AdsTabTests(unittest.TestCase):
-    def test_ads_rows_show_attribution_per_ad(self):
-        from tests.test_ad_metrics import _ad, _prod
-        from earlyscale import meta_ads
-        conn = db.connect(":memory:")
-        sid = db.upsert_store(conn, "elivorahealth.com", "Elivora")
-        db.write_product_snapshot(conn, sid, "2026-09-10", [_prod(1, "elivora-prostate-urinary-support-softgels", "Prostate")])
-        ads = [_ad("1001", "Elivora", "2026-08-20", "https://elivorahealth.com/pages/prostate", "Tired of night-time trips? " * 10),
-               _ad("1002", "Elivora", "2026-09-05", "https://elivorahealth.com/products/elivora-prostate-urinary-support-softgels?variant=1", "direct"),
-               _ad("1003", "Elivora", "2026-09-08", "https://elivorahealth.com/pages/prostate", "badge", active=1)]
-        meta_ads.record_scrape(conn, sid, "2026-09-10", ads, "Elivora")
-        conn.execute("UPDATE meta_ads SET product_handle = 'elivora-prostate-urinary-support-softgels', page_handle = 'prostate' WHERE ad_id IN ('1001', '1003')")
-        conn.execute("UPDATE meta_ads SET product_handle = 'elivora-prostate-urinary-support-softgels' WHERE ad_id = '1002'")
-        conn.execute("UPDATE meta_ads_daily SET low_impressions = 1 WHERE ad_id = '1003'")
-        conn.execute("UPDATE meta_ads_daily SET low_impressions = 0 WHERE ad_id IN ('1001', '1002')")
-        conn.commit()
-        rows = sheets.ads_rows(conn, "2026-09-10")
-        H = sheets.ADS_HEADERS
-        self.assertEqual([r[H.index("ad_id")] for r in rows], ["1002", "1001", "1003"])   # delivering first (newest first), badge last
-        r = {h: v for h, v in zip(H, rows[1])}
-        self.assertEqual((r["store"], r["page name"], r["landing_path"], r["resolved_product"], r["delivering"], r["low_impressions"]),
-                         ("elivorahealth.com", "Elivora", "/pages/prostate", "elivora-prostate-urinary-support-softgels", "yes", "no"))
-        self.assertEqual(r["days_running"], 21)
-        self.assertEqual(len(r["primary_text"]), 120)
-        self.assertEqual(rows[0][H.index("landing_path")], "/products/elivora-prostate-urinary-support-softgels?variant=1")
-        self.assertEqual(rows[2][H.index("low_impressions")], "LOW")
-        with mock.patch.object(config, "SHEETS_ADS_PER_STORE", 2):
-            self.assertEqual(len(sheets.ads_rows(conn, "2026-09-10")), 2)
-        self.assertEqual(sheets.expected_headers()["Ads"], H)
+    def test_removed_store_drops_out_of_the_sheet(self):
+        with mock.patch.object(sheets, "watched_store_ids", lambda c: {2}):
+            self.assertEqual([r[0] for r in sheets.stores_rows(self.conn)], ["dead.com"])
+            self.assertEqual(sheets.winners_rows(self.conn), [])
 
 
 class ChunkTests(unittest.TestCase):
@@ -153,10 +107,9 @@ class PostTests(unittest.TestCase):
 
     def test_retries_on_5xx_then_succeeds(self):
         session = mock.Mock()
-        session.post.side_effect = [_resp(500, "<html>boom</html>", ctype="text/html"),
-                                    _resp(200, '{"ok":true,"written":1,"skipped":0}')]
+        session.post.side_effect = [_resp(500, "<html>boom</html>", ctype="text/html"), _resp(200, '{"ok":true,"written":1,"skipped":0}')]
         with mock.patch("earlyscale.sheets.time.sleep") as sleep:
-            data = sheets.post_payload(session, self.URL, {"tab": "Alerts", "rows": []})
+            data = sheets.post_payload(session, self.URL, {"tab": "Stores", "rows": []})
         self.assertTrue(data["ok"])
         self.assertEqual(session.post.call_count, 2)
         sleep.assert_called_once()
@@ -204,26 +157,26 @@ def _tabs_session(headers=None, tabs=None):
 
 
 class SyncTests(unittest.TestCase):
-    TABS = ["Signals", "Early", "Families", "Categories", "Stores", "Pages", "Ads", "Candidates", "Products", "Alerts"]
+    TABS = ["Winners", "Stores", "Candidates"]
 
-    def test_sync_posts_every_tab_with_replace_then_append(self):
+    def test_sync_posts_every_tab_in_replace_mode(self):
         conn = two_day_db()
         session = _tabs_session(headers=sheets.expected_headers())
         out = sheets.sync(conn, "https://x/exec", session=session)
         payloads = [json.loads(c.kwargs["data"]) for c in session.post.call_args_list]
         self.assertEqual([p["tab"] for p in payloads], self.TABS)
-        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 9 + ["append"])
-        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 10)
+        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 3)
+        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 3)
         self.assertEqual([x["tab"] for x in out], self.TABS)
 
     def test_stale_code_gs_refuses_to_write(self):
         """A deployment with different columns would put every value under the wrong header: refuse, say what to do."""
         conn = two_day_db()
-        stale = dict(sheets.expected_headers(), Signals=sheets.SIGNALS_HEADERS[:32])
+        stale = dict(sheets.expected_headers(), Winners=sheets.WINNERS_HEADERS[:8])
         session = _tabs_session(headers=stale)
         with self.assertRaises(sheets.SheetsSyncError) as cm:
             sheets.sync(conn, "https://x/exec", session=session)
-        self.assertIn("Signals", str(cm.exception))
+        self.assertIn("Winners", str(cm.exception))
         self.assertIn("Deploy", str(cm.exception))
         session.post.assert_not_called()
 
@@ -233,7 +186,7 @@ class SyncTests(unittest.TestCase):
         with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
             sheets.sync(conn, "https://x/exec", session=session)
         self.assertTrue(any("does not report its headers" in x for x in logs.output))
-        self.assertEqual(session.post.call_count, 10)
+        self.assertEqual(session.post.call_count, 3)
 
     def test_dry_run_sends_nothing_and_missing_url_is_clear(self):
         conn = two_day_db()
@@ -243,6 +196,16 @@ class SyncTests(unittest.TestCase):
         with self.assertRaises(sheets.SheetsSyncError) as cm:
             sheets.sync(conn, "", session=session)
         self.assertIn("SHEETS_WEBHOOK_URL", str(cm.exception))
+
+    def test_second_sync_at_the_same_time_is_refused(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / "sync.lock"
+            with sheets.SyncLock(lock):
+                with self.assertRaises(sheets.SheetsSyncError) as cm:
+                    sheets.SyncLock(lock).__enter__()
+                self.assertIn("another sync-sheets", str(cm.exception))
+            self.assertFalse(lock.exists())
 
 
 class WatchlistRemoveTests(unittest.TestCase):
@@ -261,50 +224,29 @@ class WatchlistRemoveTests(unittest.TestCase):
             self.assertEqual(left[0]["meta_page_name"], "A.COM")  # other columns preserved
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class VerifyTests(unittest.TestCase):
     """verify() reads counts back from the web app's doGet and compares with the DB."""
 
-    def _session(self, tabs_json, products_json):
+    def _session(self, tabs_json):
         session = mock.Mock()
+
         def get(url, params=None, **kw):
             if params and params.get("tabs"):
                 return _resp(200, json.dumps({"ok": True, "tabs": tabs_json}))
-            if params and params.get("tab"):
-                return _resp(200, json.dumps({"ok": True, "tab": "Products", "rows": sum(products_json.values()), "byValue": products_json}))
             return _resp(404, "nope")
         session.get.side_effect = get
         return session
 
-    def test_match(self):
+    def test_match_and_mismatch(self):
         conn = two_day_db()
         plan = {p["tab"]: len(p["rows"]) for p in sheets.build_plan(conn)}
-        by_store = {}
-        for r in sheets.products_rows(conn):
-            by_store[r[1]] = by_store.get(r[1], 0) + 1
-        v = sheets.verify(conn, "https://x/exec", session=self._session(plan, by_store))
+        v = sheets.verify(conn, "https://x/exec", session=self._session(plan))
         self.assertEqual(v["problems"], [])
         self.assertTrue(all(t["ok"] for t in v["tabs"]))
-        self.assertTrue(all(p["ok"] for p in v["products"]))
-
-    def test_truncated_products_tab_is_reported_per_store(self):
-        conn = two_day_db()
-        plan = {p["tab"]: len(p["rows"]) for p in sheets.build_plan(conn)}
-        by_store = {}
-        for r in sheets.products_rows(conn):
-            by_store[r[1]] = by_store.get(r[1], 0) + 1
-        first = sorted(by_store)[0]
-        short = dict(by_store, **{first: by_store[first] + 1})    # the sheet holds a different count for one store
-        plan_short = dict(plan, Products=sum(short.values()))
-        plan_short["Alerts"] = plan["Alerts"] + 5                  # append tab may hold more than today's rows
-        v = sheets.verify(conn, "https://x/exec", session=self._session(plan_short, short))
-        bad = [p for p in v["products"] if not p["ok"]]
-        self.assertEqual([(p["store"], p["sheet"], p["expected"]) for p in bad], [(first, by_store[first] + 1, by_store[first])])
-        self.assertTrue(any("Products:" in x for x in v["problems"]))
-        self.assertTrue(next(t for t in v["tabs"] if t["tab"] == "Alerts")["ok"])
+        short = dict(plan, Winners=plan["Winners"] + 5)
+        v = sheets.verify(conn, "https://x/exec", session=self._session(short))
+        self.assertEqual([t["tab"] for t in v["tabs"] if not t["ok"]], ["Winners"])
+        self.assertTrue(any("Winners:" in x for x in v["problems"]))
 
     def test_old_deployment_without_doget_json_is_explained(self):
         conn = two_day_db()
@@ -320,12 +262,11 @@ class CodeGsContractTests(unittest.TestCase):
 
     def test_headers_match_and_textcols_in_range(self):
         import re
-        from earlyscale import radar
         src = (Path(__file__).resolve().parent.parent / "sheets" / "Code.gs").read_text(encoding="utf-8")
         expected = sheets.expected_headers()
+        self.assertEqual(set(re.findall(r"^  (\w+): \{", src, re.M)), set(expected))     # no extra tabs in Code.gs either
         for name, headers in expected.items():
-            key = f'"{name}"' if " " in name else name
-            m = re.search(r'  %s: \{\n    headers: (\[.*?\]),.*?textCols: (\[[^\]]*\])' % re.escape(key), src, re.S)
+            m = re.search(r'  %s: \{\n    headers: (\[.*?\]),.*?textCols: (\[[^\]]*\])' % re.escape(name), src, re.S)
             self.assertIsNotNone(m, name)
             self.assertEqual(json.loads(m.group(1)), headers, f"{name} headers differ between Code.gs and sheets.py")
             for i in json.loads(m.group(2)):
@@ -333,29 +274,17 @@ class CodeGsContractTests(unittest.TestCase):
 
 
 class ReadBackTests(unittest.TestCase):
-    """The promote read-back: compact columns, redirect loops, login redirects."""
-
     def test_compact_rows_apply_promote_marks(self):
-        from earlyscale import db, radar
+        from earlyscale import radar
         conn = db.connect(":memory:")
         conn.execute("INSERT INTO radar_domains (domain, status, first_seen) VALUES ('a.com', 'candidate', '2026-09-01'), ('b.com', 'candidate', '2026-09-01')")
-        conn.commit()
         session = mock.Mock()
-        seen = {}
-
-        def get(url, params=None, **kw):
-            seen.update(params or {})
-            return _resp(200, json.dumps({"ok": True, "tab": "Candidates", "cols": ["domain", "promote"], "rows": [["a.com", "Y"], ["b.com", ""]]}))
-        session.get.side_effect = get
+        session.get.return_value = _resp(200, json.dumps({"ok": True, "rows": [["a.com", "Y"], ["b.com", ""]], "cols": ["domain", "promote"]}))
         self.assertEqual(sheets.read_promote_marks(conn, "https://x/exec", session=session), 1)
-        self.assertEqual(seen.get("cols"), "domain,promote")
         self.assertEqual(conn.execute("SELECT promote_flag FROM radar_domains WHERE domain = 'a.com'").fetchone()[0], "Y")
-        # an old deployment ignores cols and returns full rows: still works
-        full = [["a.com"] + [""] * (len(radar.CANDIDATES_HEADERS) - 2) + ["Y"]]
-        self.assertEqual(radar.apply_promote_marks(conn, full), 1)
+        self.assertEqual(len(radar.CANDIDATES_HEADERS), len(sheets.expected_headers()["Candidates"]))
 
     def test_redirect_loop_is_retried_then_reported(self):
-        from earlyscale import db
         conn = db.connect(":memory:")
         session = mock.Mock()
         r = _resp(302, "")
@@ -366,7 +295,6 @@ class ReadBackTests(unittest.TestCase):
                 self.assertEqual(sheets.read_promote_marks(conn, "https://x/exec", session=session, retries=2), 0)
         self.assertEqual(sleep.call_count, 1)
         self.assertIn("kept redirecting", logs.output[0])
-        self.assertIn("script.googleusercontent.com", logs.output[0])
 
     def test_login_redirect_is_explained(self):
         session = mock.Mock()
@@ -381,64 +309,56 @@ class ReadBackTests(unittest.TestCase):
 class EchoHiccupTests(unittest.TestCase):
     """script.googleusercontent.com occasionally answers the one-time redirect with Google's generic 404 page."""
     PAGE = "<!DOCTYPE html><html lang=\"th\"><head><script>window['ppConfig'] = {productName: 'x'}</script></head></html>"
+    EXEC = "https://script.google.com/macros/s/x/exec"
+    ECHO = "https://script.googleusercontent.com/macros/echo?user_content_key=k"
 
     def test_post_retries_a_404_error_page_from_the_echo_host(self):
         session = mock.Mock()
-        session.post.return_value = _resp(302, "", location="https://script.googleusercontent.com/macros/echo?user_content_key=k")
-        session.get.side_effect = [_resp(404, self.PAGE, url="https://script.googleusercontent.com/macros/echo?user_content_key=k", ctype="text/html"),
-                                   _resp(200, json.dumps({"ok": True, "written": 1, "skipped": 0}), url="https://script.googleusercontent.com/macros/echo?user_content_key=k")]
+        session.post.return_value = _resp(302, "", location=self.ECHO)
+        session.get.side_effect = [_resp(404, self.PAGE, url=self.ECHO, ctype="text/html"),
+                                   _resp(200, json.dumps({"ok": True, "written": 1, "skipped": 0}), url=self.ECHO)]
         with mock.patch("earlyscale.sheets.time.sleep") as sleep:
-            data = sheets.post_payload(session, "https://script.google.com/macros/s/x/exec", {"tab": "Signals", "rows": []})
-        self.assertEqual(data["written"], 1)
-        self.assertEqual(session.post.call_count, 2)
+            data = sheets.post_payload(session, self.EXEC, {"tab": "Winners", "rows": []})
+        self.assertEqual((data["written"], session.post.call_count), (1, 2))
         self.assertTrue(sleep.called)
 
     def test_a_404_on_the_exec_url_itself_is_not_retried(self):
         session = mock.Mock()
         session.post.return_value = _resp(404, "nope", ctype="text/html")
         with self.assertRaises(sheets.SheetsSyncError):
-            sheets.post_payload(session, "https://script.google.com/macros/s/x/exec", {"tab": "Signals", "rows": []})
+            sheets.post_payload(session, self.EXEC, {"tab": "Winners", "rows": []})
         self.assertEqual(session.post.call_count, 1)
 
     def test_get_retries_the_echo_error_page(self):
         session = mock.Mock()
-        session.get.side_effect = [_resp(302, "", location="https://script.googleusercontent.com/macros/echo?user_content_key=k"),
-                                   _resp(404, self.PAGE, url="https://script.googleusercontent.com/macros/echo?user_content_key=k", ctype="text/html"),
-                                   _resp(302, "", location="https://script.googleusercontent.com/macros/echo?user_content_key=k2"),
-                                   _resp(200, json.dumps({"ok": True, "tabs": {"Signals": 1}}), url="https://script.googleusercontent.com/macros/echo?user_content_key=k2")]
+        session.get.side_effect = [_resp(302, "", location=self.ECHO), _resp(404, self.PAGE, url=self.ECHO, ctype="text/html"),
+                                   _resp(302, "", location=self.ECHO + "2"),
+                                   _resp(200, json.dumps({"ok": True, "tabs": {"Winners": 1}}), url=self.ECHO + "2")]
         with mock.patch("earlyscale.sheets.time.sleep"):
-            self.assertEqual(sheets.get_json(session, "https://script.google.com/macros/s/x/exec", {"tabs": "1"})["tabs"]["Signals"], 1)
+            self.assertEqual(sheets.get_json(session, self.EXEC, {"tabs": "1"})["tabs"]["Winners"], 1)
 
     def test_post_retries_when_the_health_check_text_comes_back(self):
         session = mock.Mock()
-        echo = "https://script.googleusercontent.com/macros/echo?user_content_key=k"
-        session.post.return_value = _resp(302, "", location=echo)
-        session.get.side_effect = [_resp(200, "ok", url=echo, ctype="text/plain"),
-                                   _resp(200, json.dumps({"ok": True, "written": 3, "skipped": 0}), url=echo)]
+        session.post.return_value = _resp(302, "", location=self.ECHO)
+        session.get.side_effect = [_resp(200, "ok", url=self.ECHO, ctype="text/plain"),
+                                   _resp(200, json.dumps({"ok": True, "written": 3, "skipped": 0}), url=self.ECHO)]
         with mock.patch("earlyscale.sheets.time.sleep"):
             with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
-                data = sheets.post_payload(session, "https://script.google.com/macros/s/x/exec", {"tab": "Signals", "rows": []})
+                data = sheets.post_payload(session, self.EXEC, {"tab": "Winners", "rows": []})
         self.assertEqual((data["written"], session.post.call_count), (3, 2))
         self.assertIn("health-check", logs.output[0])
 
     def test_a_lost_reply_does_not_resend_a_chunk_the_script_already_wrote(self):
-        """The 967 duplicate Candidates rows: every retried chunk had in fact been written; only the reply was lost."""
         session = mock.Mock()
-        echo = "https://script.googleusercontent.com/macros/echo?user_content_key=k"
-        session.post.return_value = _resp(302, "", location=echo)
-        session.get.return_value = _resp(404, self.PAGE, url=echo, ctype="text/html")
+        session.post.return_value = _resp(302, "", location=self.ECHO)
+        session.get.return_value = _resp(404, self.PAGE, url=self.ECHO, ctype="text/html")
         with mock.patch("earlyscale.sheets.time.sleep"):
-            data = sheets.post_payload(session, "https://script.google.com/macros/s/x/exec",
-                                       {"tab": "Candidates", "mode": "replace", "chunk": 2, "rows": [[1], [2], [3]]},
+            data = sheets.post_payload(session, self.EXEC, {"tab": "Candidates", "mode": "replace", "chunk": 2, "rows": [[1], [2], [3]]},
                                        already_applied=lambda: True)
         self.assertEqual((data["written"], data.get("recovered"), session.post.call_count), (3, True, 1))
 
     def test_sync_checks_the_tab_count_before_resending_a_replace_chunk(self):
-        conn = db.connect(":memory:")
-        sid = db.upsert_store(conn, "a.com")
-        db.write_product_snapshot(conn, sid, "2026-09-10", [_prod(1, "p1", "P1"), _prod(2, "p2", "P2")])
-        conn.commit()
-        echo = "https://script.googleusercontent.com/macros/echo?user_content_key=k"
+        conn = two_day_db()
         state = {"posts": 0, "count": 0}
         session = mock.Mock()
 
@@ -446,15 +366,15 @@ class EchoHiccupTests(unittest.TestCase):
             body = json.loads(data)
             state["posts"] += 1
             state["count"] = len(body["rows"])          # the script writes the rows ...
-            return _resp(302, "", location=echo)         # ... but the reply is a redirect that will fail
+            return _resp(302, "", location=self.ECHO)    # ... but the reply is a redirect that will fail
 
         def get(url, params=None, **kw):
             if params and params.get("tabs"):
-                return _resp(200, json.dumps({"ok": True, "tabs": {"Products": state["count"]}, "headers": {}}))
-            return _resp(404, EchoHiccupTests.PAGE, url=echo, ctype="text/html")
+                return _resp(200, json.dumps({"ok": True, "tabs": {"Stores": state["count"]}, "headers": {}}))
+            return _resp(404, self.PAGE, url=self.ECHO, ctype="text/html")
         session.post.side_effect, session.get.side_effect = post, get
         with mock.patch("earlyscale.sheets.time.sleep"):
-            out = sheets.sync(conn, "https://script.google.com/macros/s/x/exec", tabs=["products"], session=session, check_headers=False)
+            out = sheets.sync(conn, self.EXEC, tabs=["stores"], session=session, check_headers=False)
         self.assertEqual((state["posts"], out[0]["written"]), (1, 2))
 
     def test_an_unreachable_web_app_is_a_sync_error_not_a_traceback(self):
@@ -462,18 +382,21 @@ class EchoHiccupTests(unittest.TestCase):
         session.get.side_effect = requests.ConnectionError("Failed to resolve 'script.google.com'")
         with mock.patch("earlyscale.sheets.time.sleep"):
             with self.assertRaises(sheets.SheetsSyncError) as cm:
-                sheets.get_json(session, "https://script.google.com/macros/s/x/exec", {"tabs": "1"})
+                sheets.get_json(session, self.EXEC, {"tabs": "1"})
         self.assertIn("cannot reach", str(cm.exception))
         self.assertEqual(session.get.call_count, 3)
 
     def test_post_re_posts_when_the_echo_host_keeps_redirecting(self):
         session = mock.Mock()
-        echo = "https://script.googleusercontent.com/macros/echo?user_content_key=k"
-        session.post.return_value = _resp(302, "", location=echo)
-        loop = _resp(302, "", url=echo, location=echo)
-        session.get.side_effect = [loop] * 10 + [_resp(200, json.dumps({"ok": True, "written": 1, "skipped": 0}), url=echo)]
+        session.post.return_value = _resp(302, "", location=self.ECHO)
+        loop = _resp(302, "", url=self.ECHO, location=self.ECHO)
+        session.get.side_effect = [loop] * 10 + [_resp(200, json.dumps({"ok": True, "written": 1, "skipped": 0}), url=self.ECHO)]
         with mock.patch("earlyscale.sheets.time.sleep"):
             with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
-                data = sheets.post_payload(session, "https://script.google.com/macros/s/x/exec", {"tab": "Signals", "rows": []})
+                data = sheets.post_payload(session, self.EXEC, {"tab": "Winners", "rows": []})
         self.assertEqual((data["written"], session.post.call_count), (1, 2))
         self.assertIn("kept redirecting", logs.output[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

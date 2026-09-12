@@ -1,5 +1,5 @@
 # Registers two Task Scheduler tasks:
-#   "ShopifyTracker Daily"  run_daily.bat        at -Time     (09:00): Shopify + stock probe + Sheets, ~15 min
+#   "ShopifyTracker Daily"  run_daily.bat        at -Time     (09:00): catalogues + shop ids + Sheets, ~10 min
 #   "ShopifyTracker Meta"   run_daily.bat meta   at -MetaTime (22:00): Meta Ad Library for the watchlist, up to 8 h
 # Run from PowerShell in the project folder:   .\register_task.ps1
 #                                  or, e.g.:   .\register_task.ps1 -Time 07:30 -MetaTime 23:00

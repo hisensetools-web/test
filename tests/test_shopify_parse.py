@@ -14,40 +14,29 @@ def load(name):
 class NormaliseTests(unittest.TestCase):
     def setUp(self):
         raw = load("products_page1.json")["products"]
-        coll = load("collection_all.json")["products"]
-        positions = {p["id"]: i for i, p in enumerate(coll)}
-        self.products = shopify.normalise_products(raw, positions)
+        self.products = shopify.normalise_products(raw)
         self.by_handle = {p["handle"]: p for p in self.products}
 
     def test_malformed_record_is_skipped_not_fatal(self):
         self.assertEqual(sorted(self.by_handle), ["cloud-hoodie", "no-variants", "ridge-wallet"])
 
-    def test_variant_aggregates(self):
+    def test_only_identity_and_dates_are_kept(self):
         p = self.by_handle["cloud-hoodie"]
-        self.assertEqual(p["variant_count"], 3)
-        self.assertEqual(p["sold_out_variants"], 2)
-        self.assertEqual(p["min_price"], 59.0)
-        self.assertEqual(p["max_price"], 64.0)
+        self.assertEqual((p["product_id"], p["title"], p["url_path"], p["variant_count"]), (101, "Cloud Hoodie", "/products/cloud-hoodie", 3))
         self.assertEqual(p["tags"], ["new", "core"])
-        self.assertEqual(p["collection_position"], 1)
-        v = {v["variant_id"]: v for v in p["variants"]}
-        self.assertEqual(v[1012]["compare_at_price"], 79.0)
-        self.assertIsNone(v[1013]["sku"])  # empty string sku -> NULL
-        self.assertFalse(v[1013]["available"])
+        self.assertTrue(p["created_at"].startswith("20"))
+        for gone in ("variants", "min_price", "sold_out_variants", "collection_position"):
+            self.assertNotIn(gone, p)
 
     def test_string_tags_and_empty_type(self):
         p = self.by_handle["ridge-wallet"]
         self.assertEqual(p["tags"], ["leather", "bestseller"])
         self.assertIsNone(p["product_type"])
-        self.assertEqual(p["collection_position"], 0)
 
     def test_product_without_variants(self):
         p = self.by_handle["no-variants"]
         self.assertEqual(p["variant_count"], 0)
-        self.assertEqual(p["sold_out_variants"], 0)
-        self.assertIsNone(p["min_price"])
         self.assertIsNone(p["published_at"])
-        self.assertIsNone(p["collection_position"])
 
 
 class UrlAndDiscoveryTests(unittest.TestCase):

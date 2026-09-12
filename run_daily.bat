@@ -1,8 +1,8 @@
 @echo off
 REM Daily tracker run. Registered in Task Scheduler by register_task.ps1 (two tasks):
-REM   run_daily.bat        morning: Shopify snapshot + stock probe + Sheets sync (about 15 min)
+REM   run_daily.bat        morning: catalogues + shop ids of every store, then a Sheets sync (about 10 min)
 REM   run_daily.bat meta   night:   Meta Ad Library pass for the whole watchlist within
-REM                                 META_NIGHT_MINUTES (default 600) or until META_STOP_AT (08:30), then a Sheets sync
+REM                                 META_NIGHT_MINUTES (default 600) or until META_STOP_AT (08:30), then radar, then a Sheets sync
 REM Appends stdout+stderr to logs\run_YYYY-MM-DD.log (or logs\meta_YYYY-MM-DD.log).
 REM tracker.py reads .env itself (SHEETS_WEBHOOK_URL, META_STORES, ...).
 setlocal EnableDelayedExpansion

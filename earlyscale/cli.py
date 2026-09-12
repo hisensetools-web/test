@@ -1,8 +1,8 @@
-"""Command-line interface. Build step 1: init-db, add-store, run (products only), status."""
+"""Command-line interface: run (catalogues), ads (Meta Ad Library), radar (store discovery), sync-sheets, and the
+watchlist / diagnostics helpers. `python tracker.py --help` lists everything."""
 from __future__ import annotations
 
 import argparse
-import json
 import logging
 import os
 import re
@@ -15,7 +15,7 @@ from pathlib import Path
 from rich.console import Console
 from rich.table import Table
 
-from . import ad_detail, ad_metrics, ad_rank, config, db, deltas, fb_posts, inventory, meta_ads, platforms, radar, scaling, sheets, shopify, store_age
+from . import config, db, meta_ads, platforms, radar, sheets, shopify, store_age, winners
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist, update_watchlist_entry
 
 console = Console()
@@ -23,12 +23,8 @@ log = logging.getLogger("earlyscale")
 
 
 def _setup_logging(verbose: bool) -> None:
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s",
-        datefmt="%H:%M:%S",
-        stream=sys.stderr,
-    )
+    logging.basicConfig(level=logging.DEBUG if verbose else logging.INFO,
+                        format="%(asctime)s %(levelname)-7s %(name)s: %(message)s", datefmt="%H:%M:%S", stream=sys.stderr)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
 
@@ -38,7 +34,15 @@ def _parse_date(s: str | None) -> str:
     return datetime.strptime(s, "%Y-%m-%d").date().isoformat()
 
 
-# ---------------------------------------------------------------- commands
+def _short(domain: str) -> str:
+    return re.sub(r"^https?://", "", domain or "")
+
+
+def _wl(args) -> Path | None:
+    return Path(args.watchlist) if getattr(args, "watchlist", None) else None
+
+
+# ---------------------------------------------------------------- catalogues
 
 def cmd_init_db(args) -> int:
     conn = db.connect(args.db)
@@ -47,25 +51,9 @@ def cmd_init_db(args) -> int:
     return 0
 
 
-def cmd_add_store(args) -> int:
-    domain = args.domain
-    meta_page = args.meta_page
-    if not meta_page and not args.no_discover:
-        console.print(f"looking for a Facebook page link on {domain} ...")
-        meta_page = shopify.discover_meta_page(domain)
-        console.print(f"  meta_page_name: [bold]{meta_page or '(not found; fill in watchlist.csv)'}[/]")
-    entry = {"store_domain": domain, "meta_page_name": meta_page or "", "meta_page_id": args.meta_page_id or "",
-             "notes": args.notes or ""}
-    added = append_to_watchlist(entry, Path(args.watchlist) if args.watchlist else None)
-    conn = db.connect(args.db)
-    db.upsert_store(conn, entry["store_domain"] if added else domain.lower(), meta_page, args.meta_page_id, args.notes)
-    conn.commit()
-    console.print(f"[green]{'added' if added else 'already listed'}[/] {domain}")
-    return 0
-
-
 def run_products_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | None = None) -> tuple[int, int]:
-    """Fetch and snapshot every store. Returns (ok, failed). A failing store never aborts the run."""
+    """Fetch and snapshot every store's catalogue (id, handle, title, dates) and, once, its shop id.
+    Returns (ok, failed). A failing store never aborts the run."""
     if only:
         stores = [s for s in stores if s["store_domain"] in only]
     run_id = db.start_run(conn, snapshot_date, len(stores))
@@ -78,38 +66,34 @@ def run_products_pass(conn, stores: list[dict], snapshot_date: str, only: set[st
         t0 = time.monotonic()
         try:
             cat = platforms.fetch_catalogue(domain, session, conn, store_id, snapshot_date)
-            products, pages = cat.products, cat.pages
-            n = db.write_product_snapshot(conn, store_id, snapshot_date, products)
+            n = db.write_product_snapshot(conn, store_id, snapshot_date, cat.products)
             dur = time.monotonic() - t0
-            db.record_store_run(conn, run_id, store_id, snapshot_date, "ok", None, n, pages, dur)
-            sold_out = sum(p["sold_out_variants"] for p in products)
-            log.info("%-28s ok  %-16s products=%-5d variants=%-5d sold_out_variants=%-4d pages=%d  %.1fs%s",
-                     domain, cat.platform, n, sum(p["variant_count"] for p in products), sold_out, pages, dur,
+            db.record_store_run(conn, run_id, store_id, snapshot_date, "ok", None, n, cat.pages, dur)
+            log.info("%-28s ok  %-16s products=%-5d pages=%d  %.1fs%s", domain, cat.platform, n, cat.pages, dur,
                      f"  ({cat.note})" if cat.note and cat.platform != "shopify" else "")
             ok += 1
             if cat.platform in ("shopify", "shopify_headless"):
-                try:   # shop id, once per store, quietly: Radar's store-age calibration uses it
+                try:   # shop id + myshopify handle, once per store (they never change)
                     store_age.ensure_identity(conn, store_id, cat.extra.get("myshopify") or domain, session)
                 except Exception as e:  # noqa: BLE001
                     log.debug("%s shop id lookup failed: %s", domain, e)
-            try:   # a platform that publishes stock counts gives the inventory pass its readings for free
-                got = inventory.record_platform_stock(conn, store_id, snapshot_date, products)
-                if got:
-                    log.info("%-28s stock from the platform for %d hero variant(s)", domain, got)
-            except Exception as e:  # noqa: BLE001
-                log.debug("%s platform stock failed: %s", domain, e)
         except Exception as e:  # noqa: BLE001 - by design: log and continue
             dur = time.monotonic() - t0
             db.record_store_run(conn, run_id, store_id, snapshot_date, "error", str(e)[:500], 0, 0, dur)
             log.error("%-28s FAILED: %s", domain, e)
             failed += 1
     db.finish_run(conn, run_id, ok, failed)
+    try:
+        r = store_age.refresh_estimates(conn)
+        log.info("store age: %d of %d stores estimated from %d calibration point(s)", r["estimated"], r["stores"], r["calibration_rows"])
+    except Exception as e:  # noqa: BLE001
+        log.warning("store age estimates not refreshed: %s", e)
     return ok, failed
 
 
 def cmd_run(args) -> int:
     snapshot_date = _parse_date(args.date)
-    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    stores = read_watchlist(_wl(args))
     if not stores:
         console.print("[red]watchlist is empty[/] - add stores with `python tracker.py add-store <domain>`")
         return 2
@@ -117,49 +101,148 @@ def cmd_run(args) -> int:
     only = set(args.only) if args.only else None
     console.print(f"run: snapshot_date={snapshot_date} stores={len(only or stores)} db={args.db or config.DB_PATH}")
     t0 = time.monotonic()
-    awake = meta_ads.KeepAwake().__enter__()
-    ok, failed = run_products_pass(conn, stores, snapshot_date, only)
-    console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
-    rc = 1 if ok == 0 and failed else 0
-    if not args.no_ads and conn.execute("SELECT 1 FROM fb_posts LIMIT 1").fetchone():
-        console.print("feed-post engagement pass (captured permalinks, logged-out) ...")
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as pw:
-                browser = pw.chromium.launch(headless=True, **meta_ads.launch_kwargs())
-                try:
-                    c = fb_posts.refresh_engagement(conn, browser, snapshot_date)
-                finally:
-                    browser.close()
-            console.print(f"posts: fetched {c['fetched']}, ok={c['ok']} gated={c['gated']} removed={c['removed']}")
-        except Exception as e:  # noqa: BLE001
-            console.print(f"[red]post engagement pass failed:[/] {e}")
-    inv_stores = inventory_targets(stores, only, args.inventory, conn=conn)
-    if inv_stores and not args.no_inventory:
-        console.print(f"inventory probe pass ({len(inv_stores)} store(s), waits={config.INVENTORY_WAIT_MIN:.0f}-{config.INVENTORY_WAIT_MAX:.0f}s) ...")
-        try:
-            run_inventory_pass(conn, inv_stores, snapshot_date)
-        except Exception as e:  # noqa: BLE001 - never let the probe break the daily run
-            console.print(f"[red]inventory pass failed:[/] {e}")
-    if (config.META_ADS_ENABLED or args.ads) and not args.no_ads:
-        planned = plan_meta_stores(conn, stores, only)
-        console.print(f"Meta Ad Library pass (META_ADS=1): {len(planned)} store(s)"
-                      + (f" from META_STORES" if config.META_STORES else " (all; set META_STORES=a.com,b.com to narrow)")
-                      + f", budget {config.META_MAX_MINUTES:.0f} min, least recently scraped first ...")
-        try:
-            a_ok, a_failed = run_ads_pass(conn, stores, snapshot_date, only)
-            console.print(f"ads: [green]{a_ok} ok[/], [red]{a_failed} failed[/]")
-        except Exception as e:  # noqa: BLE001 - never let the ad pass break the daily run
-            console.print(f"[red]ads pass failed:[/] {e}")
-    if config.SHEETS_WEBHOOK_URL and not args.no_sync:
-        if args.watchlist:
-            sheets.set_watchlist_path(Path(args.watchlist))
-        console.print("syncing to Google Sheets (SHEETS_WEBHOOK_URL is set) ...")
-        if _do_sheets_sync(conn, as_of=snapshot_date) != 0:
-            rc = rc or 3
-    awake.__exit__(None, None, None)
+    with meta_ads.KeepAwake():
+        ok, failed = run_products_pass(conn, stores, snapshot_date, only)
+        console.print(f"done in {time.monotonic() - t0:.1f}s: [green]{ok} ok[/], [red]{failed} failed[/]")
+        rc = 1 if ok == 0 and failed else 0
+        if (config.META_ADS_ENABLED or args.ads) and not args.no_ads:
+            planned = plan_meta_stores(conn, stores, only)
+            console.print(f"Meta Ad Library pass: {len(planned)} store(s), budget {config.META_MAX_MINUTES:.0f} min, least recently scraped first ...")
+            try:
+                a_ok, a_failed = run_ads_pass(conn, stores, snapshot_date, only)
+                console.print(f"ads: [green]{a_ok} ok[/], [red]{a_failed} failed[/]")
+            except Exception as e:  # noqa: BLE001 - never let the ad pass break the daily run
+                console.print(f"[red]ads pass failed:[/] {e}")
+        if config.SHEETS_WEBHOOK_URL and not args.no_sync:
+            if args.watchlist:
+                sheets.set_watchlist_path(Path(args.watchlist))
+            console.print("syncing to Google Sheets (SHEETS_WEBHOOK_URL is set) ...")
+            if _do_sheets_sync(conn, as_of=snapshot_date) != 0:
+                rc = rc or 3
     return rc
 
+
+# ---------------------------------------------------------------- Meta Ad Library
+
+def _stop_at_clock(hhmm: str, now: datetime | None = None) -> datetime | None:
+    """META_STOP_AT ('08:30') as the next occurrence of that local time (today if still ahead, else tomorrow)."""
+    if not hhmm:
+        return None
+    try:
+        h, m = (int(x) for x in hhmm.split(":"))
+    except ValueError:
+        return None
+    now = now or datetime.now()
+    t = now.replace(hour=h, minute=m, second=0, microsecond=0)
+    return t if t > now else t + timedelta(days=1)
+
+
+def plan_meta_stores(conn, stores: list[dict], only: set[str] | None = None, scope: list[str] | None = None) -> list[dict]:
+    """Stores for today's Meta pass: --only, else META_STORES if set, else all; least recently scraped first
+    (never scraped first) so a watchlist bigger than the daily budget rotates."""
+    if only:
+        stores = [s for s in stores if s["store_domain"] in only]
+    else:
+        scope = config.META_STORES if scope is None else scope
+        if scope:
+            want = {x.lower() for x in scope}
+            stores = [s for s in stores if s["store_domain"].lower() in want or re.sub(r"^https?://", "", s["store_domain"].lower()) in want]
+    last: dict[str, str] = {}
+    for r in conn.execute("""SELECT s.store_domain, MAX(r.snapshot_date) AS d FROM meta_page_runs r JOIN stores s ON s.id = r.store_id
+                             WHERE r.status = 'ok' GROUP BY s.store_domain"""):
+        last[r["store_domain"]] = r["d"]
+    return sorted(stores, key=lambda s: (last.get(s["store_domain"]) or "", s["store_domain"]))
+
+
+def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | None = None,
+                 headless: bool = True, max_scrolls: int | None = None, max_minutes: float | None = None) -> tuple[int, int]:
+    """Scrape the Ad Library for the planned stores (one browser, sequential) within a time budget.
+    Returns (ok, failed). A blocked or failing page is logged in meta_page_runs and never aborts the pass."""
+    from playwright.sync_api import sync_playwright
+    stores = plan_meta_stores(conn, stores, only)
+    budget = (config.META_MAX_MINUTES if max_minutes is None else max_minutes) * 60
+    deadline = time.monotonic() + budget
+    stop_at = _stop_at_clock(config.META_STOP_AT)
+    ok = failed = 0
+    with sync_playwright() as p, meta_ads.KeepAwake():
+        handle = meta_ads.BrowserHandle(p, headless=headless)
+        try:
+            for i, s in enumerate(stores):
+                if time.monotonic() > deadline or (stop_at and datetime.now() >= stop_at):
+                    left = [x["store_domain"] for x in stores[i:]]
+                    log.warning("Meta pass %s: %d store(s) deferred to the next run (%s%s)",
+                                f"stop time {config.META_STOP_AT} reached" if stop_at and datetime.now() >= stop_at else f"budget of {budget / 60:.0f} min spent",
+                                len(left), ", ".join(left[:5]), ", ..." if len(left) > 5 else "")
+                    break
+                browser = handle.get()   # relaunched if the previous store killed it
+                domain = s["store_domain"]
+                store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
+                conn.commit()
+                query = meta_ads.store_query(s)
+                url = meta_ads.build_search_url(query=None if s.get("meta_page_id") else query, page_id=s.get("meta_page_id") or None)
+                t0 = time.monotonic()
+                try:
+                    res = meta_ads.scrape_page(url, headless=headless, max_scrolls=max_scrolls, browser=browser)
+                    counts = meta_ads.record_scrape(conn, store_id, snapshot_date, res.ads, query)
+                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "ok", res.note, len(res.ads), res.scrolls, time.monotonic() - t0)
+                    log.info("%-28s ads=%-4d new=%-4d disappeared=%-3d badge_known=%-4d urls=%-3d scrolls=%d %.0fs  %s",
+                             domain, counts["total"], counts["new"], counts["disappeared"], counts["badge_known"], counts["urls"],
+                             res.scrolls, time.monotonic() - t0, res.note)
+                    ok += 1
+                except meta_ads.MetaBlocked as e:
+                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "blocked", str(e), 0, 0, time.monotonic() - t0)
+                    log.error("%-28s BLOCKED by Meta: %s (stopping this pass; try again later)", domain, e)
+                    failed += 1
+                    break
+                except Exception as e:  # noqa: BLE001 - by design
+                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "error", str(e), 0, 0, time.monotonic() - t0)
+                    log.error("%-28s FAILED: %s", domain, e)
+                    failed += 1
+                    if meta_ads.browser_closed_error(e):
+                        log.warning("%-28s browser crashed; relaunching for the next store", domain)
+                        handle.close()
+                took = time.monotonic() - t0
+                if took > 25 * 60:
+                    # the machine slept: give the lost time back to the budget (the stop time, if set, still holds)
+                    deadline += took - 25 * 60
+                    log.warning("%-28s took %.0f min for one store; the machine probably slept part of the way (%.0f min given back to the budget)",
+                                domain, took / 60, (took - 25 * 60) / 60)
+                if i < len(stores) - 1:
+                    meta_ads._wait()
+        finally:
+            handle.close()
+    return ok, failed
+
+
+def cmd_ads(args) -> int:
+    snapshot_date = _parse_date(args.date)
+    stores = read_watchlist(_wl(args))
+    if not stores:
+        console.print("[red]watchlist is empty[/]")
+        return 2
+    conn = db.connect(args.db)
+    only = set(args.only) if args.only else None
+    planned = plan_meta_stores(conn, stores, only)
+    console.print(f"ads: snapshot_date={snapshot_date} stores={len(planned)} (least recently scraped first) "
+                  f"budget {args.max_minutes or config.META_MAX_MINUTES:.0f} min, about {config.META_MAX_SCROLLS * 5.5 / 60 + 1:.0f} min per store, "
+                  f"waits={config.META_WAIT_MIN:.0f}-{config.META_WAIT_MAX:.0f}s headless={not args.headed}")
+    t0 = time.monotonic()
+    ok, failed = run_ads_pass(conn, stores, snapshot_date, only, headless=not args.headed, max_scrolls=args.max_scrolls, max_minutes=args.max_minutes)
+    console.print(f"done in {time.monotonic() - t0:.0f}s: [green]{ok} ok[/], [red]{failed} failed[/]. "
+                  "`python tracker.py report` shows the Winners; `sync-sheets` pushes them.")
+    return 1 if ok == 0 and failed else 0
+
+
+def cmd_rebuild(args) -> int:
+    """Recompute url_daily (delivering, wow, pages, families) for every day from the stored ads (no scraping)."""
+    conn = db.connect(args.db)
+    t0 = time.monotonic()
+    n = winners.rebuild_url_daily(conn)
+    console.print(f"url_daily rebuilt: {n} URL-day rows in {time.monotonic() - t0:.0f}s")
+    return 0
+
+
+# ---------------------------------------------------------------- Google Sheets
 
 def _do_sheets_sync(conn, tabs=sheets.TAB_ORDER, as_of=None, dry_run=False, verify=True) -> int:
     try:
@@ -171,8 +254,8 @@ def _do_sheets_sync(conn, tabs=sheets.TAB_ORDER, as_of=None, dry_run=False, veri
     if verify and not dry_run:
         rc = _verify_sheets(conn, as_of) or rc
         if rc == 3 and not getattr(_do_sheets_sync, "_repairing", False):
-            # a replace-mode tab holding the wrong number of rows (a lost chunk, a concurrent writer): push it again once
-            bad = [t for t in tabs if sheets.TAB_MODES.get(t) == "replace" and sheets.TAB_NAMES[t] in _last_mismatched_tabs]
+            # a tab holding the wrong number of rows (a lost chunk, a concurrent writer): push it again once
+            bad = [t for t in tabs if sheets.TAB_NAMES[t] in _last_mismatched_tabs]
             if bad:
                 console.print(f"[yellow]re-pushing {', '.join(sheets.TAB_NAMES[t] for t in bad)} once to repair the mismatch[/]")
                 _do_sheets_sync._repairing = True
@@ -196,33 +279,24 @@ def _verify_sheets(conn, as_of=None) -> int:
     _last_mismatched_tabs.clear()
     _last_mismatched_tabs.update(x["tab"] for x in v["tabs"] if not x["ok"])
     t = Table(title="sheet vs database")
-    for c in ("tab", "mode", "rows in DB", "rows in sheet", "ok"):
+    for c in ("tab", "rows in DB", "rows in sheet", "ok"):
         t.add_column(c, justify="right" if "rows" in c else "left")
     for x in v["tabs"]:
-        t.add_row(x["tab"], x["mode"], str(x["expected"]), "?" if x["sheet"] is None else str(x["sheet"]), "yes" if x["ok"] else "[red]NO[/]")
+        t.add_row(x["tab"], str(x["expected"]), "?" if x["sheet"] is None else str(x["sheet"]), "yes" if x["ok"] else "[red]NO[/]")
     console.print(t)
-    bad = [p for p in v["products"] if not p["ok"]]
-    if bad:
-        t = Table(title="Products rows per store that differ")
-        for c in ("store", "rows in DB", "rows in sheet"):
-            t.add_column(c, justify="left" if c == "store" else "right")
-        for p in bad[:60]:
-            t.add_row(_short(p["store"]), str(p["expected"]), str(p["sheet"]))
-        console.print(t)
     if v["problems"]:
         console.print(f"[red]{len(v['problems'])} mismatch(es)[/] - the sheet does not hold what the DB holds (see above)")
         return 3
-    console.print("[green]sheet matches the database[/]" + (f" ({len(v['products'])} stores' catalogues complete)" if v["products"] else ""))
+    console.print("[green]sheet matches the database[/]")
     return 0
 
 
 def _print_sync_summary(summaries, dry_run) -> int:
     t = Table(title="Google Sheets sync" + (" (dry run, nothing sent)" if dry_run else ""))
-    for c in ("tab", "rows", "chunks", "written", "skipped"):
+    for c in ("tab", "rows", "chunks", "written"):
         t.add_column(c, justify="right" if c != "tab" else "left")
     for x in summaries:
-        t.add_row(x["tab"], str(x["rows"]), str(x["chunks"]),
-                  "-" if dry_run else str(x["written"]), "-" if dry_run else str(x["skipped"]))
+        t.add_row(x["tab"], str(x["rows"]), str(x["chunks"]), "-" if dry_run else str(x["written"]))
     console.print(t)
     return 0
 
@@ -241,13 +315,35 @@ def cmd_sync_sheets(args) -> int:
         console.print(f"[red]unknown tab(s):[/] {', '.join(bad)} (choose from {', '.join(sheets.TAB_ORDER)})")
         return 2
     as_of = _parse_date(args.date) if args.date else None
+    try:
+        store_age.refresh_estimates(conn)
+    except Exception as e:  # noqa: BLE001
+        log.warning("store age estimates not refreshed: %s", e)
     if args.verify_only:
         return _verify_sheets(conn, as_of)
     return _do_sheets_sync(conn, tabs=tabs, as_of=as_of, dry_run=args.dry_run, verify=not args.no_verify)
 
 
+# ---------------------------------------------------------------- watchlist
+
+def cmd_add_store(args) -> int:
+    domain = args.domain
+    meta_page = args.meta_page
+    if not meta_page and not args.no_discover:
+        console.print(f"looking for a Facebook page link on {domain} ...")
+        meta_page = shopify.discover_meta_page(domain)
+        console.print(f"  meta_page_name: [bold]{meta_page or '(not found; fill in watchlist.csv)'}[/]")
+    entry = {"store_domain": domain, "meta_page_name": meta_page or "", "meta_page_id": args.meta_page_id or "", "notes": args.notes or ""}
+    added = append_to_watchlist(entry, _wl(args))
+    conn = db.connect(args.db)
+    db.upsert_store(conn, entry["store_domain"] if added else domain.lower(), meta_page, args.meta_page_id, args.notes)
+    conn.commit()
+    console.print(f"[green]{'added' if added else 'already listed'}[/] {domain}")
+    return 0
+
+
 def cmd_remove_store(args) -> int:
-    removed, missing = remove_from_watchlist(args.domains, Path(args.watchlist) if args.watchlist else None)
+    removed, missing = remove_from_watchlist(args.domains, _wl(args))
     for d in removed:
         console.print(f"[green]removed[/] {d}")
     for d in missing:
@@ -257,8 +353,8 @@ def cmd_remove_store(args) -> int:
 
 
 def dead_stores(conn, stores: list[dict]) -> list[dict]:
-    """Watchlist stores that never returned a Shopify catalogue (no successful run) and never had an ad recorded:
-    non-Shopify domains, typos, dead sites. Each entry: store_domain, runs, last_error."""
+    """Watchlist stores that never returned a catalogue (no successful run) and never had an ad recorded:
+    non-store domains, typos, dead sites. Each entry: store_domain, runs, last_error."""
     out = []
     for s in stores:
         row = conn.execute("SELECT id FROM stores WHERE store_domain = ?", (s["store_domain"],)).fetchone()
@@ -267,7 +363,7 @@ def dead_stores(conn, stores: list[dict]) -> list[dict]:
         sid = row["id"]
         ok = conn.execute("SELECT COUNT(*) FROM store_runs WHERE store_id = ? AND status = 'ok'", (sid,)).fetchone()[0]
         products = conn.execute("SELECT COUNT(*) FROM products_daily WHERE store_id = ?", (sid,)).fetchone()[0]
-        ads = conn.execute("SELECT COUNT(*) FROM meta_ads WHERE store_id = ?", (sid,)).fetchone()[0]
+        ads = conn.execute("SELECT COUNT(*) FROM ads WHERE store_id = ?", (sid,)).fetchone()[0]
         if ok or products or ads:
             continue
         runs = conn.execute("SELECT COUNT(*) FROM store_runs WHERE store_id = ?", (sid,)).fetchone()[0]
@@ -276,81 +372,21 @@ def dead_stores(conn, stores: list[dict]) -> list[dict]:
     return out
 
 
-def cmd_db_check(args) -> int:
-    """Is data/tracker.db free? Tries a 2-second write lock, lists the database files and the programs that could be
-    holding it (any python, a database viewer, OneDrive syncing the folder)."""
-    import os
-    import sqlite3
-    path = Path(args.db) if args.db else config.DB_PATH
-    console.print(f"database: {path.resolve()}")
-    for f in sorted(path.parent.glob(path.name + "*")):
-        st = f.stat()
-        console.print(f"  {f.name:<22} {st.st_size / 1e6:8.1f} MB   modified {datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M:%S}")
-    if not path.exists():
-        console.print("[yellow]no database yet (the first run creates it)[/]")
-        return 0
-    raw = sqlite3.connect(str(path), timeout=2)
-    try:
-        ver = raw.execute("PRAGMA user_version").fetchone()[0]
-        mode = raw.execute("PRAGMA journal_mode").fetchone()[0]
-        console.print(f"  journal_mode={mode}  schema stamp {'current' if ver == db.schema_stamp() else 'needs the one-time update (a write)'}")
-        try:
-            raw.execute("BEGIN IMMEDIATE")
-            raw.rollback()
-            console.print("[green]write lock: free[/] (no other program is writing to it right now)")
-            locked = False
-        except sqlite3.OperationalError as e:
-            console.print(f"[red]write lock: NOT available[/] ({e}) - another program has the database open for writing")
-            locked = True
-        try:
-            n = raw.execute("SELECT COUNT(*) FROM stores").fetchone()[0]
-            console.print(f"read: ok ({n} stores)")
-        except sqlite3.OperationalError as e:
-            console.print(f"[red]read: failed ({e})[/]")
-    finally:
-        raw.close()
-    if os.name == "nt":
-        import subprocess
-        try:
-            me = os.getpid()
-            out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                  "Get-CimInstance Win32_Process -Filter \"name='python.exe' or name='pythonw.exe' or name='py.exe' or "
-                                  "name='OneDrive.exe' or name='DB Browser for SQLite.exe' or name='sqlitebrowser.exe' or name='wsl.exe'\" "
-                                  f"| Where-Object {{ $_.ProcessId -ne {me} }} "
-                                  "| Select-Object ProcessId, @{n='started';e={$_.CreationDate.ToString('HH:mm:ss')}}, CommandLine "
-                                  "| Format-Table -AutoSize -Wrap | Out-String -Width 200"],
-                                 capture_output=True, text=True, timeout=20).stdout.strip()
-            console.print("other processes that could hold it (python / OneDrive / SQLite viewers / WSL):"
-                          + ("\n" + out if out else " none running"))
-            if "OneDrive.exe" in out and "desktop" in str(path.resolve()).lower():
-                console.print("[yellow]OneDrive is running and the project sits on the Desktop, which OneDrive often syncs: it can hold tracker.db "
-                              "while uploading. Move the project out of synced folders (e.g. C:\\tracker) or exclude the folder in OneDrive.[/]")
-            if "wsl.exe" in out:
-                console.print("[yellow]WSL is running: a python started inside WSL (e.g. by a Claude Code session there) is invisible to "
-                              "Get-Process but still locks the file. `wsl --shutdown` releases it.[/]")
-        except Exception as e:  # noqa: BLE001
-            console.print(f"(could not list processes: {e})")
-    if locked:
-        console.print("close any program that has the database open (a SQLite viewer, a VS Code SQLite tab), stop leftover python "
-                      "processes (Stop-Process -Id <id>), then run db-check again.")
-    return 1 if locked else 0
-
-
 def cmd_prune_dead(args) -> int:
     conn = db.connect(args.db)
-    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
+    stores = read_watchlist(_wl(args))
     dead = dead_stores(conn, stores)
     if not dead:
         console.print("no dead stores: every watchlist domain has returned a catalogue or an ad at least once")
         return 0
-    t = Table(title=f"{len(dead)} watchlist domain(s) that never returned Shopify or Meta data")
+    t = Table(title=f"{len(dead)} watchlist domain(s) that never returned a catalogue or an ad")
     for c in ("store", "runs tried", "last error"):
         t.add_column(c, justify="right" if c == "runs tried" else "left")
     for d in dead:
         t.add_row(d["store_domain"], str(d["runs"]), d["last_error"][:90])
     console.print(t)
     if args.apply:
-        removed, _ = remove_from_watchlist([d["store_domain"] for d in dead], Path(args.watchlist) if args.watchlist else None)
+        removed, _ = remove_from_watchlist([d["store_domain"] for d in dead], _wl(args))
         console.print(f"[green]removed {len(removed)} store(s) from the watchlist[/] (their rows in the database are kept)")
     else:
         console.print("dry run: add --apply to remove them from the watchlist (or remove-store <domain> for a subset)")
@@ -360,7 +396,7 @@ def cmd_prune_dead(args) -> int:
 def cmd_restore_stores(args) -> int:
     """Put stores that are in the database but no longer in watchlist.csv back on it (undo of prune-dead / remove-store)."""
     conn = db.connect(args.db)
-    wl_path = Path(args.watchlist) if args.watchlist else None
+    wl_path = _wl(args)
     listed = {s["store_domain"] for s in read_watchlist(wl_path)}
     rows = [dict(r) for r in conn.execute("SELECT store_domain, meta_page_name, meta_page_id, notes, platform FROM stores ORDER BY store_domain")
             if r["store_domain"] not in listed]
@@ -403,6 +439,12 @@ def brand_query(domain: str) -> str:
     return label.replace("-", " ").strip()
 
 
+def _same_store(landing_domain: str | None, store_domain: str) -> bool:
+    a = re.sub(r"^(https?://)?(www\.)?", "", (landing_domain or "").lower()).split("/")[0]
+    b = re.sub(r"^(https?://)?(www\.)?", "", store_domain.lower()).split("/")[0]
+    return bool(a) and (a == b or a.endswith("." + b))
+
+
 def page_candidates(ads: list[dict], store_domain: str) -> list[dict]:
     """Group Ad Library results by page: ads, how many land on the store, example landing domain. Store-landing pages first."""
     from collections import Counter
@@ -416,7 +458,7 @@ def page_candidates(ads: list[dict], store_domain: str) -> list[dict]:
         dom = radar.normalise_landing_domain(a.get("landing_url") or a.get("landing_domain")) or ""
         if dom:
             p["domains"][dom] += 1
-        if ad_metrics.same_store(dom, re.sub(r"^https?://", "", store_domain)):
+        if _same_store(dom, store_domain):
             p["on_store"] += 1
     out = list(by.values())
     for p in out:
@@ -439,11 +481,11 @@ def cmd_find_page(args) -> int:
         try:
             url = meta_ads.build_search_url(query=query, country="ALL", search_type="keyword_unordered")
             res = meta_ads.scrape_page(url, max_ads=args.max_ads, browser=handle.get())
+        except meta_ads.MetaBlocked as e:
+            console.print(f"[red]Ad Library blocked the search:[/] {e}")
+            return 3
         finally:
             handle.close()
-    if res.blocked:
-        console.print(f"[red]Ad Library blocked the search:[/] {res.note}")
-        return 3
     cands = page_candidates(res.ads, domain)
     if not cands:
         console.print("no pages found. Try --query with the brand as written on the site (e.g. --query \"Happy Harvest\"), "
@@ -467,7 +509,7 @@ def cmd_find_page(args) -> int:
 
 
 def _set_page(domain: str, name: str, page_id: str | None, args) -> None:
-    ok = update_watchlist_entry(domain, Path(args.watchlist) if args.watchlist else None, meta_page_name=name, meta_page_id=page_id or "")
+    ok = update_watchlist_entry(domain, _wl(args), meta_page_name=name, meta_page_id=page_id or "")
     conn = db.connect(args.db)
     if page_id:
         conn.execute("UPDATE stores SET meta_page_name = ?, meta_page_id = ? WHERE store_domain = ?", (name, page_id, domain))
@@ -486,740 +528,7 @@ def cmd_set_page(args) -> int:
     return 0
 
 
-def _stop_at_clock(hhmm: str, now: datetime | None = None) -> datetime | None:
-    """META_STOP_AT ('08:30') as the next occurrence of that local time (today if still ahead, else tomorrow)."""
-    if not hhmm:
-        return None
-    try:
-        h, m = (int(x) for x in hhmm.split(":"))
-    except ValueError:
-        return None
-    now = now or datetime.now()
-    t = now.replace(hour=h, minute=m, second=0, microsecond=0)
-    return t if t > now else t + timedelta(days=1)
-
-
-def plan_meta_stores(conn, stores: list[dict], only: set[str] | None = None, scope: list[str] | None = None) -> list[dict]:
-    """Stores for today's Meta pass: --only, else META_STORES if set, else all; least recently
-    scraped first (never scraped first) so a watchlist bigger than the daily budget rotates."""
-    if only:
-        stores = [s for s in stores if s["store_domain"] in only]
-    else:
-        scope = config.META_STORES if scope is None else scope
-        if scope:
-            want = {x.lower() for x in scope}
-            stores = [s for s in stores if s["store_domain"].lower() in want
-                      or re.sub(r"^https?://", "", s["store_domain"].lower()) in want]
-    last: dict[str, str] = {}
-    for r in conn.execute("""SELECT s.store_domain, MAX(r.snapshot_date) AS d FROM meta_page_runs r JOIN stores s ON s.id = r.store_id
-                             WHERE r.status = 'ok' GROUP BY s.store_domain"""):
-        last[r["store_domain"]] = r["d"]
-    # stores with a product catalogue first: without one, ads cannot attach to products and the
-    # pass only feeds noise (the 404 domains had hundreds of ads and dozens of alerts, 0 resolved)
-    has_products = {r[0] for r in conn.execute("SELECT DISTINCT s.store_domain FROM products_daily p JOIN stores s ON s.id = p.store_id")}
-    return sorted(stores, key=lambda s: (0 if s["store_domain"] in has_products else 1, last.get(s["store_domain"]) or "", s["store_domain"]))
-
-
-def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | None = None,
-                 headless: bool = True, max_scrolls: int | None = None, detail: bool = True,
-                 detail_cap: int | None = None, max_minutes: float | None = None) -> tuple[int, int]:
-    """Scrape the Ad Library for the planned stores (one browser, sequential) within a time budget.
-    Returns (ok, failed). A blocked or failing page is logged in meta_page_runs and never aborts the pass."""
-    from playwright.sync_api import sync_playwright
-    stores = plan_meta_stores(conn, stores, only)
-    budget = (config.META_MAX_MINUTES if max_minutes is None else max_minutes) * 60
-    deadline = time.monotonic() + budget
-    stop_at = _stop_at_clock(config.META_STOP_AT)
-    ok = failed = 0
-    session = shopify.make_session()   # for landing-page fetches
-    with sync_playwright() as p, meta_ads.KeepAwake():
-        handle = meta_ads.BrowserHandle(p, headless=headless)
-        try:
-            for i, s in enumerate(stores):
-                if time.monotonic() > deadline or (stop_at and datetime.now() >= stop_at):
-                    left = [x["store_domain"] for x in stores[i:]]
-                    log.warning("Meta pass %s: %d store(s) deferred to the next run (%s%s)",
-                                f"stop time {config.META_STOP_AT} reached" if stop_at and datetime.now() >= stop_at else f"budget of {budget / 60:.0f} min spent",
-                                len(left), ", ".join(left[:5]), ", ..." if len(left) > 5 else "")
-                    break
-                browser = handle.get()   # relaunched if the previous store killed it
-                domain = s["store_domain"]
-                store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
-                conn.commit()
-                query = meta_ads.store_query(s)
-                url = meta_ads.build_search_url(query=None if s.get("meta_page_id") else query,
-                                                page_id=s.get("meta_page_id") or None)
-                t0 = time.monotonic()
-                try:
-                    res = meta_ads.scrape_page(url, headless=headless, max_scrolls=max_scrolls, browser=browser)
-                    counts = meta_ads.record_scrape(conn, store_id, snapshot_date, res.ads, query)
-                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "ok", res.note, len(res.ads),
-                                             res.scrolls, time.monotonic() - t0)
-                    log.info("%-28s ads=%-4d new=%-4d disappeared=%-3d scrolls=%d responses=%d %.0fs  %s",
-                             domain, counts["total"], counts["new"], counts["disappeared"], res.scrolls,
-                             res.responses, time.monotonic() - t0, res.note)
-                    ok += 1
-                    try:
-                        ad_detail.record_list_readings(conn, store_id, snapshot_date, res.ads)
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("%-28s list readings failed: %s", domain, e)
-                    if config.META_RANK and _rank_due(conn, store_id, snapshot_date):
-                        try:
-                            rk = ad_rank.scrape_ranks(conn, handle.get(), s, store_id, snapshot_date, [a["ad_id"] for a in res.ads])
-                            log.info("%-28s impression rank: %s", domain, rk["summary"])
-                        except meta_ads.MetaBlocked as e:
-                            log.error("%-28s impression-rank search blocked: %s", domain, e)
-                        except Exception as e:  # noqa: BLE001
-                            log.warning("%-28s impression-rank search failed: %s", domain, e)
-                    _post_process_store(conn, store_id, domain, snapshot_date, session)
-                    if detail:
-                        _detail_pass_store(conn, handle, store_id, domain, snapshot_date, detail_cap)
-                    try:
-                        pe = meta_ads.fetch_boosted_engagement(conn, handle.get(), store_id, snapshot_date)
-                        if pe["candidates"]:
-                            log.info("%-28s boosted posts: %d candidates, fetched %d, counts found %d",
-                                     domain, pe["candidates"], pe["fetched"], pe["with_counts"])
-                            for a in conn.execute("SELECT DISTINCT ad_id FROM meta_ads_daily WHERE store_id = ? AND snapshot_date = ?",
-                                                  (store_id, snapshot_date)):
-                                ad_metrics.compute_reach_metrics(conn, a["ad_id"], snapshot_date)
-                            conn.commit()
-                    except Exception as e:  # noqa: BLE001
-                        log.warning("%-28s boosted post fetch failed: %s", domain, e)
-                except meta_ads.MetaBlocked as e:
-                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "blocked", str(e), 0, 0,
-                                             time.monotonic() - t0)
-                    log.error("%-28s BLOCKED by Meta: %s (stopping this pass; try again later)", domain, e)
-                    failed += 1
-                    break
-                except Exception as e:  # noqa: BLE001 - by design
-                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "error", str(e), 0, 0,
-                                             time.monotonic() - t0)
-                    log.error("%-28s FAILED: %s", domain, e)
-                    failed += 1
-                    if meta_ads.browser_closed_error(e):
-                        # a heavy page took Chromium down ("Target crashed"); is_connected() can still say yes for a
-                        # moment, so drop the handle explicitly and the next store gets a fresh browser
-                        log.warning("%-28s browser crashed; relaunching for the next store", domain)
-                        handle.close()
-                took = time.monotonic() - t0
-                if took > 25 * 60:
-                    # the machine slept: give the lost time back to the budget (the stop time, if set, still holds)
-                    deadline += took - 25 * 60
-                    log.warning("%-28s took %.0f min for one store; the machine probably slept part of the way (%.0f min given back to the budget)",
-                                domain, took / 60, (took - 25 * 60) / 60)
-                if i < len(stores) - 1:
-                    meta_ads._wait()
-        finally:
-            handle.close()
-    return ok, failed
-
-
-def _rank_due(conn, store_id: int, today: str) -> bool:
-    """Daily while the sort is informative or unknown; weekly re-check for a store where it was not. A store judged
-    before the per-view comparison existed (no note on its last rank_checks row) is checked again right away."""
-    r = conn.execute("SELECT sort_informative, rank_checked_at FROM stores WHERE id = ?", (store_id,)).fetchone()
-    if not r or r["sort_informative"] is None or r["sort_informative"]:
-        return True
-    chk = conn.execute("SELECT note FROM rank_checks WHERE store_id = ? ORDER BY snapshot_date DESC LIMIT 1", (store_id,)).fetchone()
-    if chk is None or not chk["note"] or "[sort control" not in chk["note"]:
-        return True      # judged before the per-view comparison / before the in-page sort control existed: judge again
-    try:
-        return (date.fromisoformat(today) - date.fromisoformat(r["rank_checked_at"])).days >= 7
-    except (TypeError, ValueError):
-        return True
-
-
-def _post_process_store(conn, store_id: int, domain: str, snapshot_date: str, session, fetch_landings: bool = True) -> dict:
-    """Landing join, concepts, lineage, per-day metrics and alerts for one store. Never raises."""
-    try:
-        m = ad_metrics.process_store(conn, store_id, domain, snapshot_date, session, fetch_landings)
-        alerts = ad_metrics.run_alerts(conn, store_id, domain, snapshot_date)
-        alerts += scaling.run_alerts(conn, store_id, domain, snapshot_date)
-        alerts += ad_rank.run_alerts(conn, store_id, domain, snapshot_date)
-        log.info("%-28s metrics: resolved=%s/%s unlisted_products=%s concepts=%s lineage=%s pages_fetched=%s alerts=%d",
-                 domain, m.get("resolved", 0), m.get("ads", 0), m.get("unlisted", 0), m.get("concepts", 0),
-                 m.get("lineage", 0), m.get("pages_fetched", 0), len(alerts))
-        return m
-    except Exception as e:  # noqa: BLE001
-        log.error("%-28s metrics FAILED: %s", domain, e)
-        return {}
-
-
-def inventory_targets(stores: list[dict], only: set[str] | None, force_all: bool = False, conn=None) -> list[dict]:
-    """Stores to probe: INVENTORY_STORES from .env (or every store when INVENTORY=1 / --inventory), plus any store
-    whose latest products.json snapshot shows a variant with inventory_management='shopify' (stock is tracked,
-    so the rung-1 cart probe can read it: straight into the pool)."""
-    wanted = None if (force_all or config.INVENTORY_ALL) else set(config.INVENTORY_STORES)
-    managed = set()
-    if conn is not None and wanted is not None:
-        managed = {r[0] for r in conn.execute("""SELECT DISTINCT s.store_domain FROM variants_daily v JOIN stores s ON s.id = v.store_id
-                                                  WHERE v.inventory_management = 'shopify'
-                                                  AND v.snapshot_date = (SELECT MAX(snapshot_date) FROM variants_daily v2 WHERE v2.store_id = v.store_id)""")}
-    out = []
-    for s in stores:
-        d = s["store_domain"]
-        if only and d not in only:
-            continue
-        bare = re.sub(r"^www\.", "", d.split("//")[-1].lower())
-        if wanted is None or d.lower() in wanted or bare in wanted or f"www.{bare}" in wanted or d in managed:
-            out.append(s)
-    return out
-
-
-def run_inventory_pass(conn, stores: list[dict], snapshot_date: str) -> list[dict]:
-    """Probe hero variants of each store, compute sales and alerts. A failing store never aborts the pass."""
-    results = []
-    for s in stores:
-        domain = s["store_domain"]
-        store_id = db.upsert_store(conn, domain, s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
-        conn.commit()
-        t0 = time.monotonic()
-        plat = (conn.execute("SELECT platform FROM stores WHERE id = ?", (store_id,)).fetchone() or [None])[0]
-        if plat and plat not in ("shopify", "shopify_headless"):
-            log.info("%-28s %s store: no cart probe (stock comes from the platform's own JSON when it publishes any)", domain, plat)
-            results.append({"store": domain, "ok": True, "cart_probe": 0, "theme_inventory": 0, "ads_only": 0, "blocked": 0,
-                            "components": 0, "skipped": 0, "alerts": len(inventory.run_alerts(conn, store_id, domain, snapshot_date))})
-            continue
-        try:
-            counts = inventory.probe_store(conn, store_id, domain, snapshot_date)
-            alerts = inventory.run_alerts(conn, store_id, domain, snapshot_date)
-            log.info("%-28s heroes: cart_probe=%d theme=%d ads_only=%d blocked=%d components=%d skipped=%d alerts=%d %.0fs",
-                     domain, counts["cart_probe"], counts["theme_inventory"], counts["ads_only"], counts["blocked"],
-                     counts["components"], counts["skipped"], len(alerts), time.monotonic() - t0)
-            results.append({"store": domain, "ok": True, **counts, "alerts": len(alerts)})
-        except Exception as e:  # noqa: BLE001 - by design
-            log.error("%-28s inventory FAILED: %s", domain, e)
-            results.append({"store": domain, "ok": False, "error": str(e)})
-    md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
-    if md:
-        log.info("alerts written to %s", md)
-    return results
-
-
-def cmd_inventory(args) -> int:
-    snapshot_date = _parse_date(args.date)
-    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
-    if not stores:
-        console.print("[red]watchlist is empty[/]")
-        return 2
-    conn = db.connect(args.db)
-    only = set(args.only) if args.only else None
-    targets = inventory_targets(stores, only, force_all=bool(only) or args.all, conn=conn)
-    if not targets:
-        console.print("[red]no stores selected.[/] Set INVENTORY_STORES=a.com,b.com in .env, or pass --only a.com b.com")
-        return 2
-    missing = [s["store_domain"] for s in targets if inventory.latest_products(conn, db.upsert_store(conn, s["store_domain"]))[0] is None]
-    if missing:
-        console.print(f"[yellow]no products snapshot yet for:[/] {', '.join(missing)} - run `python tracker.py run --only ...` first")
-    console.print(f"inventory: snapshot_date={snapshot_date} stores={len(targets)} waits={config.INVENTORY_WAIT_MIN:.0f}-{config.INVENTORY_WAIT_MAX:.0f}s "
-                  f"max_variants={config.INVENTORY_MAX_VARIANTS}/store")
-    t0 = time.monotonic()
-    with meta_ads.KeepAwake():
-        results = run_inventory_pass(conn, targets, snapshot_date)
-    t = Table(title="hero variants by fallback rung")
-    for c in ("store", "cart_probe", "theme_inventory", "ads_only", "blocked", "components", "skipped", "alerts"):
-        t.add_column(c, justify="left" if c == "store" else "right")
-    for r in results:
-        if r["ok"]:
-            t.add_row(r["store"], *[str(r[c]) for c in ("cart_probe", "theme_inventory", "ads_only", "blocked", "components", "skipped", "alerts")])
-        else:
-            t.add_row(r["store"], f"[red]FAILED: {r['error'][:60]}[/]", "", "", "", "", "", "")
-    console.print(t)
-    console.print(f"done in {time.monotonic() - t0:.0f}s. Readings: `python tracker.py inventory-report`")
-    return 0 if any(r["ok"] for r in results) else 1
-
-
-def _short(domain: str) -> str:
-    return re.sub(r"^https?://", "", domain or "")
-
-
-def cmd_inventory_probe(args) -> int:
-    """One live probe with everything printed: the thing to paste when readings come back blocked."""
-    import requests as _rq
-    conn = db.connect(args.db)
-    domain = args.store
-    base = shopify.base_url(domain)
-    try:
-        base = shopify.resolve_base_url(shopify.make_session(), domain)
-    except shopify.StoreFetchError as e:
-        console.print(f"[yellow]host resolution failed:[/] {e}")
-    console.print(f"base url: {base}")
-    vid, handle = args.variant, args.handle
-    if not vid:
-        sid = db.upsert_store(conn, domain)
-        row = conn.execute("""SELECT variant_id, handle FROM hero_variants WHERE store_id = ? ORDER BY role = 'rank', handle LIMIT 1""",
-                           (sid,)).fetchone()
-        if row is None:
-            _, products = inventory.latest_products(conn, sid)
-            heroes = inventory.select_heroes(products, date.today())
-            if not heroes:
-                console.print("[red]no hero variant known for this store[/] - run `python tracker.py run --only <store>` first, or pass --variant ID")
-                return 2
-            vid, handle = heroes[0]["variant_id"], heroes[0]["handle"]
-        else:
-            vid, handle = row["variant_id"], row["handle"]
-    if not handle:
-        r = conn.execute("SELECT p.handle FROM variants_daily v JOIN products_daily p ON p.store_id = v.store_id AND p.snapshot_date = v.snapshot_date "
-                         "AND p.product_id = v.product_id WHERE v.variant_id = ? ORDER BY v.snapshot_date DESC LIMIT 1", (vid,)).fetchone()
-        handle = r["handle"] if r else None
-    console.print(f"variant: {vid}  handle: {handle}")
-    sess = inventory.fresh_session(base)
-    if handle:
-        try:
-            r0 = sess.get(f"{base}/products/{handle}", timeout=config.REQUEST_TIMEOUT,
-                          headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8", "X-Requested-With": None})
-            console.print(f"GET /products/{handle} -> HTTP {r0.status_code}, {len(r0.text)} bytes, cookies now: {sorted(sess.cookies.keys())[:8]}")
-            q = inventory.theme_inventory_from_html(r0.text, vid)
-            console.print(f"theme inventory_quantity for {vid}: {q}")
-        except _rq.RequestException as e:
-            console.print(f"[red]product page failed:[/] {e}")
-    payload = {"items": [{"id": int(vid), "quantity": config.INVENTORY_PROBE_QTY}]}
-    try:
-        r = sess.post(f"{base}/cart/add.js", json=payload, timeout=config.REQUEST_TIMEOUT, allow_redirects=False)
-    except _rq.RequestException as e:
-        console.print(f"[red]POST /cart/add.js failed:[/] {type(e).__name__}: {e}")
-        return 1
-    console.print(f"POST /cart/add.js -> HTTP {r.status_code}")
-    for k in ("server", "content-type", "location", "cf-mitigated", "cf-ray", "x-shopify-stage", "x-sorting-hat-shopid",
-              "x-request-id", "retry-after", "set-cookie"):
-        if r.headers.get(k):
-            console.print(f"  {k}: {r.headers[k][:160]}")
-    body = r.text or ""
-    console.print(f"body ({len(body)} bytes): {inventory._squash(body)[:600]}")
-    console.print(f"classified as: {inventory.probe_variant(base, vid, handle, session=sess, warm_up=False)['status']}")
-    if r.status_code == 200:
-        try:
-            sess.post(f"{base}/cart/clear.js", timeout=config.REQUEST_TIMEOUT)
-        except _rq.RequestException:
-            pass
-    return 0
-
-
-def cmd_inventory_report(args) -> int:
-    conn = db.connect(args.db)
-    as_of = _parse_date(args.date) if args.date else conn.execute("SELECT MAX(snapshot_date) FROM inventory_daily").fetchone()[0]
-    if not as_of:
-        console.print("no inventory readings yet - run `python tracker.py inventory`")
-        return 1
-    days = args.days
-    where, params = "", []
-    if args.store:
-        where, params = " AND s.store_domain = ?", [args.store]
-    # 1. per-store rung counts (latest state of each hero variant)
-    t = Table(title=f"fallback chain per store (hero variants, as of {as_of})")
-    for c in ("store", "heroes", "cart_probe", "theme_inventory", "ads_only", "blocked/never", "stock=0", "tracked %"):
-        t.add_column(c, justify="left" if c == "store" else "right")
-    rows = conn.execute(f"""
-        SELECT s.store_domain, COUNT(*) AS n,
-               SUM(h.signal_source = 'cart_probe') AS cp, SUM(h.signal_source = 'theme_inventory') AS th,
-               SUM(h.signal_source = 'ads_only') AS ao, SUM(h.signal_source IS NULL) AS nv,
-               SUM(h.inventory_tracked = 1) AS tracked,
-               SUM((SELECT stock_level FROM inventory_daily i WHERE i.store_id = h.store_id AND i.variant_id = h.variant_id
-                    AND i.stock_level IS NOT NULL ORDER BY i.snapshot_date DESC LIMIT 1) = 0) AS zero
-        FROM hero_variants h JOIN stores s ON s.id = h.store_id WHERE 1=1 {where}
-        GROUP BY s.store_domain ORDER BY s.store_domain""", params).fetchall()
-    for r in rows:
-        pct = f"{100 * (r['tracked'] or 0) / r['n']:.0f}%" if r["n"] else ""
-        t.add_row(_short(r["store_domain"]), str(r["n"]), str(r["cp"] or 0), str(r["th"] or 0), str(r["ao"] or 0),
-                  str(r["nv"] or 0), str(r["zero"] or 0), pct)
-    console.print(t)
-    # 2. raw readings: one row per hero variant, one column per day
-    dates = [r[0] for r in conn.execute("SELECT DISTINCT snapshot_date FROM inventory_daily WHERE snapshot_date <= ? ORDER BY snapshot_date DESC LIMIT ?",
-                                        (as_of, days))][::-1]
-    t = Table(title=f"raw stock_level readings, last {len(dates)} day(s)  ('-' = no reading, 'ads' = not tracked, 'blk' = blocked)")
-    for c in ("store", "handle", "variant", "role", "price", "source"):
-        t.add_column(c)
-    for d in dates:
-        t.add_column(d[5:], justify="right")
-    for c in ("sold 1d", "u/day 7d", "wow"):
-        t.add_column(c, justify="right")
-    heroes = conn.execute(f"""
-        SELECT s.store_domain, h.* FROM hero_variants h JOIN stores s ON s.id = h.store_id WHERE 1=1 {where}
-        ORDER BY s.store_domain, h.role = 'rank', h.handle, h.variant_id""", params).fetchall()
-    shown = 0
-    for h in heroes:
-        if args.limit and shown >= args.limit:
-            break
-        readings = {r["snapshot_date"]: r for r in conn.execute(
-            "SELECT * FROM inventory_daily WHERE store_id = ? AND variant_id = ? AND snapshot_date <= ?",
-            (h["store_id"], h["variant_id"], as_of))}
-        if not readings and not args.all:
-            continue
-        cells = []
-        for d in dates:
-            r = readings.get(d)
-            if r is None:
-                cells.append("-")
-            elif r["stock_level"] is not None:
-                cells.append(str(r["stock_level"]))
-            else:
-                cells.append({"ads_only": "ads", "blocked": "blk"}.get(r["signal_source"], "?"))
-        last = readings.get(dates[-1]) if dates else None
-        def f(v, fmt="{}"):
-            return "" if v is None else fmt.format(v)
-        vt = h["variant_title"] or ""
-        t.add_row(_short(h["store_domain"]), h["handle"], "" if vt == "Default Title" else vt, h["role"] or "",
-                  f(h["price"], "{:.2f}"), h["signal_source"] or "", *cells,
-                  f(last["units_sold_1d"]) if last else "", f(last["units_per_day_7d"], "{:.1f}") if last else "",
-                  f(last["units_per_day_wow"], "x{:.2f}") if last else "")
-        shown += 1
-    console.print(t)
-    if args.raw:
-        t = Table(title="raw probe messages (latest reading per variant)")
-        for c in ("store", "handle", "variant_id", "source", "message"):
-            t.add_column(c)
-        for h in heroes[: args.limit or None]:
-            r = conn.execute("SELECT signal_source, raw_message FROM inventory_daily WHERE store_id = ? AND variant_id = ? ORDER BY snapshot_date DESC LIMIT 1",
-                             (h["store_id"], h["variant_id"])).fetchone()
-            if r:
-                t.add_row(_short(h["store_domain"]), h["handle"], str(h["variant_id"]), r["signal_source"] or "", (r["raw_message"] or "")[:100])
-        console.print(t)
-    al = conn.execute(f"""SELECT a.snapshot_date, a.rule, s.store_domain, a.product_handle, a.detail FROM alerts a JOIN stores s ON s.id = a.store_id
-                          WHERE a.rule IN (9, 10, 11) {where} ORDER BY a.snapshot_date DESC, a.rule LIMIT 40""", params).fetchall()
-    if al:
-        t = Table(title="inventory alerts (rules 9-11)")
-        for c in ("date", "rule", "store", "handle", "detail"):
-            t.add_column(c)
-        for r in al:
-            t.add_row(r["snapshot_date"], f"{r['rule']} {inventory.RULES[r['rule']]}", r["store_domain"], r["product_handle"] or "", r["detail"])
-        console.print(t)
-    return 0
-
-
-def _detail_pass_store(conn, browser, store_id: int, domain: str, snapshot_date: str, cap: int | None = None) -> dict:
-    """Single-ad pages for the selected ads, then delivery / page likes / creative lineage / rule 12. Never raises."""
-    t0 = time.monotonic()
-    try:
-        c = ad_detail.fetch_store_details(conn, browser, store_id, snapshot_date, cap)
-        f = ad_detail.finalize_store(conn, store_id, snapshot_date)
-        log.info("%-28s detail: fetched %d/%d ok=%d removed=%d no_record=%d errors=%d login_wall=%d creatives_hashed=%d relaunches=%d | delivering=%d off=%d pages=%d "
-                 "creative_lineage=%d alerts=%d %.0fs", domain, c["ok"] + c["removed"] + c["no_record"] + c["errors"], c["selected"], c["ok"],
-                 c["removed"], c["no_record"], c["errors"], c["login_wall"], c["hashed"], c.get("relaunches", 0), f["delivering"], f["off"], f["pages"],
-                 f["creative_lineage"], f["alerts"], time.monotonic() - t0)
-        return {**c, **f}
-    except Exception as e:  # noqa: BLE001
-        log.error("%-28s detail pass FAILED: %s", domain, e)
-        return {}
-
-
-def cmd_ads_detail(args) -> int:
-    """Fetch single-ad pages (end_date, page likes, creatives) for stores with scraped ads."""
-    from playwright.sync_api import sync_playwright
-    snapshot_date = _parse_date(args.date)
-    conn = db.connect(args.db)
-    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
-    only = set(args.only) if args.only else None
-    targets = [s for s in stores if not only or s["store_domain"] in only]
-    with sync_playwright() as pw, meta_ads.KeepAwake():
-        handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
-        browser = handle
-        try:
-            if args.ads:
-                sid = db.upsert_store(conn, targets[0]["store_domain"]) if targets else None
-                for aid in args.ads:
-                    row = conn.execute("SELECT store_id FROM meta_ads WHERE ad_id = ?", (aid,)).fetchone()
-                    store_id = row["store_id"] if row else sid
-                    d, status = ad_detail.fetch_ad_detail(browser, aid)
-                    console.print(f"{aid}: {status} {json.dumps({k: v for k, v in (d or {}).items() if k not in ('images', 'videos')}, default=str)[:400]}")
-                    if d:
-                        console.print(f"  images={len(d['images'])} videos={len(d['videos'])}")
-                    if store_id:
-                        ad_detail.record_detail(conn, store_id, aid, snapshot_date, d, status)
-                        if d:
-                            ad_detail.fingerprint_creatives(conn, aid, d)
-                        ad_detail.finalize_store(conn, store_id, snapshot_date)
-                    conn.commit()
-                return 0
-            t = Table(title=f"single-ad page pass ({snapshot_date})")
-            for c in ("store", "selected", "ok", "removed", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts"):
-                t.add_column(c, justify="left" if c == "store" else "right")
-            for st in targets:
-                store_id = db.upsert_store(conn, st["store_domain"])
-                conn.commit()
-                if not conn.execute("SELECT 1 FROM meta_ads WHERE store_id = ? LIMIT 1", (store_id,)).fetchone():
-                    continue
-                r = _detail_pass_store(conn, handle, store_id, st["store_domain"], snapshot_date, args.max)
-                t.add_row(_short(st["store_domain"]), *[str(r.get(c, "")) for c in ("selected", "ok", "removed", "no_record", "errors", "login_wall", "hashed", "delivering", "off", "pages", "creative_lineage", "alerts")])
-            console.print(t)
-        finally:
-            handle.close()
-    md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
-    if md:
-        console.print(f"alerts written to {md}")
-    return 0
-
-
-def cmd_ads_detail_report(args) -> int:
-    """end_date / page_like_count per day for flagged ads (or --ads), plus page likes per page."""
-    conn = db.connect(args.db)
-    as_of = _parse_date(args.date) if args.date else conn.execute("SELECT MAX(snapshot_date) FROM meta_ad_detail_daily").fetchone()[0]
-    if not as_of:
-        console.print("no detail readings yet - run `python tracker.py ads-detail`")
-        return 1
-    dates = [r[0] for r in conn.execute("SELECT DISTINCT snapshot_date FROM meta_ad_detail_daily WHERE snapshot_date <= ? ORDER BY snapshot_date DESC LIMIT ?",
-                                        (as_of, args.days))][::-1]
-    where, params = "", []
-    if args.store:
-        sid = conn.execute("SELECT id FROM stores WHERE store_domain = ?", (args.store,)).fetchone()
-        if not sid:
-            console.print(f"[red]unknown store[/] {args.store}")
-            return 2
-        where, params = " AND a.store_id = ?", [sid["id"]]
-    if args.ads:
-        ids = set(args.ads)
-    else:
-        ids = set()
-        for r in conn.execute(f"SELECT DISTINCT a.store_id FROM meta_ads a WHERE 1=1 {where}", params):
-            ids |= ad_detail.flagged_ad_ids(conn, r[0])
-        if not ids:
-            console.print("no flagged ads (no rule 5-8 alerts) for this selection; showing the ads with detail readings")
-            ids = {r[0] for r in conn.execute(f"""SELECT d.ad_id FROM meta_ad_detail_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
-                                                 WHERE d.source = 'detail' {where} ORDER BY d.snapshot_date DESC LIMIT ?""", params + [args.limit])}
-    rows = [dict(r) for r in conn.execute(
-        f"""SELECT a.ad_id, s.store_domain, a.page_name, a.ad_start_date, a.delivery_status, a.last_delivered, a.switched_off_date,
-                   a.product_handle, a.lineage_of, a.lineage_via, a.creative_hash, a.page_categories
-            FROM meta_ads a JOIN stores s ON s.id = a.store_id WHERE a.ad_id IN ({','.join('?' * len(ids))}) {where}
-            ORDER BY s.store_domain, a.page_name, a.ad_start_date""", list(ids) + params)] if ids else []
-    t = Table(title=f"end_date per day for {len(rows)} ads (as of {as_of}; '-' = no reading, L = from list payload)")
-    for c in ("ad", "store", "page", "start", "product"):
-        t.add_column(c)
-    for d in dates:
-        t.add_column(d[5:], justify="right")
-    for c in ("status", "last delivered", "off since", "lineage"):
-        t.add_column(c)
-    for r in rows[: args.limit]:
-        readings = {x["snapshot_date"]: x for x in conn.execute(
-            "SELECT snapshot_date, end_date, source, status FROM meta_ad_detail_daily WHERE ad_id = ? AND snapshot_date <= ?", (r["ad_id"], as_of))}
-        cells = []
-        for d in dates:
-            x = readings.get(d)
-            if not x:
-                cells.append("-")
-            elif x["end_date"]:
-                cells.append(x["end_date"][5:] + ("" if x["source"] == "detail" else " L"))
-            else:
-                cells.append(x["status"] or "?")
-        lin = f"{r['lineage_of']} ({r['lineage_via'] or 'text'})" if r["lineage_of"] else ""
-        t.add_row(r["ad_id"], _short(r["store_domain"]), (r["page_name"] or "")[:24], (r["ad_start_date"] or "")[5:],
-                  (r["product_handle"] or "")[:24], *cells, r["delivery_status"] or "", (r["last_delivered"] or "")[5:],
-                  (r["switched_off_date"] or "")[5:], lin)
-    console.print(t)
-    t = Table(title="page_like_count per day (page-level spend proxy)")
-    for c in ("store", "page", "page_id", "categories"):
-        t.add_column(c)
-    for d in dates:
-        t.add_column(d[5:], justify="right")
-    for c in ("delta 1d", "likes/day 7d", "prev 7d"):
-        t.add_column(c, justify="right")
-    pages = conn.execute(f"""SELECT DISTINCT p.page_id, p.page_name, s.store_domain, p.store_id FROM meta_page_likes_daily p JOIN stores s ON s.id = p.store_id
-                             WHERE 1=1 {where.replace('a.store_id', 'p.store_id')} ORDER BY s.store_domain, p.page_name""", params).fetchall()
-    for pg in pages[: args.limit]:
-        hist = {x["snapshot_date"]: x for x in conn.execute("SELECT * FROM meta_page_likes_daily WHERE page_id = ? AND snapshot_date <= ?", (pg["page_id"], as_of))}
-        last = hist.get(dates[-1]) if dates else None
-        cats = ""
-        if last and last["page_categories"]:
-            try:
-                cats = ", ".join(json.loads(last["page_categories"]))[:30]
-            except ValueError:
-                cats = last["page_categories"][:30]
-        t.add_row(_short(pg["store_domain"]), (pg["page_name"] or "")[:24], pg["page_id"], cats,
-                  *[str(hist[d]["page_like_count"]) if d in hist and hist[d]["page_like_count"] is not None else "-" for d in dates],
-                  "" if not last or last["likes_delta_1d"] is None else str(last["likes_delta_1d"]),
-                  "" if not last or last["likes_slope_7d"] is None else f"{last['likes_slope_7d']:.1f}",
-                  "" if not last or last["likes_slope_prev_7d"] is None else f"{last['likes_slope_prev_7d']:.1f}")
-    console.print(t)
-    nr = conn.execute(f"""SELECT s.store_domain, d.status, COUNT(*) AS n FROM meta_ad_detail_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
-                          JOIN stores s ON s.id = a.store_id WHERE d.snapshot_date = ? AND d.source = 'detail' AND d.status != 'ok' {where}
-                          GROUP BY s.store_domain, d.status ORDER BY s.store_domain, n DESC""", [as_of] + params).fetchall()
-    if nr:
-        t = Table(title=f"single-ad pages without a record on {as_of} (removed = the library says the ad is gone)")
-        for c in ("store", "status", "pages"):
-            t.add_column(c, justify="right" if c == "pages" else "left")
-        for r in nr:
-            t.add_row(_short(r["store_domain"]), r["status"], str(r["n"]))
-        console.print(t)
-    cov = conn.execute(f"""SELECT s.store_domain, COUNT(DISTINCT a.ad_id) AS ads, SUM(a.delivery_status = 'on') AS on_, SUM(a.delivery_status = 'off') AS off,
-                             SUM(a.detail_fetched_date IS NOT NULL) AS fetched, SUM(a.creative_hash IS NOT NULL) AS hashed,
-                             SUM(a.lineage_via = 'creative') AS lin_creative
-                           FROM meta_ads a JOIN stores s ON s.id = a.store_id WHERE 1=1 {where} GROUP BY s.store_domain""", params).fetchall()
-    t = Table(title="coverage")
-    for c in ("store", "ads", "delivering", "off", "single-ad pages read", "creatives hashed", "lineage by creative"):
-        t.add_column(c, justify="left" if c == "store" else "right")
-    for r in cov:
-        t.add_row(_short(r["store_domain"]), *[str(r[k] or 0) for k in ("ads", "on_", "off", "fetched", "hashed", "lin_creative")])
-    console.print(t)
-    return 0
-
-
-def _read_clipboard() -> str:
-    try:
-        import tkinter
-        root = tkinter.Tk()
-        root.withdraw()
-        try:
-            return root.clipboard_get()
-        finally:
-            root.destroy()
-    except Exception as e:  # noqa: BLE001
-        raise SystemExit(f"could not read the clipboard ({e}); use --file or pass the URL") from e
-
-
-def cmd_fb_capture(args) -> int:
-    """Record Sponsored posts you saw yourself: a permalink, the bookmarklet JSON (--paste), or a file."""
-    conn = db.connect(args.db)
-    today = _parse_date(args.date)
-    if args.paste:
-        text = _read_clipboard()
-    elif args.file:
-        text = Path(args.file).read_text(encoding="utf-8")
-    elif args.url:
-        text = json.dumps({"permalink": args.url, "page_name": args.page, "primary_text": args.text, "landing_url": args.landing,
-                           "reactions": args.reactions, "comments": args.comments, "shares": args.shares})
-    else:
-        console.print("[red]give a URL, --paste (bookmarklet JSON on the clipboard) or --file[/]")
-        return 2
-    try:
-        caps = fb_posts.parse_captures_text(text)
-    except ValueError as e:
-        console.print(f"[red]{e}[/]")
-        return 2
-    if not caps:
-        console.print("[yellow]nothing to capture[/]")
-        return 1
-    store_id = None
-    if args.store:
-        store_id = db.upsert_store(conn, args.store)
-    new = 0
-    for c in caps:
-        if c.get("image_url") and not c.get("image_hash"):
-            c["image_hash"] = fb_posts.hash_image(c["image_url"])
-        if fb_posts.record_capture(conn, c, today, source="paste" if args.paste else ("file" if args.file else "manual"), store_id=store_id):
-            new += 1
-        console.print(f"post {c['post_id']}  page={c.get('page_name') or c.get('page_id') or '?'}  counts={c.get('counts') or {}}")
-    matched = fb_posts.match_posts(conn)
-    fb_posts.propagate_to_ads(conn, today)
-    console.print(f"{len(caps)} capture(s), {new} new, {matched} newly matched to Ad Library ads. Daily counts: `python tracker.py fb-engagement`")
-    return 0
-
-
-def cmd_fb_engagement(args) -> int:
-    """Logged-out re-fetch of every captured permalink; deltas; propagate to matched ads."""
-    from playwright.sync_api import sync_playwright
-    conn = db.connect(args.db)
-    today = _parse_date(args.date)
-    n = conn.execute("SELECT COUNT(*) FROM fb_posts").fetchone()[0]
-    if not n:
-        console.print("no captured posts yet - see `python tracker.py fb-capture --help`")
-        return 1
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=not args.headed, **meta_ads.launch_kwargs())
-        try:
-            c = fb_posts.refresh_engagement(conn, browser, today, args.max)
-        finally:
-            browser.close()
-    console.print(f"permalinks: {c['candidates']} due, fetched {c['fetched']}: ok={c['ok']} gated={c['gated']} removed={c['removed']} "
-                  f"no_counts={c['no_counts']} errors={c['errors']}")
-    return _fb_report(conn, today, args.limit)
-
-
-def _fb_report(conn, as_of: str, limit: int = 60) -> int:
-    dates = [r[0] for r in conn.execute("SELECT DISTINCT snapshot_date FROM fb_posts_daily WHERE snapshot_date <= ? ORDER BY snapshot_date DESC LIMIT 7", (as_of,))][::-1]
-    t = Table(title=f"captured Sponsored posts and their public counts (reactions/comments/shares; as of {as_of})")
-    for c in ("post", "page", "store", "ad (match)", "status"):
-        t.add_column(c)
-    for d in dates:
-        t.add_column(d[5:], justify="right")
-    for c in ("comments 1d", "eng/day 7d"):
-        t.add_column(c, justify="right")
-    rows = conn.execute("""SELECT p.*, s.store_domain FROM fb_posts p LEFT JOIN stores s ON s.id = p.store_id ORDER BY p.captured_at DESC LIMIT ?""",
-                        (limit,)).fetchall()
-    for p in rows:
-        hist = {x["snapshot_date"]: x for x in conn.execute("SELECT * FROM fb_posts_daily WHERE post_id = ?", (p["post_id"],))}
-        last = hist.get(dates[-1]) if dates else None
-        cells = []
-        for d in dates:
-            x = hist.get(d)
-            if not x:
-                cells.append("-")
-            elif x["reactions"] is None and x["comments"] is None:
-                cells.append(x["status"] or "?")
-            else:
-                cells.append(f"{x['reactions'] or 0}/{x['comments'] or 0}/{x['shares'] or 0}")
-        match = f"{p['ad_id']} ({p['match_via']} {p['match_score']})" if p["ad_id"] else ""
-        t.add_row(p["post_id"][:20], (p["page_name"] or p["page_id"] or "")[:22], _short(p["store_domain"] or ""), match, p["status"] or "",
-                  *cells, "" if not last or last["comment_delta_1d"] is None else str(last["comment_delta_1d"]),
-                  "" if not last or last["engagement_per_day_7d"] is None else f"{last['engagement_per_day_7d']:.1f}")
-    console.print(t)
-    total = conn.execute("SELECT COUNT(*), SUM(ad_id IS NOT NULL), SUM(status = 'gated'), SUM(status = 'removed') FROM fb_posts").fetchone()
-    console.print(f"{total[0]} posts captured, {total[1] or 0} matched to Ad Library ads, {total[2] or 0} gated, {total[3] or 0} removed")
-    return 0
-
-
-def cmd_fb_report(args) -> int:
-    conn = db.connect(args.db)
-    as_of = _parse_date(args.date) if args.date else (conn.execute("SELECT MAX(snapshot_date) FROM fb_posts_daily").fetchone()[0] or date.today().isoformat())
-    return _fb_report(conn, as_of, args.limit)
-
-
-def cmd_fb_listen(args) -> int:
-    """Receive captures from the browser observer extension (tools/fb_observer) on 127.0.0.1:8765."""
-    from http.server import HTTPServer
-    conn = db.connect(args.db)
-    stats = {"received": 0, "new": 0, "matched": 0}
-
-    def on_capture(n, new, matched):
-        stats["received"] += n
-        stats["new"] += new
-        stats["matched"] += matched
-        log.info("captures: +%d (%d new, %d matched) | total received %d, new %d", n, new, matched, stats["received"], stats["new"])
-    srv = HTTPServer(("127.0.0.1", args.port), fb_posts.make_listener(conn, lambda: date.today().isoformat(), on_capture))
-    console.print(f"listening on http://127.0.0.1:{args.port}/capture for the Sponsored post observer (Ctrl+C to stop). "
-                  f"Browse Facebook normally in the browser where the extension is installed.")
-    try:
-        srv.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    console.print(f"received {stats['received']} capture(s), {stats['new']} new, {stats['matched']} matched to ads. Counts: `python tracker.py fb-engagement`")
-    return 0
-
-
-def cmd_fb_bait(args) -> int:
-    """Open each watchlist store's hero product page in YOUR default browser so you can add to cart by hand
-    (that is what makes the brands' ads appear in your feed). Nothing is automated on the store or on Facebook."""
-    import webbrowser
-    conn = db.connect(args.db)
-    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
-    only = set(args.only) if args.only else None
-    urls = []
-    for s in stores:
-        d = s["store_domain"]
-        if only and d not in only:
-            continue
-        sid = db.upsert_store(conn, d)
-        _, products = inventory.latest_products(conn, sid)
-        heroes = inventory.select_heroes(products, date.today(), max_variants=5)
-        base = shopify.base_url(d)
-        handles = []
-        for h in heroes:
-            if h["handle"] not in handles:
-                handles.append(h["handle"])
-        for h in handles[: args.per_store]:
-            urls.append(f"{base}/products/{h}")
-        if not handles:
-            urls.append(base)
-    console.print(f"{len(urls)} product page(s) across {len([u for u in urls])} tab(s):")
-    for u in urls:
-        console.print(f"  {u}")
-    if args.print_only:
-        return 0
-    for i, u in enumerate(urls):
-        webbrowser.open_new_tab(u)
-        if i < len(urls) - 1:
-            time.sleep(1.5)
-    console.print("Opened in your browser. On each page: look around for half a minute, add the product to cart, move on. "
-                  "Do not check out. Their ads usually reach your feed within 1-2 days.")
-    return 0
-
+# ---------------------------------------------------------------- radar
 
 def _radar_summary(conn, out: dict) -> None:
     c = radar.summary_counts(conn)
@@ -1254,8 +563,7 @@ def cmd_radar(args) -> int:
     with meta_ads.KeepAwake():
         handle = meta_ads.LazyBrowser(headless=not args.headed)   # Playwright starts only if a search is actually needed
         try:
-            out = radar.run_radar(conn, handle, today, do_sweep=do_sweep, watchlist_path=Path(args.watchlist) if args.watchlist else None,
-                                  max_minutes=args.max_minutes)
+            out = radar.run_radar(conn, handle, today, do_sweep=do_sweep, watchlist_path=_wl(args), max_minutes=args.max_minutes)
         finally:
             handle.close()
     _radar_summary(conn, out)
@@ -1282,7 +590,7 @@ def _radar_table(conn, limit: int = 40) -> int:
 
 def cmd_radar_add(args) -> int:
     conn = db.connect(args.db)
-    r = radar.manual_add(conn, args.items, _parse_date(None), watchlist_path=Path(args.watchlist) if args.watchlist else None)
+    r = radar.manual_add(conn, args.items, _parse_date(None), watchlist_path=_wl(args))
     for d in r["added"]:
         console.print(f"[green]added[/] {d}")
     for d in r["existing"]:
@@ -1333,374 +641,89 @@ def cmd_radar_report(args) -> int:
     return _radar_table(conn, args.limit)
 
 
-def cmd_ads(args) -> int:
-    snapshot_date = _parse_date(args.date)
-    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
-    if not stores:
-        console.print("[red]watchlist is empty[/]")
-        return 2
+# ---------------------------------------------------------------- reports
+
+def cmd_report(args) -> int:
+    """The Winners tab in the terminal: one row per landing URL with >= 3 delivering ads, delivering_wow desc."""
     conn = db.connect(args.db)
-    only = set(args.only) if args.only else None
-    n = len([s for s in stores if not only or s["store_domain"] in only])
-    console.print(f"ads: snapshot_date={snapshot_date} pages={n} waits={config.META_WAIT_MIN}-{config.META_WAIT_MAX}s "
-                  f"headless={not args.headed}")
-    t0 = time.monotonic()
-    planned = plan_meta_stores(conn, stores, only)
-    console.print(f"plan: {len(planned)} store(s), least recently scraped first, budget {args.max_minutes or config.META_MAX_MINUTES:.0f} min "
-                  f"(about {config.META_MAX_SCROLLS * 5.5 / 60 + 1 + config.META_DETAIL_MAX * 4.5 / 60:.0f} min per store at current settings)")
-    ok, failed = run_ads_pass(conn, stores, snapshot_date, only, headless=not args.headed, max_scrolls=args.max_scrolls,
-                              detail=not args.no_detail, detail_cap=args.detail_max, max_minutes=args.max_minutes)
-    md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
-    console.print(f"done in {time.monotonic() - t0:.0f}s: [green]{ok} ok[/], [red]{failed} failed[/]"
-                  + (f"; alerts written to {md}" if md else ""))
-    return 1 if ok == 0 and failed else 0
-
-
-def cmd_rank_check(args) -> int:
-    """Confirm the impressions sort is informative: for the given stores run the newest-first and the impressions-sorted
-    searches (few scrolls each) and compare the orders; records ranks and sort_informative as the night pass would."""
-    from playwright.sync_api import sync_playwright
-    conn = db.connect(args.db)
-    today = _parse_date(args.date)
-    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
-    if args.only:
-        stores = [s for s in stores if s["store_domain"] in set(args.only)]
-    stores = stores[: args.limit]
-    if not stores:
-        console.print("[red]no stores selected[/]")
-        return 2
-    t = Table(title="impressions sort vs newest first")
-    for c in ("store", "query", "newest", "sorted", "compared", "same position", "sort_informative", "country", "top 3 by impressions", "views tried"):
-        t.add_column(c, justify="right" if c in ("newest", "sorted", "compared", "same position") else "left")
-    with sync_playwright() as pw, meta_ads.KeepAwake():
-        handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
-        try:
-            for s in stores:
-                sid = db.upsert_store(conn, s["store_domain"], s.get("meta_page_name"), s.get("meta_page_id"), s.get("notes"))
-                conn.commit()
-                query = meta_ads.store_query(s)
-                url = meta_ads.build_search_url(query=None if s.get("meta_page_id") else query, page_id=s.get("meta_page_id") or None)
-                try:
-                    base = meta_ads.scrape_page(url, max_scrolls=args.scrolls, browser=handle.get())
-                    if base.blocked:
-                        raise meta_ads.MetaBlocked(base.note)
-                    if base.ads:
-                        meta_ads.record_scrape(conn, sid, today, base.ads, query)
-                    rk = ad_rank.scrape_ranks(conn, handle.get(), s, sid, today, [a["ad_id"] for a in base.ads], max_scrolls=args.scrolls)
-                except meta_ads.MetaBlocked as e:
-                    console.print(f"[red]{s['store_domain']}: blocked ({e}); stopping[/]")
-                    break
-                except Exception as e:  # noqa: BLE001
-                    t.add_row(_short(s["store_domain"]), query, "", "", "", "", f"error: {str(e)[:40]}", "", "", "")
-                    continue
-                top = [r[0] for r in conn.execute("SELECT ad_id FROM meta_ads_daily WHERE store_id = ? AND snapshot_date = ? AND impression_rank IS NOT NULL ORDER BY impression_rank LIMIT 3", (sid, today))]
-                t.add_row(_short(s["store_domain"]), query[:24], str(len(base.ads)), str(rk["ranked"]), str(rk["n"]), str(rk["same_position"]),
-                          "[green]true[/]" if rk["informative"] else "[red]false[/]" if rk["informative"] is not None else "?", rk.get("country") or "",
-                          ", ".join(top), rk.get("summary", ""))
-                _post_process_store(conn, sid, s["store_domain"], today, shopify.make_session(), fetch_landings=False)
-        finally:
-            handle.close()
-    console.print(t)
-    console.print("false = every country view tried (META_RANK_COUNTRIES) returned its ads in the same order as that view's newest-first "
-                  "list: the sort carries no information for that store, and it is re-checked weekly instead of daily. "
-                  "country = the view whose ranks were kept. The 'note' column of rank_checks records what each view returned.")
-    return 0
-
-
-def cmd_ads_fields(args) -> int:
-    """Which keys the stored ad payloads carry that match --grep (to confirm what Meta calls a badge)."""
-    conn = db.connect(args.db)
-    sid = None
+    as_of = _parse_date(args.date) if args.date else None
+    stores = [dict(r) for r in conn.execute("SELECT id, store_domain, shop_id, store_created_est FROM stores ORDER BY store_domain")]
     if args.store:
-        row = conn.execute("SELECT id FROM stores WHERE store_domain = ?", (args.store,)).fetchone()
-        if not row:
-            console.print(f"[red]unknown store[/] {args.store}")
-            return 2
-        sid = row["id"]
-    fields = meta_ads.payload_fields(conn, args.grep, sid, args.limit)
-    if not fields:
-        console.print(f"no key or label matching /{args.grep}/ in the last {args.limit} stored payloads")
-        return 1
-    t = Table(title=f"payload keys matching /{args.grep}/ (last {args.limit} ads{' of ' + args.store if args.store else ''})")
-    for c in ("key path", "ads", "example value"):
-        t.add_column(c, justify="right" if c == "ads" else "left")
-    for k, (n, ex) in list(fields.items())[:40]:
-        t.add_row(k, str(n), str(ex)[:70])
-    console.print(t)
-    return 0
-
-
-def cmd_delivering_report(args) -> int:
-    """Before/after for the delivering metric: active ads (old ranking) vs ads without the low-impression badge."""
-    conn = db.connect(args.db)
-    bf = meta_ads.backfill_low_impressions(conn)
-    console.print(f"badge backfill from stored payloads: {bf['updated']} daily rows filled, {bf['flagged']} flagged low, "
-                  f"{bf['no_field']} payloads without a badge field" + (f"; keys: {bf['keys']}" if bf["keys"] else ""))
-    like = [f"%{h}%" for h in args.handle] if args.handle else ["%"]
-    rows = []
-    for pat in like:
-        for r in conn.execute("""SELECT DISTINCT s.id AS store_id, s.store_domain, a.product_handle FROM meta_ads a JOIN stores s ON s.id = a.store_id
-                                 WHERE a.product_handle LIKE ? AND (? IS NULL OR s.store_domain LIKE ?) ORDER BY s.store_domain, a.product_handle""",
-                              (pat, args.store, f"%{args.store}%" if args.store else None)):
-            rows.append(dict(r))
+        stores = [s for s in stores if _same_store(args.store, s["store_domain"]) or _same_store(s["store_domain"], args.store)]
+    rows = winners.winners_rows(conn, stores, as_of)
     if not rows:
-        console.print("no products match; the handle must be one an ad resolved to (see the Signals tab)")
-        return 1
-    seen = set()
+        console.print("no landing URL has 3 or more delivering ads yet - run `python tracker.py ads` first (the badge is read per card)")
+        return 2
+    t = Table(title=f"Winners: landing URLs with >= {winners.MIN_DELIVERING} delivering ads (delivering_wow desc, then delivering)")
+    for c in winners.WINNERS_HEADERS:
+        t.add_column(c, justify="left" if c in ("store", "landing_url", "top_page", "ads_as_of") else "right")
+    for r in rows[: args.top]:
+        t.add_row(_short(r[0]), r[1][:70], *[str(x) for x in r[2:]])
+    console.print(t)
+    console.print("delivering = active ads on the URL whose card shows no 'Low impression count' badge; 'new' = 0 delivering a week ago; "
+                  "blank wow = no scrape 6-8 days earlier. family/store age only where known.")
+    return 0
+
+
+def cmd_url(args) -> int:
+    """Time series for one landing URL (host/path, query string ignored): delivering per day + the ads behind it."""
+    conn = db.connect(args.db)
+    path = winners.normalise_landing_path(args.url) or args.url.lower()
+    rows = conn.execute("""SELECT u.*, s.store_domain FROM url_daily u JOIN stores s ON s.id = u.store_id
+                           WHERE u.landing_path = ? ORDER BY u.snapshot_date, s.store_domain""", (path,)).fetchall()
+    if not rows:
+        like = conn.execute("SELECT DISTINCT landing_path FROM url_daily WHERE landing_path LIKE ? ORDER BY 1 LIMIT 10", (f"%{path.split('/')[-1]}%",)).fetchall()
+        console.print(f"[red]no delivering ads recorded for[/] {path}" + (": similar URLs: " + ", ".join(r[0] for r in like) if like else ""))
+        return 2
+    t = Table(title=f"{path}  (per scrape day)")
+    for c in ("date", "store", "delivering", "7d ago", "wow", "proven_days", "pages", "pages_new_7d", "top_page", "family", "family_created"):
+        t.add_column(c, justify="left" if c in ("date", "store", "top_page", "family", "family_created") else "right")
     for r in rows:
-        key = (r["store_id"], r["product_handle"])
-        if key in seen:
-            continue
-        seen.add(key)
-        snap = ad_metrics._snapshot_on_or_before(conn, r["store_id"], _parse_date(args.date) if args.date else "9999")
-        if not snap:
-            continue
-        ad_metrics.write_concept_rows(conn, r["store_id"], snap)          # survival recomputed on delivering ads
-        conn.commit()
-        dm = ad_metrics.delivering_metrics(conn, r["store_id"], snap).get(r["product_handle"], {})
-        cs = conn.execute("""SELECT COUNT(*) n, SUM(ads_active > 0) alive_search, SUM(COALESCE(ads_delivering, ads_active) > 0) alive_deliv
-                             FROM meta_concepts_daily WHERE store_id = ? AND snapshot_date = ? AND product_handle = ?""",
-                          (r["store_id"], snap, r["product_handle"])).fetchone()
-        t = Table(title=f"{_short(r['store_domain'])} / {r['product_handle']}  (ads as of {snap}; week-ago snapshot {dm.get('prev_as_of') or 'none'})")
-        for c in ("metric", "before (active ads)", "after (delivering)"):
-            t.add_column(c)
-        t.add_row("ads", str(dm.get("ads_active", 0)), str(dm.get("ads_delivering", 0)))
-        t.add_row("of which low-impression badge", "-", str(dm.get("ads_low_impressions", 0)))
-        t.add_row("of which badge unknown (no field in payload)", "-", str(dm.get("ads_badge_unknown", 0)))
-        t.add_row("7 days ago", "-", str(dm.get("ads_delivering_7d_ago", "")))
-        t.add_row("week over week", "-", str(dm.get("delivering_velocity_wow", "")))
-        t.add_row("concepts alive / total", f"{cs['alive_search'] or 0}/{cs['n'] or 0}", f"{cs['alive_deliv'] or 0}/{cs['n'] or 0}")
-        console.print(t)
-        ads = conn.execute("""SELECT a.ad_id, a.ad_start_date, a.delivery_status, d.is_active, d.low_impressions, a.low_impressions_key, a.concept_id
-                              FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id AND d.snapshot_date = ?
-                              WHERE a.store_id = ? AND a.product_handle = ? AND d.is_active = 1
-                              ORDER BY d.low_impressions IS NULL, d.low_impressions, a.ad_start_date DESC LIMIT ?""",
-                           (snap, r["store_id"], r["product_handle"], args.limit)).fetchall()
-        t2 = Table(title=f"active ads for {r['product_handle']} (first {args.limit})")
-        for c in ("ad_id", "started", "badge", "badge key", "delivery (end_date)", "concept", "delivering"):
-            t2.add_column(c)
-        for a in ads:
-            badge = {1: "LOW", 0: "no"}.get(a["low_impressions"], "?")
-            t2.add_row(a["ad_id"], a["ad_start_date"] or "", badge, (a["low_impressions_key"] or "")[:28], a["delivery_status"] or "",
-                       (a["concept_id"] or "")[:10], "yes" if ad_metrics.delivering(dict(a)) else "no")
-        console.print(t2)
-        rm = ad_rank.ad_rank_metrics(conn, r["store_id"], snap)
-        pm = rm["products"].get(r["product_handle"])
-        chk = conn.execute("SELECT informative, n_compared, same_position FROM rank_checks WHERE store_id = ? ORDER BY snapshot_date DESC LIMIT 1", (r["store_id"],)).fetchone()
-        if pm:
-            t3 = Table(title=f"top {ad_rank.TOP_N} ads by impression rank for {r['product_handle']} (ranks as of {rm['as_of']}; "
-                             f"best rank {pm['best_rank']}, 7d ago {pm['best_rank_7d_ago'] if pm['best_rank_7d_ago'] is not None else '-'}, "
-                             f"ads in top {ad_rank.TOP_N}: {pm['ads_in_top5']})")
-            for c in ("rank", "ad_id", "started", "days running", "rank 7d ago", "delta 7d", "top5 days", "badge"):
-                t3.add_column(c, justify="right" if c not in ("ad_id", "started", "badge") else "left")
-            for a in pm["top5_ads"]:
-                t3.add_row(str(a["rank"]), a["ad_id"], a.get("started") or "", "" if a["days_running"] is None else str(a["days_running"]),
-                           "" if a["rank_7d_ago"] is None else str(a["rank_7d_ago"]), "" if a["rank_delta_7d"] is None else str(a["rank_delta_7d"]),
-                           str(a["top5_days"]), {1: "LOW", 0: "no"}.get(a["low_impressions"], "?"))
-            console.print(t3)
-        elif rm["as_of"] is None:
-            console.print(f"  no impression-rank data for {_short(r['store_domain'])} yet: run `python tracker.py rank-check --only {r['store_domain']}` "
-                          "or wait for the next Meta pass")
-        else:
-            console.print(f"  {r['product_handle']}: none of its ads appear in the impressions-sorted result of {rm['as_of']}")
-        if chk is not None:
-            console.print(f"  sort_informative={'true' if chk['informative'] else 'false' if chk['informative'] is not None else '?'} "
-                          f"({chk['same_position']}/{chk['n_compared']} of the first ids in the same position as newest-first)")
-    console.print("Signals and Early rank on ads_in_top5 / best-rank trend, then delivering trend; run `python tracker.py sync-sheets` to push.")
-    return 0
-
-
-def cmd_ads_metrics(args) -> int:
-    """Recompute the landing join / concepts / lineage / alerts from stored ads (no scraping)."""
-    snapshot_date = _parse_date(args.date) if args.date else None
-    conn = db.connect(args.db)
-    if snapshot_date is None:
-        snapshot_date = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily").fetchone()[0]
-    if not snapshot_date:
-        console.print("[red]no ad snapshots yet[/]")
-        return 2
-    session = shopify.make_session()
-    stores = conn.execute(
-        """SELECT DISTINCT s.id, s.store_domain FROM meta_ads_daily d JOIN stores s ON s.id = d.store_id
-           WHERE d.snapshot_date = ? ORDER BY s.store_domain""", (snapshot_date,)).fetchall()
-    if args.only:
-        stores = [s for s in stores if s["store_domain"] in set(args.only)]
-    console.print(f"ads-metrics: snapshot_date={snapshot_date} stores={len(stores)} fetch_landings={not args.no_fetch} "
-                  f"posts={args.posts}")
-    bf = meta_ads.backfill_low_impressions(conn)
-    if bf["updated"]:
-        console.print(f"low-impression badge filled from stored payloads for {bf['updated']} ad-day(s) ({bf['flagged']} flagged)")
-    browser = pw = None
-    if args.posts:
-        from playwright.sync_api import sync_playwright
-        pw = sync_playwright().start()
-        browser = pw.chromium.launch(headless=True, **meta_ads.launch_kwargs())
-    try:
-        for s in stores:
-            _post_process_store(conn, s["id"], s["store_domain"], snapshot_date, session, fetch_landings=not args.no_fetch)
-            if browser is not None:
-                pe = meta_ads.fetch_boosted_engagement(conn, browser, s["id"], snapshot_date)
-                log.info("%-28s boosted posts: %d candidates, fetched %d, counts found %d", s["store_domain"],
-                         pe["candidates"], pe["fetched"], pe["with_counts"])
-                for a in conn.execute("SELECT DISTINCT ad_id FROM meta_ads_daily WHERE store_id = ? AND snapshot_date = ?",
-                                      (s["id"], snapshot_date)):
-                    ad_metrics.compute_reach_metrics(conn, a["ad_id"], snapshot_date)
-                conn.commit()
-    finally:
-        if browser is not None:
-            browser.close()
-            pw.stop()
-    md = ad_metrics.write_alerts_markdown(conn, snapshot_date)
-    if md:
-        console.print(f"alerts written to {md}")
-    return 0
-
-
-def cmd_landing(args) -> int:
-    """Which product does a landing page sell? Fetches the URL, prints every product the page names with its evidence
-    weight (buy action > call-to-action link > plain link; menus ignored), the product the tracker picks, and, with
-    --apply, re-resolves the store's ads that land there. --refresh-all re-fetches every cached lander of every
-    watchlist store under the current rules and re-resolves their ads in one pass."""
-    from urllib.parse import urlparse
-    conn = db.connect(args.db)
-    if args.refresh_all:
-        return _landing_refresh_all(conn, args)
-    if not args.url:
-        console.print("[red]give a landing URL, or --refresh-all[/]")
-        return 2
-    host = urlparse(args.url).netloc
-    store = None
-    for r in conn.execute("SELECT id, store_domain FROM stores"):
-        if ad_metrics.same_store(host, r["store_domain"]):
-            store = r
-            break
-    if store is None:
-        console.print(f"[red]{host} is not a watchlist store[/] (add it first: python tracker.py add-store {host})")
-        return 2
-    known, v2h = ad_metrics._known_handles(conn, store["id"])
-    session = shopify.make_session()
-    try:
-        final, html, status = ad_metrics.fetch_landing(session, args.url)
-    except Exception as e:  # noqa: BLE001
-        console.print(f"[red]could not fetch {args.url}: {e}[/]")
-        return 1
-    console.print(f"{args.url} -> HTTP {status}, final {final}, {len(html)} bytes; store {store['store_domain']} ({len(known)} known handles)")
-    if not html:
-        return 1
-    ranked = ad_metrics.handles_from_html(html, v2h)
-    t = Table(title="products named on the page (what it sells first)")
-    for c in ("handle", "weight", "listed product", "note"):
-        t.add_column(c, justify="right" if c == "weight" else "left")
-    chosen = None
-    for h, w in ranked[:15]:
-        m = ad_metrics.match_handle(h, known)
-        junk = ad_metrics.is_junk_handle(m or h)
-        if chosen is None and m and not junk:
-            chosen = m
-        t.add_row(h, str(w), m or "-", "widget (ignored)" if junk else ("<- picked" if m == chosen and chosen else ""))
+        t.add_row(r["snapshot_date"], _short(r["store_domain"]), str(r["delivering"]), "" if r["delivering_7d_ago"] is None else str(r["delivering_7d_ago"]),
+                  str(winners.wow_cell(r["delivering"], r["delivering_7d_ago"])), "" if r["proven_days"] is None else str(r["proven_days"]),
+                  str(r["pages"]), str(r["pages_new_7d"]), r["top_page"] or "", r["family_key"] or "", r["family_created"] or "")
     console.print(t)
-    console.print(f"picked: [bold]{chosen or '(none: no listed product named)'}[/]   "
-                  "(weights: buy action with a known variant 6, call-to-action link 4 + 1, plain link 1, product JSON 1; header/nav/footer ignored)")
-    if args.apply:
-        key = ad_metrics._strip(args.url)
-        conn.execute("DELETE FROM landing_pages WHERE url = ?", (key,))
-        conn.commit()
-        snap = conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ?", (store["id"],)).fetchone()[0]
-        if snap:
-            ad_metrics.resolve_store_landings(conn, store["id"], store["store_domain"], snap, session)
-        rows = conn.execute("""SELECT product_handle, COUNT(*) n FROM meta_ads WHERE store_id = ? AND landing_url LIKE ?
-                               GROUP BY product_handle ORDER BY n DESC""", (store["id"], key + "%")).fetchall()
-        console.print("ads landing here, by the product they now count for: " + (", ".join(f"{r['product_handle'] or '(unresolved)'}={r['n']}" for r in rows) or "none")
-                      + ". Run `python tracker.py sync-sheets` to push.")
+    last = rows[-1]
+    ads = conn.execute("""SELECT a.ad_id, a.page_name, a.first_seen, d.low_impressions, a.landing_url, a.primary_text
+                          FROM ads_daily d JOIN ads a ON a.ad_id = d.ad_id AND a.store_id = d.store_id
+                          WHERE d.store_id = ? AND d.snapshot_date = ? AND d.still_active = 1 AND a.landing_path = ?
+                          ORDER BY d.low_impressions IS NULL, d.low_impressions, a.first_seen""", (last["store_id"], last["snapshot_date"], path)).fetchall()
+    t = Table(title=f"active ads on it, {last['snapshot_date']} (badge: LOW = low impression count, no = delivering, unread = card not rendered)")
+    for c in ("ad_id", "page", "first_seen", "badge", "landing_url", "primary text"):
+        t.add_column(c, overflow="fold")
+    for a in ads[: args.limit]:
+        t.add_row(a["ad_id"], (a["page_name"] or "")[:24], a["first_seen"] or "", {1: "LOW", 0: "no"}.get(a["low_impressions"], "unread"),
+                  (a["landing_url"] or "")[:60], " ".join((a["primary_text"] or "").split())[:80])
+    console.print(t)
     return 0
 
 
-def _landing_refresh_all(conn, args) -> int:
-    """Every cached landing page of every watchlist store is marked stale and fetched again (REQUEST_DELAY_S between
-    fetches of the same store; LANDING_REFRESH_WORKERS stores in parallel, each on its own host), then the store's
-    ads are re-resolved for its latest snapshot. Rows already resolved under the current rules are kept (a run can be
-    interrupted and resumed) unless --force. Prints, per store, landers fetched and ads that changed product."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    stores = read_watchlist(Path(args.watchlist) if args.watchlist else None)
-    only = set(args.only or [])
-    rows = [(r["id"], r["store_domain"]) for r in conn.execute("SELECT id, store_domain FROM stores ORDER BY store_domain")
-            if r["store_domain"] in {s["store_domain"] for s in stores} and (not only or r["store_domain"] in only)]
-    workers = max(1, min(config.LANDING_REFRESH_WORKERS, len(rows) or 1))
-    old_budget = config.META_MAX_LANDING_FETCH
-    config.META_MAX_LANDING_FETCH = 10 ** 6     # this pass IS the landing fetch; no per-run cap
-    ad_metrics.POLITE_LANDING_FETCH = True
-    t = Table(title="landing pages re-fetched under the current rules")
-    for c in ("store", "ads", "landers", "fetched", "ads changed product", "unresolved -> resolved", "took"):
-        t.add_column(c, justify="right" if c not in ("store",) else "left")
-
-    def one(sid: int, domain: str) -> dict | None:
-        for attempt in range(4):
-            try:
-                return _one(sid, domain)
-            except sqlite3.OperationalError as e:
-                if "locked" not in str(e).lower() or attempt == 3:
-                    raise
-                time.sleep(5 * (attempt + 1))
-        return None
-
-    def _one(sid: int, domain: str) -> dict | None:
-        c = db.connect(args.db)
-        try:
-            snap = c.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily WHERE store_id = ?", (sid,)).fetchone()[0]
-            if not snap:
-                return None
-            before = {a["ad_id"]: a["product_handle"] for a in c.execute("SELECT ad_id, product_handle FROM meta_ads WHERE store_id = ?", (sid,))}
-            keys = {ad_metrics._strip(u) for (u,) in c.execute("SELECT DISTINCT landing_url FROM meta_ads WHERE store_id = ? AND landing_url IS NOT NULL", (sid,))}
-            n_stale = 0
-            with c:
-                for k in keys:
-                    # a row already resolved under the current rules (an interrupted run, --apply) is kept; --force redoes it
-                    n_stale += c.execute("UPDATE landing_pages SET fetched_at = '2000-01-01' WHERE url = ? AND (COALESCE(resolver, 0) < ? OR ?)",
-                                         (k, ad_metrics.RESOLVER_VERSION, 1 if args.force else 0)).rowcount
-            t0 = time.monotonic()
-            ad_metrics.resolve_store_landings(c, sid, domain, snap, shopify.make_session())
-            after = {a["ad_id"]: a["product_handle"] for a in c.execute("SELECT ad_id, product_handle FROM meta_ads WHERE store_id = ?", (sid,))}
-            fetched = c.execute("SELECT COUNT(*) FROM landing_pages WHERE fetched_at = ? AND resolver = ? AND url IN (%s)" % ",".join("?" * len(keys)),
-                                (snap, ad_metrics.RESOLVER_VERSION, *keys)).fetchone()[0] if keys else 0
-            return {"domain": domain, "ads": len(after), "landers": len(keys), "stale": n_stale, "fetched": fetched,
-                    "changed": sum(1 for k in after if k in before and before[k] != after[k]),
-                    "gained": sum(1 for k in after if k in before and before[k] is None and after[k]), "took": time.monotonic() - t0}
-        finally:
-            c.close()
-
-    total_changed = done = 0
-    console.print(f"{len(rows)} stores, {workers} in parallel; REQUEST_DELAY_S={config.REQUEST_DELAY_S:.1f}s between fetches of one store. Ctrl+C keeps what is done.")
-    pool = ThreadPoolExecutor(max_workers=workers)
-    futures = {pool.submit(one, sid, domain): domain for sid, domain in rows}
-    try:
-        for f in as_completed(futures):
-            done += 1
-            domain = futures[f]
-            try:
-                r = f.result()
-            except Exception as e:  # noqa: BLE001
-                console.print(f"[{done}/{len(rows)}] {domain}: [red]failed: {e}[/]")
-                continue
-            if r is None:
-                continue
-            total_changed += r["changed"]
-            console.print(f"[{done}/{len(rows)}] {r['domain']}: {r['landers']} landing URLs, {r['fetched']} fetched, "
-                          f"{r['changed']} ads changed product ({r['took']:.0f}s)")
-            t.add_row(_short(r["domain"]), str(r["ads"]), str(r["landers"]), str(r["fetched"]), str(r["changed"]), str(r["gained"]), f"{r['took']:.0f}s")
-    except KeyboardInterrupt:
-        console.print("\n[yellow]interrupted; stores done so far are re-resolved, run again to continue (already-fetched pages are skipped)[/]")
-        pool.shutdown(wait=False, cancel_futures=True)
-        config.META_MAX_LANDING_FETCH = old_budget
-        ad_metrics.POLITE_LANDING_FETCH = False
-        console.print(t)
-        os._exit(130)
-    finally:
-        pool.shutdown(wait=True)
-        config.META_MAX_LANDING_FETCH = old_budget
-        ad_metrics.POLITE_LANDING_FETCH = False
+def cmd_status(args) -> int:
+    conn = db.connect(args.db)
+    runs = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
+    t = Table(title="recent runs")
+    for c in ("id", "snapshot_date", "started_at", "finished_at", "total", "ok", "failed"):
+        t.add_column(c)
+    for r in runs:
+        t.add_row(str(r["id"]), r["snapshot_date"], r["started_at"], r["finished_at"] or "-", str(r["stores_total"]), str(r["stores_ok"]), str(r["stores_failed"]))
     console.print(t)
-    console.print(f"{total_changed} ads now count for a different product. Run `python tracker.py sync-sheets` to push "
-                  "(the Ads tab shows landing_path -> resolved_product per ad).")
+    t = Table(title="stores")
+    for c in ("store", "meta page", "shop_id", "products", "catalogue days", "last catalogue", "ads as of", "active", "delivering", "winners", "last status"):
+        t.add_column(c, justify="right" if c in ("shop_id", "products", "catalogue days", "active", "delivering", "winners") else "left")
+    for s in conn.execute("SELECT id, store_domain, meta_page_name, shop_id FROM stores ORDER BY store_domain"):
+        p = conn.execute("""SELECT COUNT(DISTINCT snapshot_date), MAX(snapshot_date),
+                                   (SELECT COUNT(*) FROM products_daily p2 WHERE p2.store_id = p.store_id AND p2.snapshot_date = MAX(p.snapshot_date))
+                            FROM products_daily p WHERE store_id = ?""", (s["id"],)).fetchone()
+        snap = winners.latest_scrape(conn, s["id"])
+        a = conn.execute("SELECT COUNT(*), SUM(low_impressions = 0) FROM ads_daily WHERE store_id = ? AND snapshot_date = ? AND still_active = 1",
+                         (s["id"], snap)).fetchone() if snap else (0, 0)
+        w = conn.execute("SELECT COUNT(*) FROM url_daily WHERE store_id = ? AND snapshot_date = ? AND delivering >= ?",
+                         (s["id"], snap, winners.MIN_DELIVERING)).fetchone()[0] if snap else 0
+        last = conn.execute("SELECT status, error FROM store_runs WHERE store_id = ? ORDER BY run_id DESC LIMIT 1", (s["id"],)).fetchone()
+        status = "-" if last is None else (last["status"] + (": " + (last["error"] or "")[:50] if last["status"] != "ok" else ""))
+        t.add_row(_short(s["store_domain"]), s["meta_page_name"] or "-", str(s["shop_id"] or ""), str(p[2] or 0), str(p[0] or 0), p[1] or "-",
+                  snap or "-", str(a[0] or 0), str(a[1] or 0), str(w), f"[green]{status}[/]" if status == "ok" else f"[red]{status}[/]")
+    console.print(t)
     return 0
 
 
@@ -1730,330 +753,144 @@ def cmd_diag(args) -> int:
     return 0
 
 
-def cmd_ads_report(args) -> int:
-    conn = db.connect(args.db)
-    as_of = _parse_date(args.date) if args.date else (
-        conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily").fetchone()[0])
-    if not as_of:
-        console.print("[red]no ad snapshots yet[/] - run `python tracker.py ads --only <store>` first")
-        return 2
-    where, params = "", []
-    if args.store:
-        where, params = "AND s.store_domain = ?", [args.store]
-    t = Table(title=f"Ad Library pages (as of {as_of})")
-    for c in ("store", "query", "status", "ads", "active", "new today", "inactive today", "scrolls", "note"):
-        t.add_column(c)
-    for r in conn.execute(f"""
-        SELECT s.store_domain, r.query, r.status, r.ads_found, r.scrolls, r.detail,
-               (SELECT COUNT(*) FROM meta_ads_daily d WHERE d.store_id = s.id AND d.snapshot_date = ? AND d.is_active = 1) active,
-               (SELECT COUNT(*) FROM meta_ads a WHERE a.store_id = s.id AND a.first_seen_date = ?) new_today,
-               (SELECT COUNT(*) FROM meta_ads_daily d WHERE d.store_id = s.id AND d.snapshot_date = ? AND d.is_active = 0) gone
-        FROM meta_page_runs r JOIN stores s ON s.id = r.store_id
-        WHERE r.snapshot_date = ? {where} AND r.id = (SELECT MAX(id) FROM meta_page_runs r2 WHERE r2.store_id = r.store_id AND r2.snapshot_date = r.snapshot_date)
-        ORDER BY s.store_domain""", [as_of, as_of, as_of, as_of] + params):
-        colour = {"ok": "green", "blocked": "red", "error": "red"}.get(r["status"], "yellow")
-        t.add_row(r["store_domain"], r["query"] or "", f"[{colour}]{r['status']}[/]", str(r["ads_found"]),
-                  str(r["active"]), str(r["new_today"]), str(r["gone"]), str(r["scrolls"]), (r["detail"] or "")[:50])
-    console.print(t)
-
-    t = Table(title=f"where each store's active ads land (as of {as_of}): only 'product' rows reach the Signals tab")
-    for c in ("store", "active ads", "-> products", "distinct products", "unlisted-product", "advertorial", "homepage", "collection",
-              "other path", "external", "no-url", "page-ignored"):
-        t.add_column(c, justify="left" if c == "store" else "right")
-    for st in conn.execute(f"SELECT id, store_domain FROM stores {'WHERE store_domain = ?' if args.store else ''} ORDER BY store_domain",
-                           ([args.store] if args.store else [])).fetchall():
-        b = ad_metrics.landing_breakdown(conn, st["id"], st["store_domain"], as_of)
-        if not b["active"]:
-            continue
-        t.add_row(_short(st["store_domain"]), str(b["active"]), str(b["to_products"]), str(b["products"]),
-                  *[str(b[k]) for k in ("unlisted-product", "advertorial", "homepage", "collection", "other-store-path", "external", "no-url", "page-ignored")])
-    console.print(t)
-    t = Table(title=f"products by active ads pointing at them (as of {as_of})")
-    for c in ("store", "product handle", "active ads", "pages", "oldest ad (days)", "newest ad (days)", "concepts", "landing kinds"):
-        t.add_column(c)
-    for r in conn.execute(f"""
-        SELECT s.store_domain, a.product_handle, COUNT(*) n, COUNT(DISTINCT a.page_name) pages,
-               MAX(d.days_running) oldest, MIN(d.days_running) newest, COUNT(DISTINCT a.concept_id) concepts,
-               SUM(a.landing_resolved_via = 'url') direct, SUM(a.landing_resolved_via = 'page-fetch') via_page
-        FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id JOIN stores s ON s.id = d.store_id
-        WHERE d.snapshot_date = ? AND d.is_active = 1 AND a.product_handle IS NOT NULL {where}
-        GROUP BY s.store_domain, a.product_handle ORDER BY n DESC LIMIT ?""", [as_of] + params + [args.limit]):
-        t.add_row(r["store_domain"], r["product_handle"], str(r["n"]), str(r["pages"]), str(r["oldest"] or ""),
-                  str(r["newest"] or ""), str(r["concepts"]), f"direct {r['direct'] or 0}, via page {r['via_page'] or 0}")
-    console.print(t)
-    ignored = conn.execute(f"""
-        SELECT p.page_name, p.ads FROM meta_pages_daily p JOIN stores s ON s.id = p.store_id
-        WHERE p.snapshot_date = ? AND p.ignored = 1 {where} ORDER BY p.ads DESC""", [as_of] + params).fetchall()
-    if ignored:
-        console.print("[dim]ignored pages (none of their ads land on the store): " +
-                      ", ".join(f"{r['page_name']} x{r['ads']}" for r in ignored) + "[/]")
-
-    t = Table(title="advertised handles (raw /products/<handle> in ad URLs) -> resolved product")
-    for c in ("store", "advertised handle", "active ads", "in products.json", "resolved to"):
-        t.add_column(c)
-    for r in conn.execute(f"""
-        SELECT s.store_domain, a.landing_handle, COUNT(*) n, a.product_handle,
-               (SELECT CASE WHEN COALESCE(p.unlisted, 0) = 1 THEN 'unlisted' ELSE 'yes' END FROM products_daily p
-                 WHERE p.store_id = s.id AND p.handle = a.landing_handle
-                   AND p.snapshot_date = (SELECT MAX(snapshot_date) FROM products_daily WHERE store_id = s.id)) listed
-        FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id JOIN stores s ON s.id = d.store_id
-        WHERE d.snapshot_date = ? AND d.is_active = 1 AND a.landing_handle IS NOT NULL AND COALESCE(a.page_ignored, 0) = 0 {where}
-        GROUP BY s.store_domain, a.landing_handle ORDER BY n DESC LIMIT ?""", [as_of] + params + [args.limit]):
-        listed = {"yes": "[green]yes[/]", "unlisted": "[cyan]unlisted (live page, fetched)[/]"}.get(r["listed"], "[yellow]no[/]")
-        t.add_row(r["store_domain"], r["landing_handle"], str(r["n"]), listed, r["product_handle"] or "[red]-[/]")
-    console.print(t)
-
-    t = Table(title="landing pages fetched (advertorials / unmatched URLs), unresolved first")
-    for c in ("landing url", "active ads", "http", "resolved to", "handles found on page"):
-        t.add_column(c, overflow="fold")
-    known_products = {r[0] for r in conn.execute(
-        "SELECT DISTINCT handle FROM products_daily WHERE snapshot_date >= date(?, '-7 days')", (as_of,))}
-    for r in conn.execute(f"""
-        SELECT lp.url, lp.status, lp.product_handle, lp.candidates, COUNT(*) n
-        FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id JOIN stores s ON s.id = a.store_id
-        JOIN landing_pages lp ON lp.url = substr(a.landing_url, 1, CASE WHEN instr(a.landing_url, '?') > 0
-                                                       THEN instr(a.landing_url, '?') - 1 ELSE length(a.landing_url) END)
-        WHERE d.snapshot_date = ? AND d.is_active = 1 AND COALESCE(a.page_ignored, 0) = 0 {where}
-        GROUP BY lp.url ORDER BY (lp.product_handle IS NULL) DESC, n DESC LIMIT 20""", [as_of] + params):
-        if r["url"].endswith(".json") or ad_metrics.handle_from_url(r["url"])[0] in known_products:
-            continue   # product pages we already know are not diagnostics
-        t.add_row(r["url"], str(r["n"]), "" if r["status"] is None else str(r["status"]),
-                  r["product_handle"] or "[red]-[/]", (r["candidates"] or "")[:90])
-    console.print(t)
-
-    t = Table(title=f"concepts (page + landing + launch window), by days running")
-    for c in ("store", "page", "launched", "days", "ads", "active", "survival", "product / page handle", "landing"):
-        t.add_column(c, overflow="fold")
-    for r in conn.execute(f"""
-        SELECT s.store_domain, c.page_name, c.launch_date, c.days_running, c.ads_ever, c.ads_active, c.survival,
-               c.product_handle, c.page_handle, c.landing_url
-        FROM meta_concepts_daily c JOIN stores s ON s.id = c.store_id WHERE c.snapshot_date = ? {where}
-        ORDER BY c.ads_ever DESC, c.days_running DESC LIMIT ?""", [as_of] + params + [args.limit]):
-        surv = "" if r["survival"] is None else f"{r['survival']:.0%}"
-        from urllib.parse import urlparse as _up
-        t.add_row(r["store_domain"], r["page_name"] or "", r["launch_date"] or "", str(r["days_running"] or ""),
-                  str(r["ads_ever"]), str(r["ads_active"]), surv,
-                  r["product_handle"] or (f"/pages/{r['page_handle']}" if r["page_handle"] else ""),
-                  (_up(r["landing_url"]).path if r["landing_url"] else "")[:60])
-    console.print(t)
-
-    lin = conn.execute(f"""
-        SELECT s.store_domain, a.page_name, a.lineage_of, o.ad_start_date AS parent_start, COUNT(*) n,
-               AVG(a.lineage_similarity) sim, MAX(a.product_handle) product_handle, substr(o.headline, 1, 40) headline
-        FROM meta_ads a JOIN meta_ads o ON o.ad_id = a.lineage_of JOIN stores s ON s.id = a.store_id
-        WHERE a.lineage_of IS NOT NULL AND COALESCE(a.page_ignored, 0) = 0 {where}
-        GROUP BY s.store_domain, a.page_name, a.lineage_of ORDER BY n DESC LIMIT ?""", params + [args.limit]).fetchall()
-    if lin:
-        t = Table(title="lineage: older ads whose copy new ads re-use (>70% similar, parent 14+ days)")
-        for c in ("store", "page", "parent ad", "parent start", "parent headline", "new ads", "avg sim", "product"):
-            t.add_column(c)
-        for r in lin:
-            t.add_row(r["store_domain"], r["page_name"] or "", r["lineage_of"], r["parent_start"] or "",
-                      r["headline"] or "", str(r["n"]), f"{r['sim']:.0%}", r["product_handle"] or "")
-        console.print(t)
-
-    al = conn.execute(f"""SELECT a.rule, a.product_handle, a.detail, s.store_domain FROM alerts a JOIN stores s ON s.id = a.store_id
-                          WHERE a.snapshot_date = ? AND a.rule >= 5 {where} ORDER BY a.rule""", [as_of] + params).fetchall()
-    if al:
-        t = Table(title=f"alerts {as_of}")
-        for c in ("rule", "store", "product", "detail"):
-            t.add_column(c, overflow="fold")
-        for r in al:
-            t.add_row(f"{r['rule']} {ad_metrics.RULES.get(r['rule'], '')}", r["store_domain"], r["product_handle"] or "", r["detail"])
-        console.print(t)
-    if not args.raw:
-        console.print("[dim]add --raw for the per-ad rows[/]")
+def cmd_db_check(args) -> int:
+    """Is data/tracker.db free? Tries a 2-second write lock, lists the database files and the programs that could be
+    holding it (any python, a database viewer, OneDrive syncing the folder)."""
+    path = Path(args.db) if args.db else config.DB_PATH
+    console.print(f"database: {path.resolve()}")
+    for f in sorted(path.parent.glob(path.name + "*")):
+        st = f.stat()
+        console.print(f"  {f.name:<22} {st.st_size / 1e6:8.1f} MB   modified {datetime.fromtimestamp(st.st_mtime):%Y-%m-%d %H:%M:%S}")
+    if not path.exists():
+        console.print("[yellow]no database yet (the first run creates it)[/]")
         return 0
-
-    t = Table(title=f"raw ads (as of {as_of}, newest start first, limit {args.limit})")
-    for c in ("store", "ad id", "page", "start", "days", "act", "type", "headline", "primary text", "landing", "fp", "eu",
-              "reach/day", "type", "comments"):
-        t.add_column(c, overflow="fold")
-    rows = conn.execute(f"""
-        SELECT s.store_domain, a.ad_id, a.page_name, a.ad_start_date, a.first_seen_date, d.is_active, a.creative_type,
-               a.headline, a.primary_text, a.landing_url, a.fingerprint, d.eu_total_reach, d.uk_reach, d.reach_slope_7d,
-               a.engagement_type, d.comments
-        FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id JOIN stores s ON s.id = d.store_id
-        WHERE d.snapshot_date = ? {where}
-        ORDER BY a.ad_start_date DESC, a.ad_id LIMIT ?""", [as_of] + params + [args.limit]).fetchall()
-    for r in rows:
-        dr = meta_ads.days_running(r["ad_start_date"], r["first_seen_date"], as_of)
-        t.add_row(r["store_domain"], r["ad_id"], r["page_name"] or "", r["ad_start_date"] or "?",
-                  "" if dr is None else str(dr), "[green]Y[/]" if r["is_active"] else "[red]N[/]",
-                  r["creative_type"] or "", (r["headline"] or "")[:40], (r["primary_text"] or "")[:70],
-                  (r["landing_url"] or "")[:60], r["fingerprint"] or "",
-                  "" if r["eu_total_reach"] is None else str(r["eu_total_reach"]),
-                  "" if r["reach_slope_7d"] is None else str(r["reach_slope_7d"]), r["engagement_type"] or "",
-                  "" if r["comments"] is None else str(r["comments"]))
-    console.print(t)
-    return 0
-
-
-def cmd_ads_coverage(args) -> int:
-    conn = db.connect(args.db)
-    as_of = _parse_date(args.date) if args.date else conn.execute("SELECT MAX(snapshot_date) FROM meta_ads_daily").fetchone()[0]
-    if not as_of:
-        console.print("[red]no ad snapshots yet[/]")
-        return 2
-    rows = ad_metrics.coverage(conn, as_of)
-    t = Table(title=f"Meta measurability per store (as of {as_of}; ignored pages excluded)",
-              caption="EU exact = exact EU/EEA reach number; UK exact = GB reach from the country breakdown; "
-                      "range = only a lower/upper bound; boosted = ad resolves to a Page/Instagram post; "
-                      "comments = boosted posts whose counts were read today; dark = no underlying post")
-    for c, j in (("store", "left"), ("ads", "right"), ("EU exact", "right"), ("UK exact", "right"), ("range only", "right"),
-                 ("no reach", "right"), ("boosted", "right"), ("comments", "right"), ("dark", "right")):
-        t.add_column(c, justify=j)
-
-    def pct(n, d):
-        return f"{n} ({n / d:.0%})" if d else "0"
-    for r in rows:
-        style = "bold" if r["store"] == "TOTAL" else ""
-        t.add_row(f"[{style}]{r['store']}[/]" if style else r["store"], str(r["ads"]),
-                  pct(r["eu_exact"], r["ads"]), pct(r["uk_exact"], r["ads"]), pct(r["range_only"], r["ads"]),
-                  pct(r["no_reach"], r["ads"]), pct(r["boosted"], r["ads"]), pct(r["with_comments"], r["boosted"]),
-                  pct(r["dark"], r["ads"]))
-    console.print(t)
-    keys = rows[-1]["keys"] if rows else {}
-    if keys:
-        console.print("[dim]reach-related keys seen in the raw payloads (ads carrying each): " +
-                      ", ".join(f"{k} x{v}" for k, v in sorted(keys.items(), key=lambda kv: -kv[1])[:12]) + "[/]")
-    ps = conn.execute("""SELECT COALESCE(d.post_status, 'not fetched') st, COUNT(*) n FROM meta_ads_daily d JOIN meta_ads a ON a.ad_id = d.ad_id
-                         WHERE d.snapshot_date = ? AND a.engagement_type = 'boosted' GROUP BY st""", (as_of,)).fetchall()
-    if ps:
-        console.print("[dim]boosted post fetch status: " + ", ".join(f"{r['st']} x{r['n']}" for r in ps) + "[/]")
-    if args.keys:
-        shape = ad_metrics.payload_shape(conn, as_of)
-        t = Table(title="fields present in the raw ad payloads (depth <= 2)", caption="null = present but empty")
-        for c in ("field", "ads", "null"):
-            t.add_column(c, justify="right" if c != "field" else "left")
-        for k, c, z in shape[:80]:
-            t.add_row(k, str(c), str(z))
-        console.print(t)
-    return 0
-
-
-def cmd_status(args) -> int:
-    conn = db.connect(args.db)
-    runs = conn.execute("SELECT * FROM runs ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
-    t = Table(title="recent runs")
-    for c in ("id", "snapshot_date", "started_at", "finished_at", "total", "ok", "failed"):
-        t.add_column(c)
-    for r in runs:
-        t.add_row(str(r["id"]), r["snapshot_date"], r["started_at"], r["finished_at"] or "-",
-                  str(r["stores_total"]), str(r["stores_ok"]), str(r["stores_failed"]))
-    console.print(t)
-
-    rows = conn.execute(
-        """SELECT s.store_domain, s.meta_page_name,
-                  COUNT(DISTINCT p.snapshot_date) AS days,
-                  MIN(p.snapshot_date) AS first_day, MAX(p.snapshot_date) AS last_day,
-                  (SELECT COUNT(*) FROM products_daily p2 WHERE p2.store_id = s.id
-                     AND p2.snapshot_date = MAX(p.snapshot_date)) AS products_last,
-                  (SELECT SUM(sold_out_variants) FROM products_daily p3 WHERE p3.store_id = s.id
-                     AND p3.snapshot_date = MAX(p.snapshot_date)) AS sold_out_last,
-                  (SELECT sr.status || COALESCE(': ' || sr.error, '') FROM store_runs sr
-                     WHERE sr.store_id = s.id ORDER BY sr.run_id DESC LIMIT 1) AS last_status
-           FROM stores s LEFT JOIN products_daily p ON p.store_id = s.id
-           GROUP BY s.id ORDER BY s.store_domain"""
-    ).fetchall()
-    t = Table(title="stores")
-    for c in ("store", "meta page", "days", "first", "last", "products", "sold-out variants", "last status"):
-        t.add_column(c)
-    for r in rows:
-        status = r["last_status"] or "-"
-        t.add_row(r["store_domain"], r["meta_page_name"] or "-", str(r["days"]), r["first_day"] or "-",
-                  r["last_day"] or "-", str(r["products_last"] or 0), str(r["sold_out_last"] or 0),
-                  f"[green]{status}[/]" if status == "ok" else f"[red]{status[:60]}[/]")
-    console.print(t)
-    return 0
-
-
-def _fmt_delta(v: int | None, signed: bool = True) -> str:
-    if v is None:
-        return "[dim]n/a[/]"
-    if v == 0:
-        return "0"
-    if signed:
-        return f"[red]+{v}[/]" if v > 0 else f"[green]{v}[/]"
-    return f"[yellow]{v}[/]"
-
-
-def cmd_report(args) -> int:
-    conn = db.connect(args.db)
-    as_of = _parse_date(args.date) if args.date else None
-    rows = deltas.all_store_deltas(conn, as_of)
-    if not rows:
-        console.print("[red]no snapshots yet[/] - run `python tracker.py run` first")
-        return 2
-    no_hist = [d for d in rows if not d.has_history]
-    t = Table(title=f"stores by change score (as of {rows[0].snapshot_date})", caption=
-              "7d columns need only today's snapshot; delta columns compare against the previous snapshot day. "
-              "n/a = insufficient history (1 day).")
-    for c, j in (("store", "left"), ("snap", "left"), ("vs", "left"), ("products", "right"), ("new 7d", "right"),
-                 ("upd 7d", "right"), ("sold-out", "right"), ("Δ sold-out", "right"), ("price Δ", "right"),
-                 ("+handles", "right"), ("-handles", "right"), ("score", "right")):
-        t.add_column(c, justify=j)
-    for d in rows[:args.top]:
-        t.add_row(d.store_domain, d.snapshot_date, d.prev_date or "[dim]1 day[/]", str(d.products),
-                  str(d.new_products_7d), str(d.updated_products_7d), str(d.sold_out_variants),
-                  _fmt_delta(d.sold_out_variants_delta), _fmt_delta(d.price_changes, signed=False),
-                  _fmt_delta(d.new_handles, signed=False), _fmt_delta(d.removed_handles, signed=False),
-                  f"[bold]{d.change_score}[/]")
-    console.print(t)
-    if no_hist:
-        console.print(f"[dim]{len(no_hist)} store(s) have a single snapshot; deltas appear after the next run.[/]")
-
-    changes = [(d, c) for d in rows for c in d.changes]
-    if changes:
-        t = Table(title=f"product changes (top {args.changes})")
-        for c in ("store", "handle", "change", "detail"):
-            t.add_column(c)
-        colour = {"new_handle": "cyan", "sold_out": "red", "price": "yellow", "restocked": "green", "removed": "dim"}
-        for d, c in changes[:args.changes]:
-            t.add_row(d.store_domain, c.handle, f"[{colour[c.kind]}]{c.kind}[/]", c.detail)
-        console.print(t)
-    elif any(d.has_history for d in rows):
-        console.print("[dim]no product-level changes vs the previous snapshot.[/]")
-    return 0
-
-
-def cmd_product(args) -> int:
-    conn = db.connect(args.db)
-    rows = deltas.product_history(conn, args.handle, args.store)
-    if not rows:
-        console.print(f"[red]no snapshots for handle[/] {args.handle}")
-        return 2
-    t = Table(title=f"{args.handle}  ({rows[0]['title'] or ''})", caption=f"published {rows[0]['published_at']}")
-    for c, j in (("date", "left"), ("store", "left"), ("variants", "right"), ("sold-out", "right"),
-                 ("min", "right"), ("max", "right"), ("coll. pos", "right"), ("updated_at", "left")):
-        t.add_column(c, justify=j)
-    prev = None
-    for r in rows:
-        so = str(r["sold_out_variants"])
-        if prev and prev["store_domain"] == r["store_domain"] and r["sold_out_variants"] != prev["sold_out_variants"]:
-            so = f"[red]{so}[/]" if r["sold_out_variants"] > prev["sold_out_variants"] else f"[green]{so}[/]"
-        price = f"{r['min_price']:.2f}" if r["min_price"] is not None else "-"
-        if prev and prev["store_domain"] == r["store_domain"] and r["min_price"] != prev["min_price"]:
-            price = f"[yellow]{price}[/]"
-        t.add_row(r["snapshot_date"], r["store_domain"], str(r["variant_count"]), so, price,
-                  f"{r['max_price']:.2f}" if r["max_price"] is not None else "-",
-                  str(r["collection_position"]) if r["collection_position"] is not None else "-",
-                  (r["updated_at"] or "")[:19])
-        prev = r
-    console.print(t)
-    return 0
+    raw = sqlite3.connect(str(path), timeout=2)
+    locked = False
+    try:
+        ver = raw.execute("PRAGMA user_version").fetchone()[0]
+        mode = raw.execute("PRAGMA journal_mode").fetchone()[0]
+        console.print(f"  journal_mode={mode}  schema stamp {'current' if ver == db.schema_stamp() else 'needs the one-time update (a write; the first command after git pull does it)'}")
+        try:
+            raw.execute("BEGIN IMMEDIATE")
+            raw.rollback()
+            console.print("[green]write lock: free[/] (no other program is writing to it right now)")
+        except sqlite3.OperationalError as e:
+            console.print(f"[red]write lock: NOT available[/] ({e}) - another program has the database open for writing")
+            locked = True
+        try:
+            n = raw.execute("SELECT COUNT(*) FROM stores").fetchone()[0]
+            console.print(f"read: ok ({n} stores)")
+        except sqlite3.OperationalError as e:
+            console.print(f"[red]read: failed ({e})[/]")
+    finally:
+        raw.close()
+    if os.name == "nt":
+        import subprocess
+        try:
+            me = os.getpid()
+            out = subprocess.run(["powershell", "-NoProfile", "-Command",
+                                  "Get-CimInstance Win32_Process -Filter \"name='python.exe' or name='pythonw.exe' or name='py.exe' or "
+                                  "name='OneDrive.exe' or name='DB Browser for SQLite.exe' or name='sqlitebrowser.exe' or name='wsl.exe'\" "
+                                  f"| Where-Object {{ $_.ProcessId -ne {me} }} "
+                                  "| Select-Object ProcessId, @{n='started';e={$_.CreationDate.ToString('HH:mm:ss')}}, CommandLine "
+                                  "| Format-Table -AutoSize -Wrap | Out-String -Width 200"],
+                                 capture_output=True, text=True, timeout=20).stdout.strip()
+            console.print("other processes that could hold it (python / OneDrive / SQLite viewers / WSL):" + ("\n" + out if out else " none running"))
+            if "OneDrive.exe" in out and "desktop" in str(path.resolve()).lower():
+                console.print("[yellow]OneDrive is running and the project sits on the Desktop, which OneDrive often syncs: it can hold tracker.db "
+                              "while uploading. Move the project out of synced folders (e.g. C:\\tracker) or exclude the folder in OneDrive.[/]")
+            if "wsl.exe" in out:
+                console.print("[yellow]WSL is running: a python started inside WSL is invisible to Get-Process but still locks the file. "
+                              "`wsl --shutdown` releases it.[/]")
+        except Exception as e:  # noqa: BLE001
+            console.print(f"(could not list processes: {e})")
+    if locked:
+        console.print("close any program that has the database open (a SQLite viewer, a VS Code SQLite tab), stop leftover python "
+                      "processes (Stop-Process -Id <id>), then run db-check again.")
+    return 1 if locked else 0
 
 
 # ---------------------------------------------------------------- parser
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="tracker.py", description="Shopify early-scaling tracker")
+    p = argparse.ArgumentParser(prog="tracker.py", description="Shopify early-scaling tracker: which landing URLs are gaining delivering ads")
     p.add_argument("--db", help=f"SQLite path (default {config.DB_PATH})")
     p.add_argument("-v", "--verbose", action="store_true")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("init-db", help="create data/tracker.db and tables")
     s.set_defaults(fn=cmd_init_db)
+
+    s = sub.add_parser("run", help="catalogue snapshot of every watchlist store (products.json: id, handle, title, dates) + shop id")
+    s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today); re-running a date replaces it")
+    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
+    s.add_argument("--no-sync", action="store_true", help="skip the Google Sheets sync even if SHEETS_WEBHOOK_URL is set")
+    s.add_argument("--ads", action="store_true", help="also scrape the Meta Ad Library (same as META_ADS=1 in .env)")
+    s.add_argument("--no-ads", action="store_true", help="skip the Meta pass even if META_ADS=1")
+    s.set_defaults(fn=cmd_run)
+
+    s = sub.add_parser("ads", help="Meta Ad Library pass: every ad of each store (page, landing URL, start date, low-impression badge)")
+    s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today)")
+    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
+    s.add_argument("--headed", action="store_true", help="show the browser window (debugging)")
+    s.add_argument("--max-scrolls", type=int, help=f"scroll cap per page (default {config.META_MAX_SCROLLS})")
+    s.add_argument("--max-minutes", type=float, help=f"wall-clock budget for this pass (default META_MAX_MINUTES={config.META_MAX_MINUTES:.0f})")
+    s.set_defaults(fn=cmd_ads)
+
+    s = sub.add_parser("rebuild", help="recompute the per-URL daily numbers (delivering, wow, pages, families) from the stored ads; no scraping")
+    s.set_defaults(fn=cmd_rebuild)
+
+    s = sub.add_parser("radar", help="store discovery: hook + copycat sweeps (Sundays, or --sweep), then triage new landing domains")
+    s.add_argument("--date"); s.add_argument("--watchlist")
+    s.add_argument("--sweep", action="store_true", help="run the weekly sweeps now")
+    s.add_argument("--no-sweep", action="store_true", help="triage only, even on a Sunday")
+    s.add_argument("--max-minutes", type=float, help=f"budget for this run (default RADAR_MAX_MINUTES={config.RADAR_MAX_MINUTES:.0f})")
+    s.add_argument("--headed", action="store_true")
+    s.add_argument("--limit", type=int, default=40)
+    s.set_defaults(fn=cmd_radar)
+
+    s = sub.add_parser("radar-add", help="add domains/URLs straight to the watchlist (source=manual), no triage")
+    s.add_argument("items", nargs="+"); s.add_argument("--watchlist")
+    s.set_defaults(fn=cmd_radar_add)
+
+    s = sub.add_parser("radar-report", help="radar totals, hook yield, recent runs, the Candidates table")
+    s.add_argument("--limit", type=int, default=40)
+    s.set_defaults(fn=cmd_radar_report)
+
+    s = sub.add_parser("sync-sheets", help="rewrite the Winners, Stores and Candidates tabs from the database, then verify the row counts")
+    s.add_argument("--date", help="as of this date (default: latest)")
+    s.add_argument("--tabs", help="comma list from winners,stores,candidates (default all)")
+    s.add_argument("--dry-run", action="store_true", help="build and size the chunks but send nothing")
+    s.add_argument("--watchlist", help="alternate watchlist.csv (only its stores are synced)")
+    s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")
+    s.add_argument("--no-verify", action="store_true", help="skip the read-back comparison after syncing")
+    s.set_defaults(fn=cmd_sync_sheets)
+
+    s = sub.add_parser("report", help="the Winners tab in the terminal")
+    s.add_argument("--date", help="as of this date (default: latest)")
+    s.add_argument("--store", help="one store domain")
+    s.add_argument("--top", type=int, default=60)
+    s.set_defaults(fn=cmd_report)
+
+    s = sub.add_parser("url", help="time series for one landing URL and the ads behind it")
+    s.add_argument("url")
+    s.add_argument("--limit", type=int, default=40, help="max ad rows")
+    s.set_defaults(fn=cmd_url)
+
+    s = sub.add_parser("status", help="what is in the database, per store")
+    s.add_argument("--limit", type=int, default=10)
+    s.set_defaults(fn=cmd_status)
+
+    s = sub.add_parser("diag", help="write the diagnostics report to the Google Doc 'EarlyScale Diag' (and logs/diag.txt); read-only")
+    s.add_argument("--no-push", action="store_true", help="write logs/diag.txt only")
+    s.add_argument("--print", action="store_true")
+    s.add_argument("--note", action="append", help="a line to include at the top (e.g. what just ran)")
+    s.set_defaults(fn=cmd_diag)
+
+    s = sub.add_parser("db-check", help="is data/tracker.db free to write? lists its files and the programs that could be holding it")
+    s.set_defaults(fn=cmd_db_check)
 
     s = sub.add_parser("add-store", help="add a store to watchlist.csv (tries to discover its Facebook page)")
     s.add_argument("domain")
@@ -2064,167 +901,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--watchlist", help="alternate watchlist.csv path")
     s.set_defaults(fn=cmd_add_store)
 
-    s = sub.add_parser("run", help="one full pass over the watchlist (step 1: products.json snapshot)")
-    s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today); re-running a date replaces it")
+    s = sub.add_parser("remove-store", help="remove one or more domains from watchlist.csv")
+    s.add_argument("domains", nargs="+")
     s.add_argument("--watchlist", help="alternate watchlist.csv path")
-    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
-    s.add_argument("--no-sync", action="store_true", help="skip the Google Sheets sync even if SHEETS_WEBHOOK_URL is set")
-    s.add_argument("--ads", action="store_true", help="also scrape the Meta Ad Library (same as META_ADS=1 in .env)")
-    s.add_argument("--no-ads", action="store_true", help="skip the Meta pass even if META_ADS=1")
-    s.add_argument("--inventory", action="store_true", help="probe stock on every store (same as INVENTORY=1; default: INVENTORY_STORES only)")
-    s.add_argument("--no-inventory", action="store_true", help="skip the stock probe even if INVENTORY_STORES is set")
-    s.set_defaults(fn=cmd_run)
-
-    s = sub.add_parser("inventory", help="probe hero-variant stock via /cart/add.js (fallback: theme inventory_quantity) and compute units sold")
-    s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today)")
-    s.add_argument("--watchlist", help="alternate watchlist.csv path")
-    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="probe these store domains (overrides INVENTORY_STORES)")
-    s.add_argument("--all", action="store_true", help="probe every watchlist store")
-    s.set_defaults(fn=cmd_inventory)
-
-    s = sub.add_parser("inventory-probe", help="one live /cart/add.js probe with status, headers and body printed (diagnostics)")
-    s.add_argument("store", help="store domain")
-    s.add_argument("--variant", type=int, help="variant id (default: first hero variant of the store)")
-    s.add_argument("--handle", help="product handle for the Referer / product page")
-    s.set_defaults(fn=cmd_inventory_probe)
-
-    s = sub.add_parser("inventory-report", help="raw stock_level readings per hero variant and per-store fallback-rung counts")
-    s.add_argument("--date", help="as of this snapshot date (default: latest)")
-    s.add_argument("--store", help="one store domain")
-    s.add_argument("--days", type=int, default=14, help="how many daily columns to show")
-    s.add_argument("--limit", type=int, default=200, help="max variant rows")
-    s.add_argument("--all", action="store_true", help="include hero variants with no reading yet")
-    s.add_argument("--raw", action="store_true", help="also print the raw probe messages")
-    s.set_defaults(fn=cmd_inventory_report)
-
-    s = sub.add_parser("ads", help="scrape the Meta Ad Library for watchlist stores (Part B)")
-    s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today)")
-    s.add_argument("--watchlist", help="alternate watchlist.csv path")
-    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
-    s.add_argument("--headed", action="store_true", help="show the browser window (debugging)")
-    s.add_argument("--max-scrolls", type=int, help=f"scroll cap per page (default {config.META_MAX_SCROLLS})")
-    s.add_argument("--max-minutes", type=float, help=f"wall-clock budget for this pass (default META_MAX_MINUTES={config.META_MAX_MINUTES:.0f})")
-    s.add_argument("--no-detail", action="store_true", help="skip the single-ad page pass")
-    s.add_argument("--detail-max", type=int, help=f"single-ad pages per store (default {config.META_DETAIL_MAX})")
-    s.set_defaults(fn=cmd_ads)
-
-    s = sub.add_parser("ads-detail", help="single-ad Ad Library pages: end_date (delivery), page likes, creative fingerprints")
-    s.add_argument("--date", help="snapshot date (default today)")
-    s.add_argument("--watchlist")
-    s.add_argument("--only", nargs="+", metavar="DOMAIN")
-    s.add_argument("--ads", nargs="+", metavar="AD_ID", help="fetch just these ad ids and print what was parsed")
-    s.add_argument("--max", type=int, help=f"pages per store (default {config.META_DETAIL_MAX})")
-    s.add_argument("--headed", action="store_true")
-    s.set_defaults(fn=cmd_ads_detail)
-
-    s = sub.add_parser("ads-detail-report", help="end_date and page_like_count per day for flagged ads; page likes; coverage")
-    s.add_argument("--date", help="as of this date (default latest)")
-    s.add_argument("--store", help="one store domain")
-    s.add_argument("--ads", nargs="+", metavar="AD_ID")
-    s.add_argument("--days", type=int, default=7)
-    s.add_argument("--limit", type=int, default=60)
-    s.set_defaults(fn=cmd_ads_detail_report)
-
-    s = sub.add_parser("fb-capture", help="record a Sponsored post you saw yourself (URL, bookmarklet JSON via --paste, or a file)")
-    s.add_argument("url", nargs="?", help="post permalink")
-    s.add_argument("--paste", action="store_true", help="read the bookmarklet's JSON from the clipboard")
-    s.add_argument("--file", help="file with JSON / JSON lines / one URL per line")
-    s.add_argument("--page", help="page name")
-    s.add_argument("--text", help="primary text (for matching to the Ad Library ad)")
-    s.add_argument("--landing", help="landing URL")
-    s.add_argument("--reactions"); s.add_argument("--comments"); s.add_argument("--shares")
-    s.add_argument("--store", help="store domain this post advertises")
-    s.add_argument("--date", help="snapshot date for the counts (default today)")
-    s.set_defaults(fn=cmd_fb_capture)
-
-    s = sub.add_parser("fb-engagement", help="logged-out re-fetch of every captured post's public counts; deltas; join to ads")
-    s.add_argument("--date", help="snapshot date (default today)")
-    s.add_argument("--max", type=int, help=f"posts per run (default {config.FB_POSTS_MAX})")
-    s.add_argument("--headed", action="store_true")
-    s.add_argument("--limit", type=int, default=60)
-    s.set_defaults(fn=cmd_fb_engagement)
-
-    s = sub.add_parser("fb-listen", help="receive captures from the browser observer extension (tools/fb_observer) on 127.0.0.1:8765")
-    s.add_argument("--port", type=int, default=8765)
-    s.set_defaults(fn=cmd_fb_listen)
-
-    s = sub.add_parser("fb-bait", help="open watchlist stores' hero product pages in your browser so you can add to cart by hand (seeds retargeting)")
-    s.add_argument("--watchlist"); s.add_argument("--only", nargs="+", metavar="DOMAIN")
-    s.add_argument("--per-store", type=int, default=1, help="product pages per store (default 1)")
-    s.add_argument("--print-only", action="store_true", help="list the URLs instead of opening them")
-    s.set_defaults(fn=cmd_fb_bait)
-
-    s = sub.add_parser("fb-report", help="captured posts, matches and count history")
-    s.add_argument("--date"); s.add_argument("--limit", type=int, default=60)
-    s.set_defaults(fn=cmd_fb_report)
-
-    s = sub.add_parser("rank-check", help="confirm the impressions sort is informative for a few stores (records ranks + sort_informative)")
-    s.add_argument("--only", nargs="+", metavar="DOMAIN")
-    s.add_argument("--limit", type=int, default=5)
-    s.add_argument("--scrolls", type=int, default=None)
-    s.add_argument("--date"); s.add_argument("--watchlist"); s.add_argument("--headed", action="store_true")
-    s.set_defaults(fn=cmd_rank_check)
-
-    s = sub.add_parser("ads-fields", help="which keys the stored ad payloads carry that match --grep (find what Meta calls a badge)")
-    s.add_argument("--grep", default="impression")
-    s.add_argument("--store")
-    s.add_argument("--limit", type=int, default=400, help="most recently seen ads to scan")
-    s.set_defaults(fn=cmd_ads_fields)
-
-    s = sub.add_parser("delivering-report", help="before/after: active ads vs ads delivering (no low-impression badge) per product")
-    s.add_argument("--handle", action="append", help="product handle (substring); repeatable")
-    s.add_argument("--store")
-    s.add_argument("--date")
-    s.add_argument("--limit", type=int, default=20)
-    s.set_defaults(fn=cmd_delivering_report)
-
-    s = sub.add_parser("landing", help="which product does a landing page sell? shows the evidence; --apply re-resolves the ads landing there; "
-                                       "--refresh-all re-fetches every cached lander and re-resolves every store's ads")
-    s.add_argument("url", nargs="?")
-    s.add_argument("--apply", action="store_true", help="re-resolve the store's ads that land on this URL and write the result")
-    s.add_argument("--refresh-all", action="store_true", help="every watchlist store: re-fetch its cached landing pages under the current rules and re-resolve its ads")
-    s.add_argument("--only", nargs="+", metavar="DOMAIN", help="with --refresh-all: limit to these stores")
-    s.add_argument("--force", action="store_true", help="with --refresh-all: re-fetch pages already fetched today (an interrupted run resumes without it)")
-    s.add_argument("--watchlist")
-    s.set_defaults(fn=cmd_landing)
-
-    s = sub.add_parser("ads-report", help="per-page status, products by ads, concepts, lineage, alerts (--raw for ad rows)")
-    s.add_argument("--date", help="snapshot date (default: latest)")
-    s.add_argument("--store", help="one store domain")
-    s.add_argument("--limit", type=int, default=40)
-    s.add_argument("--raw", action="store_true", help="also print the per-ad rows")
-    s.set_defaults(fn=cmd_ads_report)
-
-    s = sub.add_parser("ads-metrics", help="recompute landing join / concepts / lineage / alerts from stored ads")
-    s.add_argument("--date", help="snapshot date (default: latest)")
-    s.add_argument("--only", nargs="+", metavar="DOMAIN")
-    s.add_argument("--no-fetch", action="store_true", help="do not fetch advertorial landing pages")
-    s.add_argument("--posts", action="store_true", help="also open boosted posts in a browser to read comment counts")
-    s.set_defaults(fn=cmd_ads_metrics)
-
-    s = sub.add_parser("ads-coverage", help="how measurable the scraped ads are: EU/UK reach, boosted vs dark, per store")
-    s.add_argument("--date", help="snapshot date (default: latest)")
-    s.add_argument("--keys", action="store_true", help="also list which fields the raw payloads contain")
-    s.set_defaults(fn=cmd_ads_coverage)
-
-    s = sub.add_parser("sync-sheets", help="push latest snapshot + deltas to Google Sheets via Apps Script")
-    s.add_argument("--date", help="sync the snapshot as of this date (default: latest)")
-    s.add_argument("--tabs", help="comma list from signals,families,categories,stores,pages,candidates,products,alerts (default all)")
-    s.add_argument("--dry-run", action="store_true", help="build and size the chunks but send nothing")
-    s.add_argument("--watchlist", help="alternate watchlist.csv (only its stores are synced)")
-    s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")
-    s.add_argument("--no-verify", action="store_true", help="skip the read-back comparison after syncing")
-    s.set_defaults(fn=cmd_sync_sheets)
-
-    s = sub.add_parser("diag", help="write the diagnostics report to the Google Doc 'EarlyScale Diag' (and logs/diag.txt); read-only")
-    s.add_argument("--no-push", action="store_true", help="write logs/diag.txt only")
-    s.add_argument("--print", action="store_true")
-    s.add_argument("--note", action="append", help="a line to include at the top (e.g. what just ran)")
-    s.set_defaults(fn=cmd_diag)
-
-    s = sub.add_parser("db-check", help="is data/tracker.db free to write? lists its files and the programs that could be holding it")
-    s.add_argument("--db")
-    s.set_defaults(fn=cmd_db_check)
+    s.set_defaults(fn=cmd_remove_store)
 
     s = sub.add_parser("prune-dead", help="list (and with --apply remove) watchlist domains that never returned a catalogue or an ad")
     s.add_argument("--apply", action="store_true", help="remove them from watchlist.csv (history in the DB is kept)")
@@ -2253,43 +933,6 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--page-id")
     s.add_argument("--watchlist")
     s.set_defaults(fn=cmd_set_page)
-
-    s = sub.add_parser("remove-store", help="remove one or more domains from watchlist.csv")
-    s.add_argument("domains", nargs="+")
-    s.add_argument("--watchlist", help="alternate watchlist.csv path")
-    s.set_defaults(fn=cmd_remove_store)
-
-    s = sub.add_parser("radar", help="store discovery: hook + copycat sweeps (Sundays, or --sweep), then triage new landing domains")
-    s.add_argument("--date"); s.add_argument("--watchlist")
-    s.add_argument("--sweep", action="store_true", help="run the weekly sweeps now")
-    s.add_argument("--no-sweep", action="store_true", help="triage only, even on a Sunday")
-    s.add_argument("--max-minutes", type=float, help=f"budget for this run (default RADAR_MAX_MINUTES={config.RADAR_MAX_MINUTES:.0f})")
-    s.add_argument("--headed", action="store_true")
-    s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(fn=cmd_radar)
-
-    s = sub.add_parser("radar-add", help="add domains/URLs straight to the watchlist (source=manual), no triage")
-    s.add_argument("items", nargs="+"); s.add_argument("--watchlist")
-    s.set_defaults(fn=cmd_radar_add)
-
-    s = sub.add_parser("radar-report", help="radar totals, recent runs, the Candidates table")
-    s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(fn=cmd_radar_report)
-
-    s = sub.add_parser("report", help="stores sorted by how much changed, with product-level changes")
-    s.add_argument("--date", help="report as of this snapshot date (default: latest)")
-    s.add_argument("--top", type=int, default=50, help="max stores to show")
-    s.add_argument("--changes", type=int, default=40, help="max product changes to show")
-    s.set_defaults(fn=cmd_report)
-
-    s = sub.add_parser("product", help="time series for one product handle")
-    s.add_argument("handle")
-    s.add_argument("--store", help="restrict to one store domain")
-    s.set_defaults(fn=cmd_product)
-
-    s = sub.add_parser("status", help="what is in the database")
-    s.add_argument("--limit", type=int, default=10)
-    s.set_defaults(fn=cmd_status)
     return p
 
 
@@ -2300,7 +943,6 @@ def main(argv: list[str] | None = None) -> int:
         return args.fn(args)
     except KeyboardInterrupt:
         console.print("\n[yellow]interrupted[/] - everything recorded so far is in the database; the next run continues from there")
-        import os
         sys.stdout.flush()
         sys.stderr.flush()
         os._exit(130)      # skip interpreter shutdown: worker threads mid-request and Playwright's loop would otherwise hang or spew

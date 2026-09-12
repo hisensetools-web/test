@@ -1,12 +1,12 @@
 """Catalogue adapters for non-Shopify platforms: parsers, detection, each adapter against a mock store, dates,
-the daily pass end to end, the landing join and Radar on a WooCommerce store."""
+the daily pass end to end and Radar on a WooCommerce store."""
 import json
 import threading
 import unittest
 from http.server import HTTPServer
 from unittest import mock
 
-from earlyscale import ad_metrics, config, db, inventory, platforms, radar, sheets, shopify
+from earlyscale import config, db, platforms, radar, sheets, shopify
 from earlyscale.cli import run_products_pass
 from tests import mock_platforms
 
@@ -84,7 +84,6 @@ class DetectAndAdapterTests(unittest.TestCase):
         self.assertEqual((p["url_path"], p["min_price"], p["variant_count"], p["sold_out_variants"]), ("/product/tart-cherry-sleep-gummies", 34.0, 1, 0))
         self.assertEqual(p["created_at"][:10], "2026-08-27")                         # wp/v2 date_gmt
         self.assertEqual(by["wormwood-tincture"]["sold_out_variants"], 1)
-        self.assertEqual([p["collection_position"] for p in cat.products], [0, 1, 2])   # popularity order
 
     def test_squarespace_with_stock(self):
         info, cat, _ = self._run("squarespace")
@@ -143,7 +142,7 @@ class DetectAndAdapterTests(unittest.TestCase):
             self.assertEqual((info["platform"], info["myshopify"]), ("shopify_headless", "fakebrand.myshopify.com"))
             fake_raw = [{"id": 1, "handle": "glow", "title": "Glow", "created_at": "2026-08-01T00:00:00Z", "published_at": "2026-08-01T00:00:00Z",
                          "updated_at": "2026-09-01T00:00:00Z", "variants": [{"id": 11, "title": "d", "price": "20.00", "available": True}]}]
-            with mock.patch.object(shopify, "fetch_store", lambda dom, s: (fake_raw, {1: 0}, 1)) as _:
+            with mock.patch.object(shopify, "fetch_store", lambda dom, s: (fake_raw, 1)) as _:
                 cat = platforms.fetch_catalogue(base, session, platform_hint=info, today=TODAY)
             self.assertEqual((cat.platform, cat.products[0]["handle"], cat.extra["myshopify"]), ("shopify_headless", "glow", "fakebrand.myshopify.com"))
         finally:
@@ -169,7 +168,7 @@ class FillDatesTests(unittest.TestCase):
 
 
 class DailyPassTests(unittest.TestCase):
-    def test_run_products_pass_over_three_platforms_and_signals(self):
+    def test_run_products_pass_over_three_platforms(self):
         servers = [serve(p) for p in ("woocommerce", "squarespace", "generic")]
         try:
             conn = db.connect(":memory:")
@@ -179,43 +178,18 @@ class DailyPassTests(unittest.TestCase):
             self.assertEqual((ok, failed), (3, 0))
             plats = {r[0]: r[1] for r in conn.execute("SELECT store_domain, platform FROM stores")}
             self.assertEqual(sorted(plats.values()), ["generic", "squarespace", "woocommerce"])
-            # the Squarespace stock count became an inventory reading for its hero variants, no probe needed
-            src = {r[0] for r in conn.execute("SELECT signal_source FROM inventory_daily")}
-            self.assertEqual(src, {"platform_json"})
-            with mock.patch.object(sheets, "watched_store_ids", lambda c: None):
-                rows = sheets.signals_rows(conn)
-                srows = sheets.stores_rows(conn)
-            self.assertEqual(len(rows), 9)
-            H = sheets.SIGNALS_HEADERS
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM products_daily WHERE snapshot_date = ?", (TODAY,)).fetchone()[0], 9)
             generic_base = servers[2][1]
-            gen = [r for r in rows if r[0] == generic_base]
-            self.assertEqual(len(gen), 3)
-            self.assertTrue(all(r[H.index("days_since_created")] == "" for r in gen))    # no dates on the platform, first snapshot: unknown age, not "0 days"
-            woo = [r for r in rows if r[0] == servers[0][1]]
-            self.assertEqual(sorted(r[H.index("days_since_created")] for r in woo), [12, 40, 200])   # WooCommerce dates come through
-            SH = sheets.STORES_HEADERS
-            self.assertEqual(sorted(r[SH.index("platform")] for r in srows), ["generic", "squarespace", "woocommerce"])
+            gen = conn.execute("SELECT created_at FROM products_daily p JOIN stores s ON s.id = p.store_id WHERE s.store_domain = ?", (generic_base,)).fetchall()
+            self.assertTrue(all(r[0] is None for r in gen))          # no dates on the platform, first snapshot: unknown age, not "today"
+            woo = conn.execute("SELECT created_at FROM products_daily p JOIN stores s ON s.id = p.store_id WHERE s.store_domain = ?", (servers[0][1],)).fetchall()
+            self.assertTrue(all(r[0] for r in woo))                   # WooCommerce dates come through
+            with mock.patch.object(sheets, "watched_store_ids", lambda c: None):
+                srows = sheets.stores_rows(conn)
+            self.assertEqual(sorted(r[sheets.STORES_HEADERS.index("products")] for r in srows), [3, 3, 3])
         finally:
             for srv, _ in servers:
                 srv.shutdown()
-
-    def test_landing_join_on_a_woocommerce_store(self):
-        srv, base = serve("woocommerce")
-        try:
-            conn = db.connect(":memory:")
-            sid = db.upsert_store(conn, base)
-            run_products_pass(conn, [{"store_domain": base}], TODAY)
-            known, v2h = ad_metrics._known_handles(conn, sid, TODAY)
-            self.assertIn("tart-cherry-sleep-gummies", known)
-            host = base.split("//")[1]
-            ad = {"landing_url": f"{base}/product/tart-cherry-sleep-gummies/?utm=1", "landing_domain": host}
-            r = ad_metrics.resolve_landing(conn, sid, base, ad, known, v2h, None, {}, TODAY)
-            self.assertEqual((r["product_handle"], r["resolved_via"]), ("tart-cherry-sleep-gummies", "url"))
-            ad2 = {"landing_url": f"{base}/wormwood-tincture.html", "landing_domain": host}     # bare path (Magento style)
-            r2 = ad_metrics.resolve_landing(conn, sid, base, ad2, known, v2h, None, {}, TODAY)
-            self.assertEqual(r2["product_handle"], "wormwood-tincture")
-        finally:
-            srv.shutdown()
 
 
 class RadarPlatformTests(unittest.TestCase):

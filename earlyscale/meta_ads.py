@@ -1,21 +1,16 @@
-"""Part B, increment 1: Meta Ad Library scrape -> SQLite (meta_ads, meta_ads_daily).
+"""Meta Ad Library scrape -> SQLite (ads, ads_daily).
 
-Strategy: drive the public Ad Library page with headless Chromium and capture the
-GraphQL responses it loads while scrolling. Those responses carry structured ad
-records (ad_archive_id, page, start_date, is_active, snapshot text/links/creatives,
-EU reach), which is far more robust than scraping the obfuscated DOM. Layers:
+Strategy: drive the public Ad Library page with headless Chromium and capture the GraphQL responses it loads
+while scrolling. Those carry structured ad records (ad_archive_id, page, start_date, is_active, landing link).
+The 'Low impression count' badge is not in the payload: it is read from the rendered result cards. Layers:
 
   extract_ads(obj)           pure: find ad records anywhere in a JSON payload
-  normalise_ad(node)         pure: flatten one record into our columns
-  scrape_page(...)           Playwright: open the search, scroll, collect, detect blocks
-  record_scrape(...)         SQLite: upsert ads, write today's rows, mark disappearances
-
-Engagement (reactions/comments/shares) is NOT exposed by the Ad Library; the columns
-exist and stay NULL unless a payload happens to include such counts.
+  normalise_ad(node)         pure: flatten one record into the columns we keep
+  scrape_page(...)           Playwright: open the search, scroll, collect, read the badges, detect blocks
+  record_scrape(...)         SQLite: upsert ads, write today's rows, mark disappearances, derive url_daily
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import random
@@ -24,7 +19,7 @@ import sqlite3
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timezone
-from urllib.parse import quote, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 from . import config
 
@@ -62,24 +57,22 @@ def store_query(store: dict) -> str:
         if name and domain not in _short_name_warned:
             _short_name_warned.add(domain)
             log.warning("%s: meta_page_name %r is too short to be a page name; searching the domain instead "
-                        "(fix it with `python tracker.py set-page %s \"<page name>\"`)", domain, name, domain)
+                        "(fix it with `python tracker.py set-page %s --name \"<page name>\"`)", domain, name, domain)
         return domain
     return name
 
 
 def build_search_url(query: str | None = None, page_id: str | None = None, active_only: bool = True,
-                     country: str = "ALL", search_type: str | None = None, sort: str | None = None) -> str:
-    """sort='impressions' asks for "Impressions: high to low" (sort_data[mode]=total_impressions); default is newest first."""
+                     country: str = "ALL", search_type: str | None = None) -> str:
     status = "active" if active_only else "all"
     base = f"{config.META_AD_LIBRARY_BASE}?active_status={status}&ad_type=all&country={quote(country)}&media_type=all"
-    tail = "&sort_data[direction]=desc&sort_data[mode]=total_impressions" if sort == "impressions" else ""
     if page_id:
-        return f"{base}&view_all_page_id={quote(str(page_id))}&search_type=page{tail}"
+        return f"{base}&view_all_page_id={quote(str(page_id))}&search_type=page"
     if not query:
         raise ValueError("query or page_id required")
     if search_type is None:
         search_type = "keyword_unordered" if ("." in query and " " not in query) else "page"
-    return f"{base}&q={quote(query)}&search_type={search_type}{tail}"
+    return f"{base}&q={quote(query)}&search_type={search_type}"
 
 
 def _walk(obj, seen: list):
@@ -109,9 +102,8 @@ def extract_ads(payload) -> list[dict]:
 
 
 def parse_json_lines(text: str) -> list:
-    """Facebook GraphQL bodies are often several JSON documents back to back (deferred
-    payloads), sometimes prefixed with the `for (;;);` anti-hijack guard. Decode every
-    document we can find, whatever the whitespace between them."""
+    """Facebook GraphQL bodies are often several JSON documents back to back (deferred payloads), sometimes
+    prefixed with the `for (;;);` anti-hijack guard. Decode every document we can find."""
     docs = []
     text = text.lstrip()
     if text.startswith("for (;;);"):
@@ -125,7 +117,7 @@ def parse_json_lines(text: str) -> list:
         try:
             doc, end = dec.raw_decode(text, j)
         except ValueError:
-            i = j + 1          # not a document here; skip ahead
+            i = j + 1
             continue
         docs.append(doc)
         i = end
@@ -160,201 +152,13 @@ def _first(*vals):
     return None
 
 
-def _strip_query(url: str | None) -> str:
-    if not url:
-        return ""
-    u = urlparse(url)
-    return f"{u.scheme}://{u.netloc}{u.path}"
-
-
-REACH_KEY_RE = re.compile(r"reach", re.I)
-POST_URL_RE = re.compile(
-    r"https?://(?:www\.|m\.|web\.)?(?:facebook|instagram)\.com[^\s\"'<>]*?"
-    r"(?:/posts/|/videos/|/reel/|/reels/|/photos/|permalink\.php\?story_fbid=|story\.php\?story_fbid=|/p/)[^\s\"'<>]*",
-    re.I)
-POST_ID_KEYS = ("post_id", "story_id", "boosted_post_id", "root_post_id", "source_post_id")
-
-
-def _walk_items(obj, path=""):
-    """Yield (path, key, value) for every dict entry in a nested structure."""
-    if isinstance(obj, dict):
-        for k, v in obj.items():
-            yield path, k, v
-            yield from _walk_items(v, f"{path}.{k}" if path else k)
-    elif isinstance(obj, list):
-        for i, v in enumerate(obj):
-            yield from _walk_items(v, f"{path}[{i}]")
-
-
-def extract_reach(node: dict) -> dict:
-    """EU exact reach, UK exact reach, and any reach *range*, wherever the Ad Library puts them.
-
-    Known: aaa_info.eu_total_reach (int) and aaa_info.age_country_gender_reach_breakdown
-    (per-country rows; GB summed gives an exact UK figure when present). Anything else with
-    "reach" in its key is recorded too: ints as exact, {lower_bound, upper_bound} as a range.
-    `keys` lists what was found so the coverage report can show it."""
-    out = {"eu_reach": None, "uk_reach": None, "range_lower": None, "range_upper": None, "source": None, "keys": []}
-    for path, k, v in _walk_items(node):
-        if not REACH_KEY_RE.search(k):
-            continue
-        full = f"{path}.{k}" if path else k
-        kl = k.lower()
-        if isinstance(v, bool):
-            continue
-        if v is None:
-            out["keys"].append(f"{full}=null")
-            continue
-        if isinstance(v, (int, float)):
-            out["keys"].append(f"{full}={int(v)}")
-            if kl == "eu_total_reach" and out["eu_reach"] is None:
-                out["eu_reach"] = int(v)
-            elif ("uk" in kl or "gb" in kl) and out["uk_reach"] is None:
-                out["uk_reach"] = int(v)
-        elif isinstance(v, dict) and ("lower_bound" in v or "upper_bound" in v):
-            lo, hi = v.get("lower_bound"), v.get("upper_bound")
-            out["keys"].append(f"{full}=[{lo}..{hi}]")
-            if out["range_lower"] is None and (lo is not None or hi is not None):
-                try:
-                    out["range_lower"] = int(lo) if lo is not None else None
-                    out["range_upper"] = int(hi) if hi is not None else None
-                    out["source"] = full
-                except (TypeError, ValueError):
-                    pass
-        elif isinstance(v, list) and kl == "age_country_gender_reach_breakdown":
-            gb = 0
-            found = False
-            for row in v:
-                if isinstance(row, dict) and str(row.get("country", "")).upper() in ("GB", "UK"):
-                    found = True
-                    for ag in row.get("age_gender_breakdowns") or []:
-                        for g in ("male", "female", "unknown"):
-                            val = ag.get(g)
-                            if isinstance(val, (int, float)):
-                                gb += int(val)
-            out["keys"].append(f"{full}:{len(v)} countries" + (f" GB={gb}" if found else ""))
-            if found and out["uk_reach"] is None:
-                out["uk_reach"] = gb
-    if out["eu_reach"] is not None:
-        out["source"] = "eu_total_reach" if out["source"] is None else out["source"]
-    elif out["uk_reach"] is not None and out["source"] is None:
-        out["source"] = "uk"
-    out["keys"] = ",".join(out["keys"])[:400] or None
-    return out
-
-
-def extract_post_url(node: dict) -> str | None:
-    """Underlying Page/Instagram post for a boosted-post ad, if the payload exposes one."""
-    snap = node.get("snapshot") or {}
-    for key in POST_ID_KEYS:
-        v = node.get(key) or snap.get(key)
-        if v and str(v).isdigit():
-            page_id = node.get("page_id") or snap.get("page_id")
-            return f"https://www.facebook.com/{page_id}/posts/{v}" if page_id else f"https://www.facebook.com/{v}"
-    rs = snap.get("root_reshared_post")
-    if isinstance(rs, dict):
-        for key in ("url", "permalink", "permalink_url", "link_url"):
-            if rs.get(key):
-                return str(rs[key])
-        if rs.get("id") and str(rs["id"]).isdigit():
-            return f"https://www.facebook.com/{rs['id']}"
-    for _, k, v in _walk_items(node):
-        if isinstance(v, str) and ("facebook.com" in v or "instagram.com" in v):
-            m = POST_URL_RE.search(v)
-            if m and "ads/library" not in m.group(0):
-                return m.group(0)
-    return None
-
-
-LOW_IMPR_KEY_RE = re.compile(r"low[_\-]?impression", re.I)
-LOW_IMPR_TEXT_RE = re.compile(r"low[ _\-]?impression", re.I)
-
-
-def extract_low_impressions(node: dict, max_depth: int = 6) -> tuple[int | None, str | None]:
-    """The 'Low impression count' badge from an ad's payload: (1 / 0 / None unknown, the key path it came from).
-
-    Meta does not document the field, so this looks for any key containing 'low_impression' (boolean or
-    label) anywhere in the record, then for any string label containing 'low impression'. A record that has
-    neither yields None (unknown), which the metrics treat as delivering. `ads-fields --grep impression` lists
-    the keys a store's payloads actually carry so the match can be confirmed."""
-    found: list[tuple[str, object]] = []
-
-    def walk(o, path, depth):
-        if depth > max_depth:
-            return
-        if isinstance(o, dict):
-            for k, v in o.items():
-                kp = f"{path}.{k}" if path else str(k)
-                if LOW_IMPR_KEY_RE.search(str(k)):
-                    found.append((kp, v))
-                elif isinstance(v, str) and LOW_IMPR_TEXT_RE.search(v) and len(v) < 120:
-                    found.append((kp, v))
-                elif isinstance(v, (dict, list)):
-                    walk(v, kp, depth + 1)
-        elif isinstance(o, list):
-            for i, v in enumerate(o[:50]):
-                walk(v, f"{path}[{i}]", depth + 1)
-    walk(node, "", 0)
-    for kp, v in found:
-        if isinstance(v, bool):
-            return (1 if v else 0), kp
-        if isinstance(v, (int, float)):
-            return (1 if v else 0), kp
-        if isinstance(v, str):
-            low = v.strip().lower()
-            if low in ("true", "yes", "1"):
-                return 1, kp
-            if low in ("false", "no", "0", ""):
-                return 0, kp
-            if LOW_IMPR_TEXT_RE.search(v):
-                return 1, kp
-            return 1, kp        # any other label under a low_impression key: the badge is present
-        if isinstance(v, dict) and v:
-            return 1, kp
-    return None, None
-
-
 def normalise_ad(node: dict) -> dict:
+    """The columns kept per ad. low_impressions is filled from the rendered card (apply_card_badges); the payload
+    has no badge field, so it starts as None (unknown)."""
     snap = node.get("snapshot") or {}
     cards = snap.get("cards") or []
-    videos = snap.get("videos") or []
-    images = snap.get("images") or []
     first_card = cards[0] if cards else {}
-    body_text = _first(_text(snap.get("body")), _text(first_card.get("body")))
-    headline = _first(_text(snap.get("title")), _text(first_card.get("title")))
-    link = _first(snap.get("link_url"), first_card.get("link_url"), snap.get("link_description") and None)
-    fmt = (snap.get("display_format") or "").upper()
-    if videos or fmt == "VIDEO":
-        ctype = "video"
-    elif len(cards) > 1 or fmt in ("CAROUSEL", "MULTI_IMAGES"):
-        ctype = "carousel"
-    elif images or fmt == "IMAGE":
-        ctype = "image"
-    elif fmt:
-        ctype = fmt.lower()
-    else:
-        ctype = "unknown"
-    asset = _first(
-        videos[0].get("video_preview_image_url") if videos else None,
-        videos[0].get("video_hd_url") if videos else None,
-        videos[0].get("video_sd_url") if videos else None,
-        images[0].get("original_image_url") if images else None,
-        images[0].get("resized_image_url") if images else None,
-        first_card.get("original_image_url"), first_card.get("resized_image_url"),
-        first_card.get("video_preview_image_url"),
-    )
-    reach = extract_reach(node)
-    eu_reach = reach["eu_reach"]
-    # Meta gives every ad its own asset URL, so hashing the asset made every fingerprint unique.
-    # Hash the copy instead: identical text+headline across ads/pages = same creative concept.
-    fp_src = f"{(headline or '').lower().strip()}|{(body_text or '').lower()[:500]}"
-    low_impr, low_key = extract_low_impressions(node)
-    social = {}
-    for key in ("reactions", "comments", "shares"):
-        for cand in (f"{key}_count", key, f"{key[:-1]}_count"):
-            v = node.get(cand) if cand in node else snap.get(cand)
-            if isinstance(v, (int, float)):
-                social[key] = int(v)
-                break
+    link = _first(snap.get("link_url"), first_card.get("link_url"))
     return {
         "ad_id": str(node.get("ad_archive_id")),
         "page_id": str(node.get("page_id") or "") or None,
@@ -362,46 +166,22 @@ def normalise_ad(node: dict) -> dict:
         "start_date": _unix_to_date(node.get("start_date")),
         "end_date": _unix_to_date(node.get("end_date")),
         "is_active": 1 if node.get("is_active") in (True, 1, "true") else 0,
-        "primary_text": body_text,
-        "headline": headline,
+        "primary_text": _first(_text(snap.get("body")), _text(first_card.get("body"))),
         "landing_url": link,
         "landing_domain": urlparse(link).netloc.lower() if link else None,
-        "caption": _text(snap.get("caption")),
-        "cta": _text(snap.get("cta_text")),
-        "creative_type": ctype,
-        "asset_url": asset,
-        "platforms": ",".join(node.get("publisher_platform") or []) or None,
-        "collation_count": node.get("collation_count"),
-        "eu_total_reach": int(eu_reach) if isinstance(eu_reach, (int, float)) else None,
-        "uk_reach": reach["uk_reach"],
-        "reach_range_lower": reach["range_lower"],
-        "reach_range_upper": reach["range_upper"],
-        "reach_source": reach["source"],
-        "reach_keys": reach["keys"],
-        "post_url": extract_post_url(node),
-        "page_like_count": (lambda v: int(v) if isinstance(v, (int, float)) else None)(node.get("page_like_count", snap.get("page_like_count"))),
-        "is_active_flag": node.get("is_active"),
-        "reactions": social.get("reactions"),
-        "comments": social.get("comments"),
-        "shares": social.get("shares"),
-        "fingerprint": hashlib.sha1(fp_src.encode("utf-8")).hexdigest()[:16],
-        "low_impressions": low_impr,
-        "low_impressions_key": low_key,
-        "raw_json": json.dumps(node, ensure_ascii=False)[:20000],
+        "low_impressions": None,
     }
 
 
 # ---------------------------------------------------------------- browser
 
 def launch_kwargs() -> dict:
-    """Extra Chromium launch options: META_CHROMIUM_PATH points at a specific binary
-    (e.g. a pre-installed Chromium when Playwright's own download is unavailable)."""
+    """META_CHROMIUM_PATH points at a specific binary (e.g. a pre-installed Chromium)."""
     return {"executable_path": config.META_CHROMIUM_PATH} if config.META_CHROMIUM_PATH else {}
 
+
 class KeepAwake:
-    """While a long pass runs, stop Windows from sleeping (the display may still turn off).
-    A sleeping laptop pauses the pass but not the wall-clock budget: one night showed a 3-minute
-    step taking 5.8 hours. No-op on other platforms or if the call fails. Use as a context manager."""
+    """While a long pass runs, stop Windows from sleeping (the display may still turn off). No-op elsewhere."""
     ES_CONTINUOUS, ES_SYSTEM_REQUIRED = 0x80000000, 0x00000001
 
     def __enter__(self):
@@ -426,8 +206,8 @@ class KeepAwake:
 
 
 class BrowserHandle:
-    """Lazily launched Chromium that is relaunched when it dies (a heavy page can take the whole
-    browser process down; the pass must carry on with the next ad / store instead of failing)."""
+    """Lazily launched Chromium that is relaunched when it dies (a heavy page can take the whole browser
+    process down; the pass must carry on with the next store instead of failing)."""
 
     def __init__(self, pw, headless: bool = True):
         self.pw, self.headless, self.browser, self.relaunches = pw, headless, None, 0
@@ -450,9 +230,8 @@ class BrowserHandle:
 
 
 class LazyBrowser:
-    """A BrowserHandle that starts Playwright only when a browser is first needed. A command that ends up opening
-    no page (radar with nothing to triage) must not start and stop the driver for nothing: that leaves
-    'Task was destroyed but it is pending' noise from asyncio at exit."""
+    """A BrowserHandle that starts Playwright only when a browser is first needed (a radar run with nothing to
+    search must not start and stop the driver for nothing)."""
 
     def __init__(self, headless: bool = True):
         self.headless, self.pw, self.handle, self.relaunches = headless, None, None, 0
@@ -490,7 +269,7 @@ class ScrapeResult:
     responses: int = 0
     blocked: bool = False
     note: str = ""
-    sort_ui: str = ""          # what the in-page sort control did (sort_ui=...): "select option ...", "clicked ...", or why not
+    badges_read: int = 0       # ads whose card was seen (badge known)
 
 
 def _wait(lo: float | None = None, hi: float | None = None) -> None:
@@ -500,13 +279,10 @@ def _wait(lo: float | None = None, hi: float | None = None) -> None:
 
 
 def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = None,
-                max_ads: int | None = None, browser=None, sort_ui: str | None = None) -> ScrapeResult:
-    """Open one Ad Library search and collect every ad record the page loads.
-
-    Pass an existing Playwright `browser` to reuse it across stores (one concurrent
-    browser, a fresh context + user agent per store). sort_ui="impressions" chooses
-    "Impressions: high to low" in the page's own sort control after the first load
-    (the URL's sort_data is ignored by Meta's web app) and collects the re-sorted results."""
+                max_ads: int | None = None, browser=None) -> ScrapeResult:
+    """Open one Ad Library search and collect every ad record the page loads, reading the 'Low impression count'
+    badge off every rendered card. Pass an existing Playwright `browser` to reuse it across stores (one concurrent
+    browser, a fresh context + user agent per store)."""
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout  # local import: optional dep
 
     max_scrolls = config.META_MAX_SCROLLS if max_scrolls is None else max_scrolls
@@ -536,6 +312,12 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
             result.responses += 1
             ingest(body)
 
+    def read_badges(page) -> None:
+        try:
+            dom_badges.update(read_card_badges(page))
+        except Exception as e:  # noqa: BLE001
+            log.debug("%s: card badge read failed: %s", _short(url), e)
+
     def run(b):
         ctx = b.new_context(user_agent=random.choice(USER_AGENTS), viewport={"width": 1366, "height": 850},
                             locale="en-US", timezone_id="America/New_York")
@@ -545,7 +327,6 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
             page.goto(url, wait_until="domcontentloaded", timeout=config.META_NAV_TIMEOUT_MS)
             _wait(2, 4)
             _dismiss_dialogs(page)
-            # ads embedded in the initial HTML
             for html in page.evaluate(
                 "() => Array.from(document.querySelectorAll('script[type=\"application/json\"]')).map(s => s.textContent)"
             ):
@@ -554,39 +335,14 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
             _check_blocked(page, result)
             if result.blocked:
                 return
-            if sort_ui:
-                info = _apply_sort_ui(page, sort_ui)
-                result.sort_ui = info["how"] if info["applied"] else f"{info['how']} (seen: {'; '.join(info['controls'])[:300] or 'nothing'})"
-                if info["applied"]:
-                    before_ids = set(nodes)
-                    nodes.clear()
-                    dom_badges.clear()
-                    result.responses = 0
-                    _wait(3, 5)                     # the re-sorted first batch arrives through on_response
-                    _check_blocked(page, result)
-                    if result.blocked:
-                        return
-                    if not nodes:                   # some builds render the re-sorted list without a new request
-                        for html in page.evaluate(
-                            "() => Array.from(document.querySelectorAll('script[type=\"application/json\"]')).map(s => s.textContent)"
-                        ):
-                            if html and "ad_archive_id" in html:
-                                ingest(html)
-                    log.info("%s: sort control: %s; %d ads in the re-sorted first load (%d before)", _short(url), info["how"], len(nodes), len(before_ids))
-                else:
-                    log.info("%s: sort control: %s", _short(url), result.sort_ui)
             stale = 0
             log.info("%s: page open, %d ads in the first load; scrolling (%d-%ds between scrolls, up to %d scrolls)",
                      _short(url), len(nodes), int(config.META_WAIT_MIN), int(config.META_WAIT_MAX), max_scrolls)
             for i in range(max_scrolls):
                 before = len(nodes)
+                read_badges(page)      # before the scroll: cards rendered so far, while they are still in the DOM
                 page.evaluate("() => window.scrollTo(0, (document.scrollingElement || document.body || document.documentElement || {scrollHeight: 100000}).scrollHeight)")
                 result.scrolls += 1
-                if result.scrolls % 5 == 0:
-                    try:
-                        dom_badges.update(read_card_badges(page))
-                    except Exception:  # noqa: BLE001
-                        pass
                 _wait()
                 if (i + 1) % 5 == 0:
                     log.info("%s: scroll %d/%d, %d ads so far", _short(url), i + 1, max_scrolls, len(nodes))
@@ -604,9 +360,9 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
                 result.note = f"hit max_scrolls={max_scrolls}"
             try:
                 page.wait_for_timeout(1500)            # let the last batch of cards render before the final read
-                dom_badges.update(read_card_badges(page))
-            except Exception as e:  # noqa: BLE001
-                log.debug("%s: card badge read failed: %s", _short(url), e)
+            except Exception:  # noqa: BLE001
+                pass
+            read_badges(page)
         except PWTimeout as e:
             raise MetaScrapeError(f"navigation timeout: {e}") from None
         finally:
@@ -622,7 +378,7 @@ def scrape_page(url: str, *, headless: bool = True, max_scrolls: int | None = No
             finally:
                 b.close()
     result.ads = [normalise_ad(n) for n in nodes.values()]
-    apply_card_badges(result.ads, dom_badges)
+    result.badges_read = apply_card_badges(result.ads, dom_badges)
     if result.blocked:
         raise MetaBlocked(result.note or "blocked")
     return result
@@ -661,72 +417,21 @@ def read_card_badges(page) -> dict[str, bool]:
 
 
 def apply_card_badges(ads: list[dict], badges: dict[str, bool]) -> int:
-    """The card wins over the payload (which has no badge field): 1 with the badge, 0 for a card seen without it."""
+    """1 for a card with the badge, 0 for a card seen without it; None (unknown) when the card never rendered."""
     n = 0
     for a in ads:
         v = badges.get(str(a.get("ad_id")))
         if v is None:
             continue
         a["low_impressions"] = 1 if v else 0
-        a["low_impressions_key"] = "card:Low impression count"
         n += 1
     return n
 
 
 def _short(url: str) -> str:
     """The search term from an Ad Library URL, for log lines."""
-    from urllib.parse import parse_qs, urlparse as _up
-    q = parse_qs(_up(url).query)
+    q = parse_qs(urlparse(url).query)
     return (q.get("q") or q.get("view_all_page_id") or ["?"])[0]
-
-
-SORT_WANT_RE = re.compile(r"impression", re.I)
-SORT_CONTROL_RE = re.compile(r"sort|newest|impression|relevance", re.I)
-
-
-def _apply_sort_ui(page, mode: str = "impressions") -> dict:
-    """Best-effort: pick 'Impressions: high to low' in the page's sort control. Returns {applied, how, controls}
-    where controls lists what was seen, so an unrecognised layout can be reported and the selectors adjusted."""
-    found: list[str] = []
-    # 1. a native <select> whose options mention impressions
-    try:
-        for i in range(min(page.locator("select").count(), 10)):
-            sel = page.locator("select").nth(i)
-            opts = [o.strip() for o in sel.locator("option").all_text_contents()]
-            found.append("select: " + " | ".join(opts)[:120])
-            for o in opts:
-                if SORT_WANT_RE.search(o):
-                    sel.select_option(label=o)
-                    return {"applied": True, "how": f"select option {o!r}", "controls": found}
-    except Exception as e:  # noqa: BLE001
-        found.append(f"select scan failed: {str(e)[:80]}")
-    # 2. a button / combobox mentioning sort or newest: open it, then click the entry mentioning impressions
-    try:
-        ctl = page.locator("[role=button], [role=combobox], button").filter(has_text=SORT_CONTROL_RE)
-        n = min(ctl.count(), 8)
-        for i in range(n):
-            try:
-                found.append("control: " + (ctl.nth(i).inner_text(timeout=1000) or "").strip().replace("\n", " ")[:80])
-            except Exception:  # noqa: BLE001
-                pass
-        for i in range(n):
-            c = ctl.nth(i)
-            try:
-                if not c.is_visible(timeout=800):
-                    continue
-                c.click(timeout=2000)
-                page.wait_for_timeout(800)
-                opt = page.locator("[role=menuitem], [role=option], [role=menuitemradio], [role=radio], li, label").filter(has_text=SORT_WANT_RE)
-                if opt.count() and opt.first.is_visible(timeout=1500):
-                    label = (opt.first.inner_text(timeout=1000) or "").strip().replace("\n", " ")[:80]
-                    opt.first.click(timeout=2000)
-                    return {"applied": True, "how": f"clicked control {i} -> {label!r}", "controls": found}
-                page.keyboard.press("Escape")
-            except Exception as e:  # noqa: BLE001
-                found.append(f"control {i} failed: {str(e)[:60]}")
-    except Exception as e:  # noqa: BLE001
-        found.append(f"control scan failed: {str(e)[:80]}")
-    return {"applied": False, "how": "sort control not found", "controls": found}
 
 
 def _dismiss_dialogs(page) -> None:
@@ -760,81 +465,51 @@ def _check_blocked(page, result: ScrapeResult) -> None:
 
 # ---------------------------------------------------------------- SQLite
 
-def record_scrape(conn: sqlite3.Connection, store_id: int, snapshot_date: str, ads: list[dict],
-                  query: str) -> dict:
-    """Write one page's scrape. Returns counts: new, seen, disappeared."""
+def record_scrape(conn: sqlite3.Connection, store_id: int, snapshot_date: str, ads: list[dict], query: str) -> dict:
+    """Write one page's scrape: ads (upsert), today's ads_daily rows, still_active=0 rows for ads of this store
+    that were not in today's results, then the store's url_daily rows for the day.
+    Returns counts: new, seen, disappeared, total, badge_known."""
+    from .winners import compute_url_daily, normalise_landing_path
     now = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
     ids_today = {a["ad_id"] for a in ads}
-    new = 0
-    if not query.startswith("rank:"):
-        shared = sum(1 for a in ads if conn.execute("SELECT 1 FROM meta_ads_daily WHERE snapshot_date = ? AND ad_id = ? AND store_id != ?",
-                                                    (snapshot_date, a["ad_id"], store_id)).fetchone())
-        if shared:
-            log.warning("%s: %d of %d ads were already recorded today under another watchlist store (the same page advertises for "
-                        "both?); a day's row holds one store, so the other store's counts drop by that many", query, shared, len(ads))
+    new = known = 0
     with conn:
         for pos, a in enumerate(ads):
-            existing = conn.execute("SELECT ad_id FROM meta_ads WHERE ad_id = ?", (a["ad_id"],)).fetchone()
-            if existing is None:
+            path = normalise_landing_path(a.get("landing_url"))
+            row = conn.execute("SELECT first_seen FROM ads WHERE ad_id = ? AND store_id = ?", (a["ad_id"], store_id)).fetchone()
+            if row is None:
                 new += 1
-                conn.execute(
-                    """INSERT INTO meta_ads (ad_id, store_id, page_id, page_name, ad_start_date, ad_end_date,
-                         first_seen_date, last_seen_date, primary_text, headline, landing_url, landing_domain,
-                         caption, cta, creative_type, asset_url, platforms, fingerprint, query, raw_json)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                    (a["ad_id"], store_id, a["page_id"], a["page_name"], a["start_date"], a["end_date"],
-                     snapshot_date, snapshot_date, a["primary_text"], a["headline"], a["landing_url"],
-                     a["landing_domain"], a["caption"], a["cta"], a["creative_type"], a["asset_url"],
-                     a["platforms"], a["fingerprint"], query, a["raw_json"]))
+                conn.execute("""INSERT INTO ads (ad_id, store_id, page_id, page_name, landing_url, landing_path, first_seen, first_scraped,
+                                                 last_scraped, primary_text) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                             (a["ad_id"], store_id, a.get("page_id"), a.get("page_name"), a.get("landing_url"), path,
+                              a.get("start_date") or snapshot_date, snapshot_date, snapshot_date, (a.get("primary_text") or "")[:500] or None))
             else:
-                conn.execute(
-                    """UPDATE meta_ads SET last_seen_date = ?, ad_end_date = COALESCE(?, ad_end_date),
-                         page_name = COALESCE(?, page_name), primary_text = COALESCE(?, primary_text),
-                         headline = COALESCE(?, headline), landing_url = COALESCE(?, landing_url),
-                         landing_domain = COALESCE(?, landing_domain), asset_url = COALESCE(?, asset_url),
-                         raw_json = ? WHERE ad_id = ?""",
-                    (snapshot_date, a["end_date"], a["page_name"], a["primary_text"], a["headline"],
-                     a["landing_url"], a["landing_domain"], a["asset_url"], a["raw_json"], a["ad_id"]))
-            conn.execute(
-                """UPDATE meta_ads SET post_url = COALESCE(?, post_url), reach_keys = ?,
-                     engagement_type = CASE WHEN COALESCE(?, post_url) IS NULL THEN 'dark' ELSE 'boosted' END,
-                     low_impressions_key = COALESCE(?, low_impressions_key)
-                   WHERE ad_id = ?""",
-                (a.get("post_url"), a.get("reach_keys"), a.get("post_url"), a.get("low_impressions_key"), a["ad_id"]))
-            prev = conn.execute("SELECT reactions, comments, shares, post_status, low_impressions, impression_rank FROM meta_ads_daily WHERE snapshot_date = ? AND ad_id = ?",
-                                (snapshot_date, a["ad_id"])).fetchone()
-            conn.execute(
-                """INSERT OR REPLACE INTO meta_ads_daily
-                   (snapshot_date, ad_id, store_id, is_active, position, eu_total_reach, uk_reach, reach_range_lower,
-                    reach_range_upper, reach_source, reactions, comments, shares, post_status, collation_count, fetched_at,
-                    low_impressions)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (snapshot_date, a["ad_id"], store_id, a["is_active"], pos, a["eu_total_reach"], a.get("uk_reach"),
-                 a.get("reach_range_lower"), a.get("reach_range_upper"), a.get("reach_source"),
-                 a["reactions"] if a["reactions"] is not None else (prev["reactions"] if prev else None),
-                 a["comments"] if a["comments"] is not None else (prev["comments"] if prev else None),
-                 a["shares"] if a["shares"] is not None else (prev["shares"] if prev else None),
-                 prev["post_status"] if prev else None, a["collation_count"], now,
-                 a.get("low_impressions") if a.get("low_impressions") is not None else (prev["low_impressions"] if prev else None)))
-            if prev and prev["impression_rank"] is not None:
-                conn.execute("UPDATE meta_ads_daily SET impression_rank = ? WHERE snapshot_date = ? AND ad_id = ?",
-                             (prev["impression_rank"], snapshot_date, a["ad_id"]))
-        # ads seen on an earlier day for this store that did not show up today -> inactive row
-        gone = [r["ad_id"] for r in conn.execute(
-            "SELECT ad_id FROM meta_ads WHERE store_id = ? AND last_seen_date < ?", (store_id, snapshot_date))
+                conn.execute("""UPDATE ads SET last_scraped = ?, page_id = COALESCE(?, page_id), page_name = COALESCE(?, page_name),
+                                  landing_url = COALESCE(?, landing_url), landing_path = COALESCE(?, landing_path),
+                                  first_seen = COALESCE(?, first_seen), primary_text = COALESCE(?, primary_text)
+                                WHERE ad_id = ? AND store_id = ?""",
+                             (snapshot_date, a.get("page_id"), a.get("page_name"), a.get("landing_url"), path, a.get("start_date"),
+                              (a.get("primary_text") or "")[:500] or None, a["ad_id"], store_id))
+            low = a.get("low_impressions")
+            if low is None:      # a same-day re-run keeps the badge it read earlier
+                prev = conn.execute("SELECT low_impressions FROM ads_daily WHERE snapshot_date = ? AND store_id = ? AND ad_id = ?",
+                                    (snapshot_date, store_id, a["ad_id"])).fetchone()
+                low = prev["low_impressions"] if prev else None
+            known += 1 if low is not None else 0
+            conn.execute("""INSERT OR REPLACE INTO ads_daily (snapshot_date, store_id, ad_id, still_active, low_impressions, position, fetched_at)
+                            VALUES (?,?,?,?,?,?,?)""", (snapshot_date, store_id, a["ad_id"], a.get("is_active", 1), low, pos, now))
+        gone = [r["ad_id"] for r in conn.execute("SELECT ad_id FROM ads WHERE store_id = ? AND last_scraped < ?", (store_id, snapshot_date))
                 if r["ad_id"] not in ids_today]
-        for aid in gone:
-            conn.execute(
-                """INSERT OR IGNORE INTO meta_ads_daily (snapshot_date, ad_id, store_id, is_active, fetched_at)
-                   VALUES (?,?,?,0,?)""", (snapshot_date, aid, store_id, now))
-    return {"new": new, "seen": len(ads) - new, "disappeared": len(gone), "total": len(ads)}
+        conn.executemany("""INSERT OR IGNORE INTO ads_daily (snapshot_date, store_id, ad_id, still_active, low_impressions, position, fetched_at)
+                            VALUES (?,?,?,0,NULL,NULL,?)""", [(snapshot_date, store_id, aid, now) for aid in gone])
+    urls = compute_url_daily(conn, store_id, snapshot_date)
+    return {"new": new, "seen": len(ads) - new, "disappeared": len(gone), "total": len(ads), "badge_known": known, "urls": urls}
 
 
 def record_page_run(conn: sqlite3.Connection, store_id: int, snapshot_date: str, query: str, status: str,
                     detail: str, ads_found: int, scrolls: int, duration_s: float) -> None:
     conn.execute(
-        """INSERT INTO meta_page_runs (store_id, snapshot_date, query, status, detail, ads_found, scrolls,
-                                       duration_s, ran_at)
+        """INSERT INTO meta_page_runs (store_id, snapshot_date, query, status, detail, ads_found, scrolls, duration_s, ran_at)
            VALUES (?,?,?,?,?,?,?,?,?)""",
         (store_id, snapshot_date, query, status, detail[:500], ads_found, scrolls, round(duration_s, 1),
          datetime.now(timezone.utc).replace(microsecond=0).isoformat()))
@@ -847,159 +522,3 @@ def days_running(ad_start: str | None, first_seen: str, as_of: str) -> int | Non
         return (date.fromisoformat(as_of) - date.fromisoformat(start)).days
     except (TypeError, ValueError):
         return None
-
-
-# ---------------------------------------------------------------- boosted posts (browser, best effort)
-
-_COUNT_PATTERNS = {
-    "comments": [r'"comment_count"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)', r'"comments"\s*:\s*\{\s*"total_count"\s*:\s*(\d+)',
-                 r'"comment_count"\s*:\s*(\d+)', r'"commentCount"\s*:\s*(\d+)', r'(\d[\d,.]*[KkMm]?)\s+comments?\b'],
-    "reactions": [r'"reaction_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)', r'"reactions"\s*:\s*\{\s*"count"\s*:\s*(\d+)',
-                  r'"reaction_count"\s*:\s*(\d+)', r'"like_count"\s*:\s*(\d+)'],
-    "shares": [r'"share_count"\s*:\s*\{\s*"count"\s*:\s*(\d+)', r'"share_count"\s*:\s*(\d+)', r'(\d[\d,.]*[KkMm]?)\s+shares?\b'],
-}
-
-
-def _to_int(text: str) -> int | None:
-    t = text.replace(",", "").strip()
-    mult = 1
-    if t[-1:].lower() == "k":
-        mult, t = 1000, t[:-1]
-    elif t[-1:].lower() == "m":
-        mult, t = 1_000_000, t[:-1]
-    try:
-        return int(float(t) * mult)
-    except ValueError:
-        return None
-
-
-def parse_post_counts(html: str) -> dict:
-    """Pull comment / reaction / share counts out of a Facebook post page's HTML, if present."""
-    out = {}
-    for key, pats in _COUNT_PATTERNS.items():
-        for pat in pats:
-            m = re.search(pat, html, re.I)
-            if m:
-                v = _to_int(m.group(1))
-                if v is not None:
-                    out[key] = v
-                    break
-    return out
-
-
-def fetch_post_counts(browser, url: str) -> tuple[dict, str]:
-    """Open a public post in a fresh context and read its counts. Returns (counts, status):
-    status is 'ok', 'login-wall', 'no-counts' or 'error:<reason>'."""
-    ctx = browser.new_context(user_agent=random.choice(USER_AGENTS), viewport={"width": 1366, "height": 850},
-                              locale="en-US")
-    page = ctx.new_page()
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=config.META_NAV_TIMEOUT_MS)
-        _wait(2, 4)
-        _dismiss_dialogs(page)
-        if "/login" in page.url.lower() or "/checkpoint" in page.url.lower():
-            return {}, "login-wall"
-        html = page.content()
-        counts = parse_post_counts(html)
-        if not counts:
-            body = (page.evaluate("() => document.body ? document.body.innerText : ''") or "")[:20000]
-            counts = parse_post_counts(body)
-        return counts, ("ok" if counts else "no-counts")
-    except Exception as e:  # noqa: BLE001
-        return {}, f"error:{type(e).__name__}:{str(e).splitlines()[0][:60] if str(e) else ''}"
-    finally:
-        ctx.close()
-
-
-def fetch_boosted_engagement(conn: sqlite3.Connection, browser, store_id: int, snapshot_date: str,
-                             max_posts: int | None = None) -> dict:
-    """For today's active boosted ads, fetch each underlying post once per day and store counts."""
-    max_posts = config.META_MAX_POSTS if max_posts is None else max_posts
-    rows = conn.execute(
-        """SELECT a.ad_id, a.post_url FROM meta_ads a JOIN meta_ads_daily d ON d.ad_id = a.ad_id AND d.snapshot_date = ?
-           WHERE a.store_id = ? AND a.post_url IS NOT NULL AND d.is_active = 1 AND d.post_status IS NULL
-             AND COALESCE(a.page_ignored, 0) = 0 ORDER BY d.position""", (snapshot_date, store_id)).fetchall()
-    seen: dict[str, tuple[dict, str]] = {}
-    fetched = ok = 0
-    for r in rows:
-        url = r["post_url"]
-        if url not in seen:
-            if fetched >= max_posts:
-                break
-            seen[url] = fetch_post_counts(browser, url)
-            fetched += 1
-            _wait()
-        counts, status = seen[url]
-        if counts:
-            ok += 1
-        conn.execute(
-            """UPDATE meta_ads_daily SET reactions = COALESCE(?, reactions), comments = COALESCE(?, comments),
-                 shares = COALESCE(?, shares), post_status = ? WHERE snapshot_date = ? AND ad_id = ?""",
-            (counts.get("reactions"), counts.get("comments"), counts.get("shares"), status, snapshot_date, r["ad_id"]))
-    conn.commit()
-    return {"candidates": len(rows), "fetched": fetched, "with_counts": ok}
-
-
-def backfill_low_impressions(conn: sqlite3.Connection, store_id: int | None = None) -> dict:
-    """Read the badge out of the stored raw payload for ads whose latest daily row has no value yet (the payload
-    is the one from the ad's last scrape, so only that day's row is filled). Returns counts and the keys seen."""
-    from collections import Counter
-    sql = "SELECT ad_id, last_seen_date, raw_json FROM meta_ads WHERE raw_json IS NOT NULL"
-    args: list = []
-    if store_id is not None:
-        sql += " AND store_id = ?"
-        args.append(store_id)
-    keys: Counter = Counter()
-    n = flagged = unknown = 0
-    for r in conn.execute(sql, args).fetchall():
-        try:
-            node = json.loads(r["raw_json"])
-        except ValueError:
-            continue
-        val, key = extract_low_impressions(node)
-        if val is None:
-            unknown += 1
-            continue
-        keys[key] += 1
-        cur = conn.execute("UPDATE meta_ads_daily SET low_impressions = ? WHERE ad_id = ? AND snapshot_date = ? AND low_impressions IS NULL",
-                           (val, r["ad_id"], r["last_seen_date"]))
-        conn.execute("UPDATE meta_ads SET low_impressions_key = COALESCE(low_impressions_key, ?) WHERE ad_id = ?", (key, r["ad_id"]))
-        n += cur.rowcount
-        flagged += val
-    conn.commit()
-    return {"updated": n, "flagged": flagged, "no_field": unknown, "keys": dict(keys)}
-
-
-def payload_fields(conn: sqlite3.Connection, grep: str, store_id: int | None = None, limit_ads: int = 400) -> dict:
-    """{key path: (count, example value)} over stored payloads for keys matching `grep` (case-insensitive).
-    The way to find out what Meta calls a badge before hard-coding it."""
-    rx = re.compile(grep, re.I)
-    sql = "SELECT raw_json FROM meta_ads WHERE raw_json IS NOT NULL"
-    args: list = []
-    if store_id is not None:
-        sql += " AND store_id = ?"
-        args.append(store_id)
-    sql += " ORDER BY last_seen_date DESC LIMIT ?"
-    args.append(limit_ads)
-    out: dict[str, list] = {}
-
-    def walk(o, path, depth):
-        if depth > 7:
-            return
-        if isinstance(o, dict):
-            for k, v in o.items():
-                kp = f"{path}.{k}" if path else str(k)
-                if rx.search(str(k)) or (isinstance(v, str) and rx.search(v) and len(v) < 120):
-                    rec = out.setdefault(kp, [0, v if not isinstance(v, (dict, list)) else json.dumps(v)[:80]])
-                    rec[0] += 1
-                if isinstance(v, (dict, list)):
-                    walk(v, kp, depth + 1)
-        elif isinstance(o, list):
-            for v in o[:20]:
-                walk(v, path + "[]", depth + 1)
-    for r in conn.execute(sql, args):
-        try:
-            walk(json.loads(r["raw_json"]), "", 0)
-        except ValueError:
-            continue
-    return {k: (v[0], v[1]) for k, v in sorted(out.items(), key=lambda kv: -kv[1][0])}

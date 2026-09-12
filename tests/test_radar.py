@@ -24,7 +24,8 @@ def prod(pid, handle, title, days, pos=None):
 
 class PureTests(unittest.TestCase):
     def test_distinctive_words_strips_brand_and_noise(self):
-        bw = radar.brand_words_for("biorootlabs.com", "BioRoot Labs")
+        bw = radar.brand_words_for("biorootlabs.com", ["BioRoot Ceylon Cinnamon Softgels", "BioRoot Magnesium", "Sleep Gummies"])
+        self.assertIn("bioroot", bw)                       # a word that opens several titles is the brand, even without a vendor field
         self.assertEqual(radar.distinctive_words("BioRoot Ceylon Cinnamon Softgels 7200mg with MCT Oil - 60 Capsules", bw), "ceylon cinnamon mct")
         self.assertEqual(radar.distinctive_words("Premium Formula", bw), "")
 
@@ -72,7 +73,7 @@ class RunTests(unittest.TestCase):
         self.wl.write_text("store_domain,meta_page_name,meta_page_id,notes\nexisting.com,,,\n", encoding="utf-8")
         self.conn = db.connect(":memory:")
         sid = db.upsert_store(self.conn, "existing.com")
-        db.write_product_snapshot(self.conn, sid, d(1), [prod(1, "hero-cream", "Acme Retinol Night Cream", 100, 0), prod(2, "old", "Old Thing", 400, 1)])
+        db.write_product_snapshot(self.conn, sid, d(1), [prod(1, "hero-cream", "Acme Retinol Night Cream", 100, 0), prod(2, "old", "Acme Old Thing", 400, 1)])
         self.conn.commit()
         # the fake Ad Library: ads per query
         self.ads = {

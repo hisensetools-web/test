@@ -3,9 +3,9 @@
 Sources
   hooks     radar/hooks.txt phrases searched in the Ad Library (country RADAR_COUNTRY, active ads),
             up to RADAR_MAX_ADS_PER_QUERY ads each, weekly
-  copycat   for each hero product on the watchlist (top 3 by collection rank + published <= 30 days)
-            the product title's distinctive words (brand words stripped) searched the same way, plus a
-            web search for the title whose result domains are triaged
+  copycat   for each hero product on the watchlist (the 3 newest by created_at + every product published
+            <= 30 days ago) the product title's distinctive words (brand words stripped) searched the same
+            way, plus a web search for the title whose result domains are triaged
   manual    `tracker.py radar-add ...` and radar/imports/*.csv|txt: straight to the watchlist, source=manual
 
 Triage (sources hooks / copycat), per landing domain not on the watchlist:
@@ -32,7 +32,7 @@ from urllib.parse import parse_qs, quote_plus, unquote, urlparse
 
 import requests
 
-from . import ad_metrics, config, meta_ads, shopify, store_age
+from . import config, db, meta_ads, shopify, store_age
 from .watchlist import append_to_watchlist, normalise_domain, read_watchlist
 
 log = logging.getLogger("earlyscale.radar")
@@ -56,6 +56,36 @@ SKIP_DOMAINS = ("facebook.com", "fb.com", "instagram.com", "fbcdn.net", "google.
 TLD_RE = re.compile(r"^[a-z]{2,24}$")
 FILE_EXTS = {"php", "jpg", "jpeg", "png", "gif", "webp", "svg", "js", "css", "json", "xml", "html", "htm", "pdf", "mp4", "txt", "ico",
              "woff", "woff2", "zip", "aspx", "asp", "jsp", "cgi"}
+# products nobody copies: shipping protection, gift cards, memberships, digital goods
+EXCLUDE_RE = re.compile(
+    r"(shipping[-\s_]?protection|package[-\s_]?protection|route[-\s_]?package|order[-\s_]?protection|"
+    r"\bwarranty\b|\binsurance\b|gift[-\s_]?card|\bmembership\b|\bmembers?[-\s_]?only\b|\be-?book\b|"
+    r"\bdigital\b|\bdownload(able)?\b|\bpdf\b|\btip[-\s_]?jar\b|^tips?$|priority[-\s_]?processing|"
+    r"\bdonation\b|\bcourse\b)", re.I)
+PRODUCT_RE = re.compile(r"/products/([a-z0-9][a-z0-9\-_.%]*)", re.I)
+GENERIC_PRODUCT_RE = re.compile(r"/(?:product|shop/p|p|item|items|store/p|producto|produkt|artikel)/([a-z0-9][a-z0-9\-_.%]*)", re.I)
+
+
+def is_excluded(title: str | None, handle: str | None, product_type: str | None = None, tags=None) -> bool:
+    text = " ".join(str(x or "") for x in (title, handle, product_type, " ".join(tags) if isinstance(tags, list) else tags))
+    return bool(EXCLUDE_RE.search(text))
+
+
+def handle_from_url(url: str | None) -> str | None:
+    """The product handle straight from a landing URL's path (Shopify /products/<handle> and the product paths of
+    the other platforms), else None."""
+    if not url:
+        return None
+    path = urlparse(url).path
+    m = PRODUCT_RE.search(path) or GENERIC_PRODUCT_RE.search(path)
+    return m.group(1).lower().split(".")[0] if m else None
+
+
+def fetch_landing(session: requests.Session, url: str) -> tuple[str, str, int]:
+    """GET a landing page (follows redirects). Returns (final_url, html, status)."""
+    r = session.get(url, timeout=config.REQUEST_TIMEOUT, allow_redirects=True,
+                    headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
+    return r.url, r.text if r.status_code == 200 else "", r.status_code
 
 
 def _utcnow() -> str:
@@ -89,28 +119,37 @@ def distinctive_words(title: str, brand_words: set[str] | None = None, max_words
     return " ".join(out[:max_words])
 
 
-def brand_words_for(store_domain: str, vendor: str | None = None) -> set[str]:
+def brand_words_for(store_domain: str, titles: list[str] | None = None) -> set[str]:
+    """The domain label, plus any word that opens several of the store's product titles (a brand prefix like
+    'Acme Retinol Cream', 'Acme Night Serum'): what a copycat would not repeat."""
     host = re.sub(r"^https?://", "", store_domain).split("/")[0].lower()
     label = host.split(".")[0] if not host.startswith("www.") else host.split(".")[1]
     words = {label, host}
-    for w in re.findall(r"[a-z]+", (vendor or "").lower()):
-        words.add(w)
     for w in re.findall(r"[a-z]+", label):
         words.add(w)
+    firsts = Counter()
+    for t in titles or []:
+        m = re.match(r"\s*([a-z][a-z'\-]+)", (t or "").lower())
+        if m:
+            firsts[m.group(1)] += 1
+    n = len([t for t in titles or [] if t])
+    for w, c in firsts.items():
+        if c >= 2 and c >= 0.3 * n and w not in STOP:
+            words.add(w)
     return words
 
 
 def hero_queries(conn: sqlite3.Connection, today: str, top_n: int = 3, new_days: int = 30) -> list[dict]:
-    """[(store_domain, handle, query)] for every watchlist store's hero products."""
-    from . import inventory
+    """[{store, handle, query, title}] for every store's hero products: the top_n newest by created_at plus every
+    product published in the last new_days days."""
     out = []
     t = date.fromisoformat(today)
     for s in conn.execute("SELECT id, store_domain FROM stores"):
-        _, products = inventory.latest_products(conn, s["id"])
+        _, products = db.latest_products(conn, s["id"])
         if not products:
             continue
-        ranked = sorted((p for p in products if p.get("collection_position") is not None), key=lambda p: p["collection_position"])[:top_n]
-        chosen = {p["product_id"]: p for p in ranked}
+        newest = sorted((p for p in products if p.get("created_at")), key=lambda p: p["created_at"], reverse=True)[:top_n]
+        chosen = {p["product_id"]: p for p in newest}
         for p in products:
             pub = (p.get("published_at") or "")[:10]
             try:
@@ -118,11 +157,10 @@ def hero_queries(conn: sqlite3.Connection, today: str, top_n: int = 3, new_days:
                     chosen.setdefault(p["product_id"], p)
             except ValueError:
                 pass
-        vendor = conn.execute("SELECT vendor FROM products_daily WHERE store_id = ? AND vendor IS NOT NULL LIMIT 1", (s["id"],)).fetchone()
-        bw = brand_words_for(s["store_domain"], vendor[0] if vendor else None)
+        bw = brand_words_for(s["store_domain"], [p.get("title") for p in products])
         for p in chosen.values():
-            if inventory.is_excluded(p.get("title"), p.get("handle"), p.get("product_type"), p.get("tags")):
-                continue                 # shipping protection, gift cards, memberships: not products anyone copies
+            if is_excluded(p.get("title"), p.get("handle")):
+                continue
             q = distinctive_words(p.get("title") or "", bw)
             if len(q.split()) >= 2:
                 out.append({"store": s["store_domain"], "handle": p["handle"], "query": q, "title": p.get("title")})
@@ -340,7 +378,7 @@ def landing_urls(conn: sqlite3.Connection, domain: str, limit: int = 3) -> list[
                                        (domain, limit))]
 
 
-def follow_lander_urls(urls: list[str], domain: str, session=None, fetch=ad_metrics.fetch_landing, check=is_shopify,
+def follow_lander_urls(urls: list[str], domain: str, session=None, fetch=fetch_landing, check=is_shopify,
                        with_platform: bool = False):
     """For a non-store landing domain: open up to 3 of its ad landing pages, collect the shop domains they link to,
     and return the first that is a storefront (with its products). Pure HTTP, thread-safe."""
@@ -360,11 +398,11 @@ def follow_lander_urls(urls: list[str], domain: str, session=None, fetch=ad_metr
     return (None, [], None) if with_platform else (None, [])
 
 
-def follow_lander(conn: sqlite3.Connection, domain: str, session=None, fetch=ad_metrics.fetch_landing, check=is_shopify) -> tuple[str | None, list[dict]]:
+def follow_lander(conn: sqlite3.Connection, domain: str, session=None, fetch=fetch_landing, check=is_shopify) -> tuple[str | None, list[dict]]:
     return follow_lander_urls(landing_urls(conn, domain), domain, session, fetch=fetch, check=check)
 
 
-def classify_domain(domain: str, urls: list[str], session=None, check=is_shopify, fetch=ad_metrics.fetch_landing) -> dict:
+def classify_domain(domain: str, urls: list[str], session=None, check=is_shopify, fetch=fetch_landing) -> dict:
     """Stage 1 of triage, HTTP only (runs in a thread pool): Shopify storefront, a lander in front of one, or a funnel.
     Returns {type, store_domain, products, lander_domain}."""
     session = session or shopify.make_session()
@@ -377,7 +415,7 @@ def classify_domain(domain: str, urls: list[str], session=None, check=is_shopify
     return {"type": "funnel", "store_domain": domain, "products": [], "lander_domain": None}
 
 
-def classify_many(conn: sqlite3.Connection, domains: list[str], check=is_shopify, fetch=ad_metrics.fetch_landing,
+def classify_many(conn: sqlite3.Connection, domains: list[str], check=is_shopify, fetch=fetch_landing,
                   workers: int | None = None, deadline: float | None = None):
     """Yield (domain, classification) for many domains, checked concurrently (each on its own HTTP session).
     Per-hop resolution chatter is silenced (thousands of dead hosts); a progress line every 50 domains instead."""
@@ -414,7 +452,7 @@ def domain_ads(conn: sqlite3.Connection, domain: str, products: list[dict], toda
     pages = Counter((r["page_name"] or r["page_id"] or "") for r in rows)
     handles: Counter = Counter()
     for r in rows:
-        h, _ = ad_metrics.handle_from_url(r["landing_url"])
+        h = handle_from_url(r["landing_url"])
         if h:
             handles[h] += 1
     t = date.fromisoformat(today)
@@ -525,7 +563,7 @@ def _save(conn, rec: dict) -> None:
 
 def triage_domain(conn: sqlite3.Connection, browser, domain: str, source: str, today: str, session=None,
                   search=search_ads, check=is_shopify, follow=None, identity=store_age.fetch_identity,
-                  watchlist_path: Path | None = None, fetch=ad_metrics.fetch_landing, classified: dict | None = None,
+                  watchlist_path: Path | None = None, fetch=fetch_landing, classified: dict | None = None,
                   allow_search: bool = True, refetch: bool = True) -> dict:
     """Classify one domain, write its radar_domains row, promote when it qualifies. Returns the row (+ 'promoted', 'searched').
 
@@ -667,7 +705,7 @@ def import_folder(conn: sqlite3.Connection, today: str, folder: Path | None = No
 def run_radar(conn: sqlite3.Connection, browser, today: str, do_sweep: bool | None = None, session=None,
               search=search_ads, check=is_shopify, identity=store_age.fetch_identity, web_search=web_search_domains,
               watchlist_path: Path | None = None, wait=None, max_minutes: float | None = None,
-              fetch=ad_metrics.fetch_landing, workers: int | None = None) -> dict:
+              fetch=fetch_landing, workers: int | None = None) -> dict:
     """imports -> (weekly) hook + copycat sweeps -> classify every new landing domain (HTTP, threads) ->
     daily re-check of every candidate from stored facts -> Ad Library searches where they can change a verdict."""
     session = session or shopify.make_session()
