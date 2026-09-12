@@ -332,6 +332,10 @@ def cmd_add_store(args) -> int:
     conn = db.connect(args.db)
     domains = list(args.domains)
     if args.file:
+        if not Path(args.file).exists():
+            console.print(f"[red]{args.file} does not exist.[/] Create it first (Notepad is fine): one real domain per line, saved in this folder, "
+                          "then run the command again. Or list the domains on the command line instead of --file.")
+            return 2
         for line in Path(args.file).read_text(encoding="utf-8-sig").splitlines():
             line = line.strip().split(",")[0].strip()
             if line and not line.startswith("#") and "." in line:
