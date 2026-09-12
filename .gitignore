@@ -9,3 +9,4 @@ logs/
 .pytest_cache/
 pdp_output/
 data/shopify_token.json
+stores.txt

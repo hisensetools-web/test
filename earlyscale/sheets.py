@@ -29,7 +29,7 @@ TAB_ORDER = ("winners", "stores")
 TAB_NAMES = {"winners": "Winners", "stores": "Stores"}
 TAB_MODES = {"winners": "replace", "stores": "replace"}
 
-_watchlist_path = None   # set by set_watchlist_path(); None = default watchlist.csv
+_watchlist_path = None   # set by set_watchlist_path(); None = default stores.txt
 
 
 def set_watchlist_path(path) -> None:
@@ -39,7 +39,7 @@ def set_watchlist_path(path) -> None:
 
 
 def watched_store_ids(conn: sqlite3.Connection) -> set[int] | None:
-    """Stores currently in watchlist.csv (None = no watchlist, use every store in the DB).
+    """Stores currently in stores.txt (None = no watchlist, use every store in the DB).
     Removed stores keep their history in SQLite but drop out of the sheet."""
     domains = {r["store_domain"] for r in read_watchlist(_watchlist_path)}
     if not domains:

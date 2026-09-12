@@ -94,26 +94,34 @@ schtasks /Query /TN "ShopifyTracker Meta"  /V /FO LIST | findstr /C:"Last Run Ti
 `Cannot find path 'logs\run_<today>.log'` means the morning task has not run yet today. The 22:00 task names its
 log by the day it *started*, so last night is `meta_<yesterday>.log`. "Last Result: 0" = ran fine.
 
-## 5. Watchlist
+## 5. Stores: one file, `stores.txt`
 
-You only need domains. The night pass searches each domain in the Ad Library, which returns every Facebook page
-advertising it (the whitepage personas included); no page name is needed and none is looked up.
+`stores.txt` in the project folder is the whole store list: one domain per line. Open it in Notepad, add a line, save.
+Every command reads it fresh, so a store added today gets its catalogue at 09:00 and its ads at 22:00. Your old
+`watchlist.csv` was turned into `stores.txt` automatically the first time.
 
-```powershell
-python tracker.py add-store a.com b.com c.com          # add stores (as many as you like on one line)
-python tracker.py add-store --file domains.txt         # one domain per line (a CSV's first column works too)
-python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
-python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad
-python tracker.py prune-dead --apply                   # ...and remove them from the watchlist
-python tracker.py restore-stores --apply               # put removed stores back (all of them, or name domains after --apply)
-python tracker.py pages elivorahealth.com              # which pages advertise this domain (the same search the night pass runs)
-python tracker.py pages elivorahealth.com --set 2      # pin the store to page 2 only (rarely wanted; the domain search covers every page)
-python tracker.py ads --only a.com b.com               # scrape the new stores now instead of waiting for 22:00
+```
+elivorahealth.com
+gutbiowellness.com          # a comment after # is kept as the store's note
+somestore.com   page=123456789012345    # optional: pin the Meta pass to this one Facebook page
 ```
 
-Editing `watchlist.csv` by hand works the same way: one domain per line under `store_domain`, the other columns empty.
-Use the apex domain (`brand.com`, not `www.brand.com`). Keep one entry per advertiser: two entries sharing one
-Facebook page (luma.viture.com and viture.com) each get the same ads.
+Only the domain is needed. The night pass searches each domain in the Ad Library, which returns every Facebook page
+advertising it (the whitepage personas included). Use the apex domain (`brand.com`, not `www.brand.com`), one entry
+per advertiser.
+
+The same from the command line, if you prefer:
+
+```powershell
+python tracker.py add-store a.com b.com c.com          # appends lines to stores.txt (skips ones already there)
+python tracker.py add-store --file list.txt            # from another text file, one domain per line
+python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
+python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad
+python tracker.py prune-dead --apply                   # ...and remove them from stores.txt
+python tracker.py restore-stores --apply               # put removed stores back (all of them, or name domains after --apply)
+python tracker.py pages elivorahealth.com              # which pages advertise this domain (the same search the night pass runs)
+python tracker.py ads --only a.com b.com               # scrape new stores now instead of waiting for 22:00
+```
 
 ## 6. Settings (`.env`)
 

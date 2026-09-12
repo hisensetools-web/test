@@ -95,7 +95,7 @@ def cmd_run(args) -> int:
     snapshot_date = _parse_date(args.date)
     stores = read_watchlist(_wl(args))
     if not stores:
-        console.print("[red]watchlist is empty[/] - add stores with `python tracker.py add-store <domain>`")
+        console.print("[red]stores.txt is empty[/] - add domains to it (one per line) or run `python tracker.py add-store <domain>`")
         return 2
     conn = db.connect(args.db)
     only = set(args.only) if args.only else None
@@ -218,7 +218,7 @@ def cmd_ads(args) -> int:
     snapshot_date = _parse_date(args.date)
     stores = read_watchlist(_wl(args))
     if not stores:
-        console.print("[red]watchlist is empty[/]")
+        console.print("[red]stores.txt is empty[/] - add domains to it, one per line")
         return 2
     conn = db.connect(args.db)
     only = set(args.only) if args.only else None
@@ -327,7 +327,7 @@ def cmd_sync_sheets(args) -> int:
 # ---------------------------------------------------------------- watchlist
 
 def cmd_add_store(args) -> int:
-    """Add one or more stores to watchlist.csv (and the database). No Facebook page is needed: the Meta pass searches
+    """Add one or more stores to stores.txt (and the database). No Facebook page is needed: the Meta pass searches
     the Ad Library for the domain, which returns every page advertising it."""
     conn = db.connect(args.db)
     domains = list(args.domains)
@@ -353,8 +353,8 @@ def cmd_add_store(args) -> int:
         conn.commit()
         added += 1 if ok else 0
         console.print(f"[green]{'added' if ok else 'already listed'}[/] {domain}")
-    console.print(f"{added} of {len(domains)} added. Catalogue on the next `run`, ads on the next `ads` pass "
-                  "(python tracker.py ads --only <domain> to do one now).")
+    console.print(f"{added} of {len(domains)} added to {_wl(args) or config.WATCHLIST_PATH.name} (you can also edit that file directly, one domain per line). "
+                  "Catalogue on the next `run`, ads on the next `ads` pass (python tracker.py ads --only <domain> to do one now).")
     return 0
 
 
@@ -410,7 +410,7 @@ def cmd_prune_dead(args) -> int:
 
 
 def cmd_restore_stores(args) -> int:
-    """Put stores that are in the database but no longer in watchlist.csv back on it (undo of prune-dead / remove-store)."""
+    """Put stores that are in the database but no longer in stores.txt back on it (undo of prune-dead / remove-store)."""
     conn = db.connect(args.db)
     wl_path = _wl(args)
     listed = {s["store_domain"] for s in read_watchlist(wl_path)}
@@ -528,11 +528,11 @@ def _set_page(domain: str, name: str, page_id: str | None, args) -> None:
         conn.execute("UPDATE stores SET meta_page_name = ? WHERE store_domain = ?", (name, domain))
     conn.commit()
     if ok:
-        console.print(f"[green]set[/] {domain}: meta_page_name={name!r} meta_page_id={page_id or ''!r} (watchlist.csv + database). "
+        console.print(f"[green]set[/] {domain}: meta_page_name={name!r} meta_page_id={page_id or ''!r} (stores.txt + database). "
                       + (f"The Meta pass now searches only that page. Next: python tracker.py ads --only {domain}" if page_id
                          else "Without a page id the Meta pass still searches the domain; the name is a label."))
     else:
-        console.print(f"[yellow]{domain} is not in watchlist.csv[/]; the database row was updated. Add the store first (add-store).")
+        console.print(f"[yellow]{domain} is not in stores.txt[/]; the database row was updated. Add the store first (add-store).")
 
 
 def cmd_set_page(args) -> int:
@@ -722,7 +722,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("run", help="catalogue snapshot of every watchlist store (products.json: id, handle, title, dates) + shop id")
     s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today); re-running a date replaces it")
-    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.add_argument("--watchlist", help="alternate stores file")
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
     s.add_argument("--no-sync", action="store_true", help="skip the Google Sheets sync even if SHEETS_WEBHOOK_URL is set")
     s.add_argument("--ads", action="store_true", help="also scrape the Meta Ad Library (same as META_ADS=1 in .env)")
@@ -731,7 +731,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("ads", help="Meta Ad Library pass: every ad of each store (page, landing URL, start date, low-impression badge)")
     s.add_argument("--date", help="snapshot date YYYY-MM-DD (default today)")
-    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.add_argument("--watchlist", help="alternate stores file")
     s.add_argument("--only", nargs="+", metavar="DOMAIN", help="limit to these store domains")
     s.add_argument("--headed", action="store_true", help="show the browser window (debugging)")
     s.add_argument("--max-scrolls", type=int, help=f"scroll cap per page (default {config.META_MAX_SCROLLS})")
@@ -745,7 +745,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--date", help="as of this date (default: latest)")
     s.add_argument("--tabs", help="comma list from winners,stores (default both)")
     s.add_argument("--dry-run", action="store_true", help="build and size the chunks but send nothing")
-    s.add_argument("--watchlist", help="alternate watchlist.csv (only its stores are synced)")
+    s.add_argument("--watchlist", help="alternate stores.txt (only its stores are synced)")
     s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")
     s.add_argument("--no-verify", action="store_true", help="skip the read-back comparison after syncing")
     s.set_defaults(fn=cmd_sync_sheets)
@@ -774,21 +774,21 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("db-check", help="is data/tracker.db free to write? lists its files and the programs that could be holding it")
     s.set_defaults(fn=cmd_db_check)
 
-    s = sub.add_parser("add-store", help="add one or more stores to watchlist.csv (no Facebook page needed: the Meta pass searches the domain)")
+    s = sub.add_parser("add-store", help="add one or more stores to stores.txt (no Facebook page needed: the Meta pass searches the domain)")
     s.add_argument("domains", nargs="*", metavar="DOMAIN")
     s.add_argument("--file", help="a text file with one domain per line (a CSV's first column works too)")
     s.add_argument("--page-id", help="single domain only: pin the Meta pass to this one Facebook page instead of the domain search")
     s.add_argument("--notes")
-    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.add_argument("--watchlist", help="alternate stores file")
     s.set_defaults(fn=cmd_add_store)
 
-    s = sub.add_parser("remove-store", help="remove one or more domains from watchlist.csv")
+    s = sub.add_parser("remove-store", help="remove one or more domains from stores.txt")
     s.add_argument("domains", nargs="+")
-    s.add_argument("--watchlist", help="alternate watchlist.csv path")
+    s.add_argument("--watchlist", help="alternate stores file")
     s.set_defaults(fn=cmd_remove_store)
 
     s = sub.add_parser("prune-dead", help="list (and with --apply remove) watchlist domains that never returned a catalogue or an ad")
-    s.add_argument("--apply", action="store_true", help="remove them from watchlist.csv (history in the DB is kept)")
+    s.add_argument("--apply", action="store_true", help="remove them from stores.txt (history in the DB is kept)")
     s.add_argument("--watchlist")
     s.set_defaults(fn=cmd_prune_dead)
 

@@ -55,7 +55,7 @@ Families, Signals, Early, Pages, Ads, Products and Alerts tabs, and every alert 
 `run` (catalogues + shop id), `ads` (Ad Library pass within a time budget, least recently scraped store first),
 `sync-sheets`, `report` (the Winners tab in the terminal), `url <landing url>` (its time series), `status`, `diag`,
 `rebuild` (recompute url_daily from the stored ads), and the watchlist helpers (`add-store`, `remove-store`, `find-page`,
-`pages`, `set-page`, `prune-dead`, `restore-stores`, `db-check`). Stores are added by hand (domains only); there is no store discovery.
+`pages`, `set-page`, `prune-dead`, `restore-stores`, `db-check`). Stores are added by hand: `stores.txt`, one domain per line (optional `page=<id>` pin); there is no store discovery.
 
 ## Engineering rules
 - Python 3.11+, `requests`, `playwright`, `sqlite3`, `rich`. Keep dependencies minimal.

@@ -1,0 +1,8 @@
+# stores.txt: one store per line, the domain only. Copy this file to stores.txt (it is created for you from
+# watchlist.csv on the first run if you already had one) and add a line whenever you find a new store.
+# Every command reads the file fresh. Blank lines and # comments are ignored.
+# Optional on a line: page=<facebook page id> pins the Meta pass to that one page instead of the domain search;
+# a trailing # comment is kept as the store's note.
+elivorahealth.com
+gutbiowellness.com          # added 13 sep
+example-store.com   page=123456789012345

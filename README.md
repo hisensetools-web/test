@@ -94,9 +94,10 @@ cp .env.example .env          # SHEETS_WEBHOOK_URL for the sheet; everything els
 python tracker.py init-db     # creates data/tracker.db
 ```
 
-`watchlist.csv` ships with three test stores. Add yours with `python tracker.py add-store a.com b.com ...` or
-`add-store --file domains.txt`, or edit `watchlist.csv` directly. Only the domain is needed: the Meta pass searches
-the domain in the Ad Library, which returns every page advertising it. There is no automatic store discovery.
+The store list is `stores.txt`: one domain per line (see `stores.example.txt`), read fresh by every command, so
+adding a store is adding a line. `python tracker.py add-store a.com b.com ...` appends lines for you. Only the domain
+is needed: the Meta pass searches the domain in the Ad Library, which returns every page advertising it. An existing
+`watchlist.csv` is converted into `stores.txt` on the first run. There is no automatic store discovery.
 
 **Updating from the previous version:** the first command after `git pull` converts `data/tracker.db` to the new
 layout (ads and their daily rows are kept, the tables of the deleted signals are dropped, the file is compacted; a
@@ -178,7 +179,7 @@ python tracker.py sync-sheets               # sends it, then compares the sheet'
 | tab | rows | behaviour |
 |---|---|---|
 | **Winners** | one per landing URL with >= 3 delivering ads | rewritten every sync; columns and sort as above |
-| **Stores** | one per store in watchlist.csv | store, shop_id, store_age_days, products, ads_as_of, last error |
+| **Stores** | one per store in stores.txt | store, shop_id, store_age_days, products, ads_as_of, last error |
 
 Every sync first asks the deployed `Code.gs` which headers it writes and refuses to send rows when they differ
 from this code's columns (a stale deployment would put every value under the wrong header); it ends by reading the
@@ -202,7 +203,7 @@ Version: **New version** > Deploy. The URL stays the same.
 
 `python tracker.py ads` opens the public Ad Library in headless Chromium, one browser, one store at a time, with a
 random 3-8 s pause between scrolls and stores. It searches the store's domain as a keyword (every page whose ads
-show that domain, whitepage personas included; a `meta_page_id` in `watchlist.csv` pins a store to one page instead)
+show that domain, whitepage personas included; `page=<id>` on a store's line in `stores.txt` pins it to one page instead)
 for active ads, scrolls `META_MAX_SCROLLS` (20, about 350 newest ads) times and captures the
 GraphQL responses the page loads: ad id, page, start date, landing link. The "Low impression count" badge is not in
 those payloads; it is read off every rendered result card (before each scroll and at the end), so an ad whose card
@@ -280,7 +281,7 @@ sudo apt install -y git python3.11 python3.11-venv
 git clone <your repo url> tracker && cd tracker
 python3.11 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python -m playwright install --with-deps chromium
-# copy .env, watchlist.csv, calibration/ and data/tracker.db from the laptop to keep the history
+# copy .env, stores.txt, calibration/ and data/tracker.db from the laptop to keep the history
 mkdir -p logs && crontab -e
 ```
 
@@ -357,7 +358,7 @@ earlyscale/platforms.py catalogue adapters for the other storefront platforms
 earlyscale/store_age.py shop id extraction and the store age estimate (calibration/shop_ids.csv)
 earlyscale/sheets.py    Google Sheets sync client (rows, chunking, 302 + retry handling, verify, lock)
 earlyscale/ops.py       the diagnostics report
-earlyscale/watchlist.py watchlist.csv I/O
+earlyscale/watchlist.py stores.txt I/O (one domain per line)
 earlyscale/config.py    paths, .env loader, tunables
 sheets/Code.gs          Apps Script web app to paste into the Sheet's script editor
 tests/                  unit tests, fixture JSON, mock store server, fake Apps Script runtime (node), fake Ad Library page, replay.sh

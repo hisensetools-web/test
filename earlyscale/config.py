@@ -26,7 +26,7 @@ def load_dotenv(path: Path = ROOT / ".env") -> None:
 load_dotenv()
 
 DB_PATH = Path(os.environ.get("TRACKER_DB", ROOT / "data" / "tracker.db"))
-WATCHLIST_PATH = ROOT / "watchlist.csv"
+WATCHLIST_PATH = Path(os.environ.get("STORES_FILE", ROOT / "stores.txt"))   # one domain per line; created from watchlist.csv once
 
 REQUEST_TIMEOUT = (10, 30)  # (connect, read) seconds
 REQUEST_RETRIES = 3
