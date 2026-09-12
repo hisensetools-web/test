@@ -9,10 +9,12 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import random
 import sqlite3
 import time
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import requests
@@ -34,28 +36,14 @@ PRODUCTS_HEADERS = ["date", "store", "handle", "title", "published_at", "updated
                     "available variants", "total variants", "collection position"]
 ALERTS_HEADERS = ["date", "store", "handle", "rule", "detail", "created_at"]
 
-SIGNALS_HEADERS = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at",
-                   "days_since_created", "created_at", "relaunch",
-                   "price", "sold_out", "collection_rank", "collection_rank_delta_7d",
-                   "variants_of_family_published_7d", "ads_pointing_here", "ads_in_top5", "best_rank", "best_rank_delta_7d",
-                   "ads_delivering", "ads_delivering_7d_ago",
-                   "delivering_velocity_wow", "ads_low_impressions", "concepts_delivering", "ads_launched_7d", "ads_launched_prev_7d",
-                   "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d",
-                   "engagement_per_day",
-                   "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d",
-                   "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d",
-                   "units_per_day_wow", "store_badge"]
+SIGNALS_ROW_ORDER = ["store", "product family", "handle", "channel tag", "days_since_published", "published_at", "days_since_created", "created_at", "relaunch", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_in_top5", "best_rank", "best_rank_delta_7d", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "ads_low_impressions", "concepts_delivering", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "ads_as_of", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"]   # the order signals_rows_for_store builds
+SIGNALS_HEADERS = ["store", "product family", "handle", "ads_as_of", "channel tag", "days_since_published", "published_at", "days_since_created", "created_at", "relaunch", "price", "sold_out", "collection_rank", "collection_rank_delta_7d", "variants_of_family_published_7d", "ads_pointing_here", "ads_in_top5", "best_rank", "best_rank_delta_7d", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "ads_low_impressions", "concepts_delivering", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d", "landing_paths", "landing_paths_new_7d", "engagement_per_day", "days_running_max", "concept_status", "eu_reach_slope_7d", "comment_delta_1d", "signal_source", "inventory_tracked", "stock_level", "units_sold_1d", "units_per_day_7d", "units_per_day_wow", "store_badge"]   # sheet order: ads_as_of next to the handle so a stale row is obvious
 FAMILIES_HEADERS = ["store", "family", "title", "handles", "newest published_at", "oldest published_at",
                     "published 7d", "published 14d", "published 30d", "best collection rank", "handle list"]
 CATEGORIES_HEADERS = ["category", "stores", "families", "newest published_at", "families published 7d",
                       "store list", "example families"]
 
-EARLY_HEADERS = ["store", "handle", "product family", "days_since_created", "created_at", "relaunch", "days_since_published",
-                 "ads_in_top5", "best_rank", "best_rank_delta_7d",
-                 "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "concepts_delivering", "ads_pointing_here",
-                 "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d",
-                 "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level",
-                 "units_per_day_7d", "ads_as_of", "store_badge"]
+EARLY_HEADERS = ["store", "handle", "ads_as_of", "product family", "days_since_created", "created_at", "relaunch", "days_since_published", "ads_in_top5", "best_rank", "best_rank_delta_7d", "ads_delivering", "ads_delivering_7d_ago", "delivering_velocity_wow", "concepts_delivering", "ads_pointing_here", "ads_launched_7d", "ads_launched_prev_7d", "ad_velocity_wow", "pages_pointing_here", "pages_new_7d", "landing_paths_new_7d", "days_running_max", "concept_status", "price", "sold_out", "collection_rank", "stock_level", "units_per_day_7d", "store_badge"]
 EARLY_MAX_AGE_DAYS = 90
 ADS_HEADERS = ["store", "page name", "ad_id", "started", "days_running", "delivering", "low_impressions", "impression_rank",
                "landing_path", "resolved_product", "primary_text"]
@@ -273,7 +261,7 @@ def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[lis
     rows = [r for ctx in _contexts(conn, as_of) for r in signals.signals_rows_for_store(ctx)]
     # what we compare: ads in the impressions top 5 (desc) and the best-rank trend (climbing first), then the
     # delivering trend, then delivering ads, then launches this week (testing volume only), then youngest by created_at
-    H = SIGNALS_HEADERS
+    H = SIGNALS_ROW_ORDER
     itop, idelta = H.index("ads_in_top5"), H.index("best_rank_delta_7d")
     idl, iwow = H.index("ads_delivering"), H.index("delivering_velocity_wow")
     il, ip = H.index("ads_launched_7d"), H.index("ads_pointing_here")
@@ -289,7 +277,8 @@ def signals_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[lis
         days = r[icreated] if r[icreated] != "" else (r[ipub] if r[ipub] != "" else 10**6)
         return (-top, delta, -wow, -deliv, -launched, -pointing, days, r[0], r[2])
     rows.sort(key=key)
-    return rows
+    order = [SIGNALS_ROW_ORDER.index(h) for h in SIGNALS_HEADERS]
+    return [[r[i] for i in order] for r in rows]
 
 
 def _wow_value(cell) -> float:
@@ -586,12 +575,47 @@ def check_deployed_headers(session: requests.Session, url: str, tabs=TAB_ORDER) 
     return bad
 
 
+class SyncLock:
+    """Two syncs at once interleave their chunks and the replace-mode tabs end up holding a random subset of rows
+    (12 Sep: Signals held 5962 of 11114). One sync at a time per database: a lock file next to it."""
+
+    def __init__(self, path: Path | None = None):
+        self.path = path or (config.DB_PATH.parent / "sync.lock")
+        self.held = False
+
+    def __enter__(self):
+        try:
+            if self.path.exists():
+                age = time.time() - self.path.stat().st_mtime
+                if age < 3 * 3600:
+                    raise SheetsSyncError(f"another sync-sheets started {age / 60:.0f} min ago and has not finished ({self.path}); "
+                                          "wait for it, or delete the file if that process is gone")
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.path.write_text(f"{os.getpid()} {datetime.now().isoformat()}")
+            self.held = True
+        except OSError:
+            self.held = False
+        return self
+
+    def __exit__(self, *a):
+        if self.held:
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+
+
 def sync(conn: sqlite3.Connection, url: str, tabs=TAB_ORDER, as_of: str | None = None,
          session: requests.Session | None = None, dry_run: bool = False, check_headers: bool = True) -> list[dict]:
     """POST every tab. Returns one summary dict per tab: tab, rows, chunks, written, skipped.
     Refuses to write when the deployed Code.gs carries different headers than this code (column shift)."""
     if not url and not dry_run:
         raise SheetsSyncError("SHEETS_WEBHOOK_URL is not set (put it in .env)")
+    with SyncLock():
+        return _sync(conn, url, tabs, as_of, session, dry_run, check_headers)
+
+
+def _sync(conn, url, tabs, as_of, session, dry_run, check_headers) -> list[dict]:
     session = session or requests.Session()
     if url and not dry_run and check_headers:
         bad = check_deployed_headers(session, url, tabs)

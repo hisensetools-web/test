@@ -645,7 +645,9 @@ class AdVelocityTests(unittest.TestCase):
         rows = sheets.signals_rows(conn, "2026-09-07")
         self.assertEqual([r[2] for r in rows], ["launching", "pointed", "quiet-young"])
         i = sheets.SIGNALS_HEADERS.index("ads_launched_7d")
-        self.assertEqual(rows[0][i:i + 4], [2, 0, "new", "2026-09-07"])   # ads_as_of = the scrape the numbers come from
+        self.assertEqual(rows[0][i:i + 3], [2, 0, "new"])
+        self.assertEqual(rows[0][sheets.SIGNALS_HEADERS.index("ads_as_of")], "2026-09-07")   # ads_as_of = the scrape the numbers come from
+        self.assertEqual(sheets.SIGNALS_HEADERS.index("ads_as_of"), 3)                        # next to the handle, so a stale row is obvious
 
 
 class NoLockAcrossFetchTests(unittest.TestCase):

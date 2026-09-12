@@ -17,18 +17,21 @@ if (-not (Test-Path $bat)) { throw "run_daily.bat not found next to this script"
 
 # Exposed as an env var so the schtasks line below can be passed verbatim (--% stops
 # PowerShell's own argument parsing, which mangles embedded quotes differently in 5.1 vs 7).
+# The tasks run through run_hidden.vbs: no console window, so a run cannot be killed by closing one.
+$vbs = Join-Path $PSScriptRoot "run_hidden.vbs"
 $env:TRACKER_BAT = $bat
+$env:TRACKER_VBS = $vbs
 $env:TRACKER_TIME = $Time
-Write-Host "Running: schtasks /Create /TN ""ShopifyTracker Daily"" /TR ""\""$bat\"""" /SC DAILY /ST $Time /F"
-schtasks --% /Create /TN "ShopifyTracker Daily" /TR "\"%TRACKER_BAT%\"" /SC DAILY /ST %TRACKER_TIME% /F
+Write-Host "Running: schtasks /Create /TN ""ShopifyTracker Daily"" /TR ""wscript.exe \""$vbs\"""" /SC DAILY /ST $Time /F"
+schtasks --% /Create /TN "ShopifyTracker Daily" /TR "wscript.exe \"%TRACKER_VBS%\"" /SC DAILY /ST %TRACKER_TIME% /F
 if ($LASTEXITCODE -ne 0) { throw "schtasks failed with exit code $LASTEXITCODE" }
 if ($NoMeta) {
   schtasks /Delete /TN "ShopifyTracker Meta" /F 2>$null | Out-Null
   Write-Host "Meta night task not registered (-NoMeta); `run` will only include Meta if you run it by hand with --ads."
 } else {
   $env:TRACKER_META_TIME = $MetaTime
-  Write-Host "Running: schtasks /Create /TN ""ShopifyTracker Meta"" /TR ""\""$bat\"" meta"" /SC DAILY /ST $MetaTime /F"
-  schtasks --% /Create /TN "ShopifyTracker Meta" /TR "\"%TRACKER_BAT%\" meta" /SC DAILY /ST %TRACKER_META_TIME% /F
+  Write-Host "Running: schtasks /Create /TN ""ShopifyTracker Meta"" /TR ""wscript.exe \""$vbs\"" meta"" /SC DAILY /ST $MetaTime /F"
+  schtasks --% /Create /TN "ShopifyTracker Meta" /TR "wscript.exe \"%TRACKER_VBS%\" meta" /SC DAILY /ST %TRACKER_META_TIME% /F
   if ($LASTEXITCODE -ne 0) { throw "schtasks (meta) failed with exit code $LASTEXITCODE" }
 }
 

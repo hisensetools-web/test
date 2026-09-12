@@ -170,7 +170,20 @@ def _do_sheets_sync(conn, tabs=sheets.TAB_ORDER, as_of=None, dry_run=False, veri
     rc = _print_sync_summary(summaries, dry_run)
     if verify and not dry_run:
         rc = _verify_sheets(conn, as_of) or rc
+        if rc == 3 and not getattr(_do_sheets_sync, "_repairing", False):
+            # a replace-mode tab holding the wrong number of rows (a lost chunk, a concurrent writer): push it again once
+            bad = [t for t in tabs if sheets.TAB_MODES.get(t) == "replace" and sheets.TAB_NAMES[t] in _last_mismatched_tabs]
+            if bad:
+                console.print(f"[yellow]re-pushing {', '.join(sheets.TAB_NAMES[t] for t in bad)} once to repair the mismatch[/]")
+                _do_sheets_sync._repairing = True
+                try:
+                    rc = _do_sheets_sync(conn, tabs=bad, as_of=as_of, dry_run=False, verify=True)
+                finally:
+                    _do_sheets_sync._repairing = False
     return rc
+
+
+_last_mismatched_tabs: set[str] = set()
 
 
 def _verify_sheets(conn, as_of=None) -> int:
@@ -180,6 +193,8 @@ def _verify_sheets(conn, as_of=None) -> int:
     except sheets.SheetsSyncError as e:
         console.print(f"[yellow]could not verify the sheet:[/] {e}")
         return 0
+    _last_mismatched_tabs.clear()
+    _last_mismatched_tabs.update(x["tab"] for x in v["tabs"] if not x["ok"])
     t = Table(title="sheet vs database")
     for c in ("tab", "mode", "rows in DB", "rows in sheet", "ok"):
         t.add_column(c, justify="right" if "rows" in c else "left")

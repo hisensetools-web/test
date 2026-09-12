@@ -174,7 +174,7 @@ three tabs, each with a bold frozen header row:
 
 | tab | rows | behaviour |
 |---|---|---|
-| **Signals** | one per product (latest snapshot) | overwritten every sync; sorted by `ads_launched_7d` desc, then `ads_pointing_here` desc, then youngest product first. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then the Meta columns (`ads_pointing_here`, `ads_launched_7d`, `ads_launched_prev_7d`, `ad_velocity_wow` = launches this week / last week, `ads_as_of` = the date of the scrape those numbers come from, engagement, days running, concept status) and the six inventory columns (`signal_source`, `inventory_tracked`, `stock_level`, `units_sold_1d`, `units_per_day_7d`, `units_per_day_wow`) filled by the stock probe |
+| **Signals** | one per product (latest snapshot) | overwritten every sync; `ads_as_of` (the date of the ad snapshot the row's Meta numbers come from) sits right after the handle, because rows from different nights must not be compared as if they were the same day; sorted by `ads_launched_7d` desc, then `ads_pointing_here` desc, then youngest product first. Columns: store, product family, handle, channel tag (from handle suffix: google, tiktok, taboola, fb, otp, sub, coc, vip, retired, variant), days_since_published, published_at, price, sold_out, collection_rank (1 = top of /collections/all), collection_rank_delta_7d (positive = climbed vs the snapshot 7+ days ago), variants_of_family_published_7d, then the Meta columns (`ads_pointing_here`, `ads_launched_7d`, `ads_launched_prev_7d`, `ad_velocity_wow` = launches this week / last week, `ads_as_of` = the date of the scrape those numbers come from, engagement, days running, concept status) and the six inventory columns (`signal_source`, `inventory_tracked`, `stock_level`, `units_sold_1d`, `units_per_day_7d`, `units_per_day_wow`) filled by the stock probe |
 | **Ads** | one per active ad (latest snapshot, delivering first, newest first, 100 per store) | overwritten; page name, ad id, started, days running, delivering, low_impressions, impression_rank, landing_path, resolved_product, primary text (120 chars): the attribution behind every Signals number |
 | **Families** | one per product family per store | overwritten; a family = handles sharing a base name or normalised title. Handle count, newest/oldest published_at, launches in 7/14/30 days, best rank, handle list. Sorted by 7-day launches |
 | **Categories** | one per keyword category | overwritten; categories are title unigrams/bigrams shared by 2+ stores (nothing hardcoded), with store/family counts and newest publish date. Families with no shared keyword fall into `(uncategorised)` |
@@ -983,6 +983,11 @@ WHERE t.snapshot_date = date('now') AND t.price != y.price;
   as "VITURE") record the same ads under whichever was scraped last, and the other's counts drop to 0 (the pass
   warns "already recorded today under another watchlist store"). Keep one domain per advertiser:
   `python tracker.py remove-store luma.viture.com beast.viture.com`.
+- The scheduled tasks run through `run_hidden.vbs` (no console window): two runs died with a Ctrl+C exit code when
+  the window a task had opened was closed. Re-run `.\register_task.ps1` once after pulling this.
+- One `sync-sheets` at a time: a lock file (`data/sync.lock`, ignored after 3 h) refuses a second sync, because two
+  interleaved syncs leave a replace-mode tab with a random subset of rows (12 Sep: Signals held 5962 of 11114). A
+  tab whose row count still mismatches after a sync is pushed again once, automatically.
 - A missed 22:00 start (laptop asleep) that Task Scheduler catches up between 07:00 and 20:00 is skipped by
   `run_daily.bat meta` (logged), so the 8-hour night pass never runs on top of the morning task; tonight's start
   does it. A Chromium crash mid-pass ("Target crashed") is followed by a fresh browser for the next store.
