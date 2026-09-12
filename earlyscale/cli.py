@@ -327,18 +327,25 @@ def cmd_sync_sheets(args) -> int:
 # ---------------------------------------------------------------- watchlist
 
 def cmd_add_store(args) -> int:
-    domain = args.domain
-    meta_page = args.meta_page
-    if not meta_page and not args.no_discover:
-        console.print(f"looking for a Facebook page link on {domain} ...")
-        meta_page = shopify.discover_meta_page(domain)
-        console.print(f"  meta_page_name: [bold]{meta_page or '(not found; fill in watchlist.csv)'}[/]")
-    entry = {"store_domain": domain, "meta_page_name": meta_page or "", "meta_page_id": args.meta_page_id or "", "notes": args.notes or ""}
-    added = append_to_watchlist(entry, _wl(args))
+    """Add one or more stores to watchlist.csv (and the database). With one domain the Facebook page link is looked up
+    in the storefront footer unless --meta-page / --no-discover is given; with several, discovery runs for each."""
     conn = db.connect(args.db)
-    db.upsert_store(conn, entry["store_domain"] if added else domain.lower(), meta_page, args.meta_page_id, args.notes)
-    conn.commit()
-    console.print(f"[green]{'added' if added else 'already listed'}[/] {domain}")
+    added = 0
+    for domain in args.domains:
+        meta_page = args.meta_page if len(args.domains) == 1 else None
+        if not meta_page and not args.no_discover:
+            console.print(f"looking for a Facebook page link on {domain} ...")
+            meta_page = shopify.discover_meta_page(domain)
+            console.print(f"  meta_page_name: [bold]{meta_page or '(not found; set it later with find-page or set-page)'}[/]")
+        entry = {"store_domain": domain, "meta_page_name": meta_page or "", "meta_page_id": (args.meta_page_id or "") if len(args.domains) == 1 else "",
+                 "notes": args.notes or ""}
+        ok = append_to_watchlist(entry, _wl(args))
+        db.upsert_store(conn, entry["store_domain"] if ok else domain.lower(), meta_page, entry["meta_page_id"] or None, args.notes)
+        conn.commit()
+        added += 1 if ok else 0
+        console.print(f"[green]{'added' if ok else 'already listed'}[/] {domain}")
+    if len(args.domains) > 1:
+        console.print(f"{added} of {len(args.domains)} added. They get their catalogue on the next `run` and their ads on the next `ads` pass.")
     return 0
 
 
@@ -772,9 +779,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("db-check", help="is data/tracker.db free to write? lists its files and the programs that could be holding it")
     s.set_defaults(fn=cmd_db_check)
 
-    s = sub.add_parser("add-store", help="add a store to watchlist.csv (tries to discover its Facebook page)")
-    s.add_argument("domain")
-    s.add_argument("--meta-page", help="Meta page name (skips discovery)")
+    s = sub.add_parser("add-store", help="add one or more stores to watchlist.csv (tries to discover each one's Facebook page)")
+    s.add_argument("domains", nargs="+", metavar="DOMAIN")
+    s.add_argument("--meta-page", help="Meta page name (single domain only; skips discovery)")
     s.add_argument("--meta-page-id")
     s.add_argument("--notes")
     s.add_argument("--no-discover", action="store_true")

@@ -97,7 +97,8 @@ log by the day it *started*, so last night is `meta_<yesterday>.log`. "Last Resu
 ## 5. Watchlist
 
 ```powershell
-python tracker.py add-store x.com                      # add a store (finds its Facebook page)
+python tracker.py add-store x.com                      # add a store (finds its Facebook page in the footer)
+python tracker.py add-store a.com b.com c.com          # add several at once
 python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
 python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad
 python tracker.py prune-dead --apply                   # ...and remove them from the watchlist
