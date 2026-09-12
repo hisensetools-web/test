@@ -95,8 +95,8 @@ python tracker.py init-db     # creates data/tracker.db
 ```
 
 `watchlist.csv` ships with three test stores. Add yours with `python tracker.py add-store somestore.com` (finds the
-Facebook page link in the storefront footer; `find-page` searches the Ad Library when there is none) or drop a list
-into `radar/imports/`.
+Facebook page link in the storefront footer; `find-page` searches the Ad Library when there is none) or edit
+`watchlist.csv` directly. There is no automatic store discovery: the watchlist is yours.
 
 **Updating from the previous version:** the first command after `git pull` converts `data/tracker.db` to the new
 layout (ads and their daily rows are kept, the tables of the deleted signals are dropped, the file is compacted; a
@@ -107,8 +107,7 @@ few minutes for a 1.4 GB file, once). Then paste `sheets/Code.gs` again and depl
 ```bash
 python tracker.py run                    # catalogues + shop ids for every store, then a Sheets sync (~10 min for 150 stores)
 python tracker.py ads --max-minutes 480  # Ad Library pass, least recently scraped store first, within the budget (~3 min per store)
-python tracker.py radar                  # store discovery (Sundays: weekly sweeps, then triage)
-python tracker.py sync-sheets            # Winners / Stores / Candidates -> the Google Sheet, with a row-count check
+python tracker.py sync-sheets            # Winners / Stores -> the Google Sheet, with a row-count check
 ```
 
 `run --ads` (or `META_ADS=1`) chains the Meta pass after the catalogues. Every pass writes as it goes; Ctrl+C keeps
@@ -152,7 +151,7 @@ python tracker.py rebuild                                 # recompute url_daily 
 
 ## Google Sheets sync
 
-Pushes the three tabs into a Google Sheet through a Google Apps Script **web app**. No Google Cloud project, no
+Pushes the two tabs into a Google Sheet through a Google Apps Script **web app**. No Google Cloud project, no
 service account, no API keys: you paste one file into the Apps Script editor and copy one URL back. The code you
 paste is [`sheets/Code.gs`](sheets/Code.gs).
 
@@ -180,7 +179,6 @@ python tracker.py sync-sheets               # sends it, then compares the sheet'
 |---|---|---|
 | **Winners** | one per landing URL with >= 3 delivering ads | rewritten every sync; columns and sort as above |
 | **Stores** | one per store in watchlist.csv | store, shop_id, store_age_days, products, ads_as_of, last error |
-| **Candidates** | one per Radar domain (candidates first) | rewritten after the `promote` column has been read back |
 
 Every sync first asks the deployed `Code.gs` which headers it writes and refuses to send rows when they differ
 from this code's columns (a stale deployment would put every value under the wrong header); it ends by reading the
@@ -228,103 +226,6 @@ pages per run, cached in `product_pages`). Every adapter yields the same product
 page path). Dates a platform does not publish are filled with the day this tracker first saw the product; products
 already present on the store's first snapshot get no date (unknown age) rather than "today".
 
-## Radar: finding stores before they are on the watchlist
-
-`python tracker.py radar` discovers new Shopify stores from the Ad Library and decides, per store,
-whether it goes straight onto the watchlist or waits on a **Candidates** tab. The night task runs it
-after the Meta pass; on Sundays (`RADAR_SWEEP_WEEKDAY=6`) it also runs the weekly sweeps.
-
-### Sources
-
-1. **Hook sweeps** (`radar/hooks.txt`, one phrase per line, `#` comments). Each phrase is searched
-   in the Ad Library (US, active ads, unordered keyword match, up to `RADAR_MAX_ADS_PER_QUERY=500`
-   ads per phrase). Every ad is stored in `radar_ads` with its page name, page id, landing domain,
-   body length and start date; the landing domain is what gets triaged.
-2. **Copycat search**: for every watchlist store's hero products (the 3 newest by `created_at` plus
-   anything published in the last 30 days) the distinctive words of the title, minus the store's
-   own brand words (the domain label and any word that opens several titles), become an Ad Library query, so stores selling the same product show up. The
-   same words go to a web search (DuckDuckGo HTML, `RADAR_WEB_SEARCH=1`, `RADAR_MAX_WEB_QUERIES`)
-   and every result domain is kept for triage. Copycat queries rotate: `RADAR_MAX_COPYCAT_QUERIES`
-   least-recently-searched ones per sweep.
-3. **Manual import**: `python tracker.py radar-add <domain or url> ...`, or drop a `.txt`/`.csv`
-   into `radar/imports/` (one domain per line, or any CSV with a domain / website / url / landing / link
-   column, e.g. an ad-spy export). These skip triage and go straight onto the watchlist with
-   `source=manual`; processed files move to `radar/imports/done/`.
-
-### Triage (every new landing domain, then every Candidates row again daily)
-
-A sweep of 80 phrases returns a few thousand distinct landing domains, so triage is split into a cheap
-stage that runs on all of them and an expensive stage that runs only where it can change the verdict.
-
-**Stage 1, HTTP only, `RADAR_CHECK_WORKERS` (6) domains at a time:**
-
-1. Is it a storefront on any platform (`platforms.is_store`: Shopify, headless Shopify, WooCommerce,
-   Squarespace, Magento, BigCommerce, Wix, or any site with a product sitemap and JSON-LD)? If not, the
-   lander's outbound links (buy buttons, checkout, "shop now") are followed one hop; if one of them is a
-   store, that store is the candidate (`store_domain`) and the lander is remembered in `lander_domain`.
-   Still nothing: it is a **funnel**. With `RADAR_FUNNEL_MIN_ADS` (3) or more sweep ads pointing at it,
-   it is parked as `type=funnel` and its ads, pages and landing URLs are tracked; with fewer it is
-   `discarded` (news sites, app stores, one-off landers) and comes back automatically the day a later
-   sweep brings its count to the threshold.
-2. Store age: `store_age_days` from the earliest product `created_at` (or the shop-id calibration
-   when one exists; it is optional). `store_first_created` and `store_created_est` are both shown.
-3. From the ads radar has already seen: `active_ads` (a lower bound until the domain is searched),
-   `ads_in_sweeps`, `pages`, `top page`, an example ad text, and `hot new product` = a product
-   published in the last 30 days with 3 or more ads pointing at it.
-
-**Stage 2, one Ad Library search per domain (minutes each), up to `RADAR_MAX_TRIAGE` (40) per run,
-most sweep ads first:** the store's top pages (up to 3, by `page_id`) are searched for all their
-active ads, or the domain as a keyword when no page is known. Only domains where the answer can change
-the verdict get one: Shopify stores that are young (`<= RADAR_MAX_AGE_DAYS`) or have a hot new product
-and are still under `RADAR_MIN_ACTIVE_ADS`, and funnels over the ad threshold. An old store without a
-hot product is parked without a search (nothing it could return would promote it) and is searched
-the week its catalogue refresh shows a new product. `searched_at` on the tab says when a domain was
-last searched; a domain is not searched again within `RADAR_RESEARCH_DAYS` (7).
-
-**Promote** when `(store_age_days <= RADAR_MAX_AGE_DAYS (180) OR hot new product) AND active_ads >= RADAR_MIN_ACTIVE_ADS (10)`.
-Promotion appends the store to `watchlist.csv` with the note `radar: <source> <date>` (plus
-`via <lander>` when it was reached through a funnel page) and it gets its first Shopify snapshot on
-the next morning run.
-Everything else is a **candidate**: every night its facts are recomputed (age moves, new sweep ads,
-`promote` marks) and it is promoted the day it crosses; Shopify candidates get their catalogue re-read
-every `RADAR_REFRESH_DAYS` (7) so a new product makes them eligible. To force one, type `Y` in the
-`promote` column of the Candidates tab; the next `sync-sheets` reads the marks back and the next
-radar run promotes those domains without waiting for a search.
-
-There is no copy-length filter anywhere.
-
-### Candidates tab
-
-`domain, type (shopify / funnel), status (candidate / promoted), first_seen, store_age_days,
-store_created_est, store_first_created, products, active_ads, ads_in_sweeps, searched_at, pages, top page,
-example ad text (200 chars), hot new product, source (hook:<phrase> / copycat:<store>/<handle> /
-web:<store>/<handle> / manual), lander_domain, last_checked, promote`. Candidates first (most active
-ads first), then promoted rows. Discarded domains are kept in the database (`radar_domains`) but not shown.
-
-### Budget, resume and schedule
-
-One radar run is capped at `RADAR_MAX_MINUTES` (240); the sweeps stop `RADAR_TRIAGE_MINUTES` (60)
-before that so classification and searches always get their turn. A phrase searched successfully in
-the last `RADAR_RESWEEP_DAYS` (6) days is skipped, so a sweep that crashed, was interrupted or ran out
-of budget continues where it stopped when you run it again (and finishes next Sunday otherwise).
-Stage 1 checks every new domain; stage 2 searches are capped per run and the rest wait for the next
-night. Every search waits the same random 3-8 s as the Meta scraper and uses one browser. A first
-sweep of 80 phrases takes about 3.5 h at 500 ads per phrase; if it keeps running short, halve the
-symptom group in `hooks.txt` first or raise the budget.
-
-Radar shares `data/tracker.db` with the other commands. The connection waits up to 60 s for another
-tracker command to finish writing and retries a write that still finds the database locked, so
-running `run` or `sync-sheets` while a sweep is going is safe; a phrase whose ads could not be stored
-is logged and searched again next time.
-
-### Hook yield (keeping `hooks.txt` honest)
-
-`radar-report` (and the end of every sweep) prints one row per phrase: sweeps run, ads seen, distinct
-landing domains, how many of those were promoted, how many are parked Shopify candidates, how many
-funnels, how many discarded, and a verdict. A phrase gets credit for every ad it returned, even when
-another phrase returned the same ad first. `delete` = zero promotable stores across two or more sweeps; `add siblings` = the top
-producers. Edit `radar/hooks.txt` accordingly; the next sweep picks up the new list.
-
 ## Diagnostics without pasting: the "EarlyScale Diag" doc
 
 `python tracker.py diag` collects a read-only report and writes it to a Google Doc named **EarlyScale Diag** in the
@@ -344,7 +245,7 @@ Two tasks, so the morning numbers are ready quickly and the slow Meta pass runs 
 | task | when | what | takes |
 |---|---|---|---|
 | ShopifyTracker Daily | 09:00 | `run_daily.bat`: catalogues + shop ids, Sheets sync, diag | about 10 min for 150 stores |
-| ShopifyTracker Meta | 22:00 | `run_daily.bat meta`: Ad Library pass until `META_NIGHT_MINUTES` (600) or 08:30, then `radar`, then a Sheets sync, diag | about 3 min per store |
+| ShopifyTracker Meta | 22:00 | `run_daily.bat meta`: Ad Library pass until `META_NIGHT_MINUTES` (600) or 08:30, then a Sheets sync, diag | about 3 min per store |
 
 Register both from PowerShell in the project folder (re-run to change the times):
 
@@ -385,7 +286,7 @@ mkdir -p logs && crontab -e
 ```
 0 9  * * * cd /home/you/tracker && .venv/bin/python tracker.py run --no-ads            >> logs/run_$(date +\%F).log  2>&1
 0 22 * * * cd /home/you/tracker && .venv/bin/python tracker.py ads --max-minutes 600   >> logs/meta_$(date +\%F).log 2>&1
-30 8 * * * cd /home/you/tracker && .venv/bin/python tracker.py radar                   >> logs/meta_$(date +\%F).log 2>&1 && .venv/bin/python tracker.py sync-sheets >> logs/meta_$(date +\%F).log 2>&1
+30 8 * * * cd /home/you/tracker && .venv/bin/python tracker.py sync-sheets             >> logs/meta_$(date +\%F).log 2>&1
 ```
 
 From a datacenter IP Facebook shows login walls more often than from a home connection, and only one machine should
@@ -401,7 +302,6 @@ run the passes (move `data/tracker.db` once and delete the Windows tasks).
 | `ads_daily` | ad per scrape day | still_active, low_impressions (1 / 0 / NULL unknown), position |
 | `url_daily` | landing path per store per scrape day | delivering, delivering_7d_ago, proven_days, pages, pages_new_7d, top_page, family |
 | `meta_page_runs`, `runs`, `store_runs` | pass / store run | status, errors, durations |
-| `radar_domains`, `radar_ads`, `radar_ad_hits`, `radar_runs` | Radar | see the Radar section |
 
 History is never overwritten; re-running a date replaces that date's rows for the store. `python tracker.py rebuild`
 recomputes `url_daily` from `ads` / `ads_daily` at any time.
@@ -433,7 +333,7 @@ python -m unittest discover -s tests -v
 bash tests/replay.sh                        # Linux / macOS / WSL, needs node: two scheduled days against the fakes
 ```
 
-The replay runs the morning `run --no-ads`, the night `ads`, `radar` and `sync-sheets` for 2026-09-03 and then
+The replay runs the morning `run --no-ads`, the night `ads` and `sync-sheets` for 2026-09-03 and then
 2026-09-10 (mutated catalogues, ads a week older) against mock Shopify stores (`tests/mock_store.py`), a fake Ad
 Library page with the badge on some cards (`tests/fake_ad_library.py`) and the real `Code.gs` inside
 `tests/fake_gas.js`, then prints the sheet-vs-database table and the day-2 Winners. Every step must exit 0 and no log
@@ -447,19 +347,17 @@ tracker.py              CLI entry point
 run_daily.bat           Windows daily runner (day / meta modes; logs to logs\)
 run_hidden.vbs          runs run_daily.bat without a console window (used by the scheduled tasks)
 register_task.ps1       registers the two Task Scheduler tasks
-earlyscale/cli.py       commands: run, ads, radar, sync-sheets, report, url, status, diag, rebuild, watchlist helpers
+earlyscale/cli.py       commands: run, ads, sync-sheets, report, url, status, diag, rebuild, watchlist helpers
 earlyscale/db.py        schema, migration from the previous layout, snapshot writers
 earlyscale/winners.py   landing path normalisation, product families, url_daily, the Winners / Stores rows
 earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture + card badges), recording
 earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + normaliser + Meta page discovery
 earlyscale/platforms.py catalogue adapters for the other storefront platforms
 earlyscale/store_age.py shop id extraction and the store age estimate (calibration/shop_ids.csv)
-earlyscale/radar.py     store discovery: hook/copycat/web sweeps, triage, Candidates tab, watchlist promotion, hook yield
 earlyscale/sheets.py    Google Sheets sync client (rows, chunking, 302 + retry handling, verify, lock)
 earlyscale/ops.py       the diagnostics report
 earlyscale/watchlist.py watchlist.csv I/O
 earlyscale/config.py    paths, .env loader, tunables
 sheets/Code.gs          Apps Script web app to paste into the Sheet's script editor
-radar/hooks.txt         hook phrases for the weekly sweep; radar/imports/ for manual domain lists
 tests/                  unit tests, fixture JSON, mock store server, fake Apps Script runtime (node), fake Ad Library page, replay.sh
 ```

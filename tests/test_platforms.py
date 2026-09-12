@@ -1,12 +1,12 @@
 """Catalogue adapters for non-Shopify platforms: parsers, detection, each adapter against a mock store, dates,
-the daily pass end to end and Radar on a WooCommerce store."""
+and the daily pass end to end."""
 import json
 import threading
 import unittest
 from http.server import HTTPServer
 from unittest import mock
 
-from earlyscale import config, db, platforms, radar, sheets, shopify
+from earlyscale import config, db, platforms, sheets, shopify
 from earlyscale.cli import run_products_pass
 from tests import mock_platforms
 
@@ -190,19 +190,6 @@ class DailyPassTests(unittest.TestCase):
         finally:
             for srv, _ in servers:
                 srv.shutdown()
-
-
-class RadarPlatformTests(unittest.TestCase):
-    def test_woocommerce_store_is_classified_by_platform(self):
-        srv, base = serve("woocommerce")
-        try:
-            cls = radar.classify_domain(base, [], shopify.make_session())
-            self.assertEqual((cls["type"], cls["store_domain"], len(cls["products"])), ("woocommerce", base, 3))
-            rec = {"type": "woocommerce", "store_age_days": 30, "hot_new_product": None, "status": "candidate", "active_ads": 2}
-            self.assertTrue(radar._eligible(rec))
-            self.assertTrue(radar._needs_search(rec, TODAY))
-        finally:
-            srv.shutdown()
 
 
 if __name__ == "__main__":

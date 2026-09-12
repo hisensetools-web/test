@@ -109,7 +109,7 @@ class ConnectSetupTests(unittest.TestCase):
 
 class MigrationTests(unittest.TestCase):
     """A database from the previous layout (meta_ads / meta_ads_daily, the wide products_daily, a dozen signal tables)
-    is carried over: ads and their daily rows are kept, everything else is dropped, url_daily is derived."""
+    is carried over: ads and their daily rows are kept, everything else (the Radar tables included) is dropped, url_daily is derived."""
 
     OLD_SCHEMA = """
     CREATE TABLE stores (id INTEGER PRIMARY KEY, store_domain TEXT NOT NULL UNIQUE, meta_page_name TEXT, meta_page_id TEXT, notes TEXT,
@@ -159,7 +159,8 @@ class MigrationTests(unittest.TestCase):
             raw.close()
             conn = db.connect(path)
             tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-            for gone in ("meta_ads", "meta_ads_daily", "variants_daily", "landing_pages", "rank_checks", "alerts", "fb_posts", "fb_posts_daily", "products_daily_old"):
+            for gone in ("meta_ads", "meta_ads_daily", "variants_daily", "landing_pages", "rank_checks", "alerts", "fb_posts", "fb_posts_daily",
+                         "products_daily_old", "radar_domains"):
                 self.assertNotIn(gone, tables)
             self.assertEqual([r[1] for r in conn.execute("PRAGMA table_info(products_daily)")],
                              ["snapshot_date", "store_id", "product_id", "handle", "title", "created_at", "published_at", "updated_at", "url_path", "fetched_at"])

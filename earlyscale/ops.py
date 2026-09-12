@@ -72,7 +72,7 @@ def collect_diag(conn: sqlite3.Connection, notes: list[str] | None = None, max_c
     add(f"host: {platform.node()} {platform.system()} {platform.release()}; python {platform.python_version()}; cwd {ROOT}")
     add(f"code: {git_head()}")
     add(f"config: META_MAX_SCROLLS={config.META_MAX_SCROLLS} META_NIGHT_MINUTES={os.environ.get('META_NIGHT_MINUTES', '600')} "
-        f"META_STOP_AT={config.META_STOP_AT or '-'} RADAR_MAX_MINUTES={config.RADAR_MAX_MINUTES:.0f} "
+        f"META_STOP_AT={config.META_STOP_AT or '-'} "
         f"SHEETS_WEBHOOK_URL={'set' if config.SHEETS_WEBHOOK_URL else 'MISSING'}")
     for n in notes or []:
         add(f"note: {n}")

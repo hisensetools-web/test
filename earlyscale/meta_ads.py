@@ -230,8 +230,8 @@ class BrowserHandle:
 
 
 class LazyBrowser:
-    """A BrowserHandle that starts Playwright only when a browser is first needed (a radar run with nothing to
-    search must not start and stop the driver for nothing)."""
+    """A BrowserHandle that starts Playwright only when a browser is first needed (a command that opens no page
+    must not start and stop the driver for nothing)."""
 
     def __init__(self, headless: bool = True):
         self.headless, self.pw, self.handle, self.relaunches = headless, None, None, 0

@@ -1,7 +1,6 @@
 """Google Sheets sync via an Apps Script web app (sheets/Code.gs).
 
-Three tabs: Winners (one row per landing URL with >= 3 delivering ads), Stores, Candidates (Radar). Rows come
-from winners.py / radar.py, are cut into JSON chunks under SHEETS_CHUNK_BYTES, POSTed one by one (following the
+Two tabs: Winners (one row per landing URL with >= 3 delivering ads) and Stores. Rows come from winners.py, are cut into JSON chunks under SHEETS_CHUNK_BYTES, POSTed one by one (following the
 302 that Apps Script answers POSTs with, retrying on 5xx / network errors / Google's response-host hiccups), and
 the tab counts are read back afterwards to verify the sheet holds what the database holds.
 """
@@ -19,16 +18,16 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 
-from . import config, radar, winners
+from . import config, winners
 from .watchlist import read_watchlist
 
 log = logging.getLogger("earlyscale.sheets")
 
 WINNERS_HEADERS = winners.WINNERS_HEADERS
 STORES_HEADERS = winners.STORES_HEADERS
-TAB_ORDER = ("winners", "stores", "candidates")
-TAB_NAMES = {"winners": "Winners", "stores": "Stores", "candidates": "Candidates"}
-TAB_MODES = {"winners": "replace", "stores": "replace", "candidates": "replace"}
+TAB_ORDER = ("winners", "stores")
+TAB_NAMES = {"winners": "Winners", "stores": "Stores"}
+TAB_MODES = {"winners": "replace", "stores": "replace"}
 
 _watchlist_path = None   # set by set_watchlist_path(); None = default watchlist.csv
 
@@ -70,29 +69,6 @@ def winners_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[lis
 
 def stores_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
     return winners.stores_rows(conn, _stores(conn), as_of)
-
-
-def candidates_rows(conn: sqlite3.Connection, as_of: str | None = None) -> list[list]:
-    return radar.candidates_rows(conn)
-
-
-def read_promote_marks(conn: sqlite3.Connection, url: str, session: requests.Session | None = None, retries: int = 3) -> int:
-    """Before rewriting the Candidates tab, read its domain + promote columns back and honour any Y."""
-    session = session or requests.Session()
-    last: Exception | None = None
-    for attempt in range(retries):
-        try:
-            data = get_json(session, url, {"tab": TAB_NAMES["candidates"], "rows": "1", "cols": "domain,promote"})
-            n = radar.apply_promote_marks(conn, data.get("rows") or [])
-            if n:
-                log.info("sheets: %d promote mark(s) read back from the Candidates tab", n)
-            return n
-        except SheetsSyncError as e:
-            last = e
-            if attempt < retries - 1:
-                time.sleep(5 * (attempt + 1))
-    log.warning("sheets: could not read Candidates back after %d tries (%s); promote marks not applied this time", retries, last)
-    return 0
 
 
 # ---------------------------------------------------------------- chunking
@@ -275,7 +251,7 @@ def verify(conn: sqlite3.Connection, url: str, as_of: str | None = None, session
 # ---------------------------------------------------------------- orchestration
 
 def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = None) -> list[dict]:
-    builders = {"winners": winners_rows, "stores": stores_rows, "candidates": candidates_rows}
+    builders = {"winners": winners_rows, "stores": stores_rows}
     plan = []
     for tab in TAB_ORDER:
         if tab not in tabs:
@@ -290,7 +266,7 @@ def build_plan(conn: sqlite3.Connection, tabs=TAB_ORDER, as_of: str | None = Non
 
 
 def expected_headers() -> dict[str, list[str]]:
-    return {"Winners": WINNERS_HEADERS, "Stores": STORES_HEADERS, "Candidates": radar.CANDIDATES_HEADERS}
+    return {"Winners": WINNERS_HEADERS, "Stores": STORES_HEADERS}
 
 
 def check_deployed_headers(session: requests.Session, url: str, tabs=TAB_ORDER) -> list[str]:
@@ -359,8 +335,6 @@ def _sync(conn, url, tabs, as_of, session, dry_run, check_headers) -> list[dict]
             raise SheetsSyncError(f"the deployed Code.gs writes different columns than this code for: {', '.join(bad)}. "
                                   "Every value would land under the wrong header. Paste sheets/Code.gs into the Apps Script editor "
                                   "and Deploy > Manage deployments > Edit > New version, then sync again.")
-    if "candidates" in tabs and url and not dry_run:
-        read_promote_marks(conn, url, session)
     summaries = []
     for item in build_plan(conn, tabs, as_of):
         n = len(item["chunks"])

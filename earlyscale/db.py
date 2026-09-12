@@ -160,85 +160,20 @@ CREATE TABLE IF NOT EXISTS meta_page_runs (
     ran_at          TEXT NOT NULL
 );
 
--- Radar: store discovery. One row per landing domain ever seen by a sweep or import.
-CREATE TABLE IF NOT EXISTS radar_domains (
-    domain              TEXT PRIMARY KEY,
-    type                TEXT,               -- shopify | funnel | not-shopify
-    status              TEXT NOT NULL,      -- candidate | promoted | discarded | watchlist
-    source              TEXT,               -- hook:<phrase> | copycat:<handle> | web:<query> | manual
-    first_seen          TEXT NOT NULL,
-    last_checked        TEXT,
-    lander_domain       TEXT,
-    shop_id             INTEGER,
-    store_created_est   TEXT,
-    store_first_created TEXT,
-    store_age_days      INTEGER,
-    products            INTEGER,
-    active_ads          INTEGER,
-    pages               INTEGER,
-    top_page            TEXT,
-    hot_new_product     TEXT,
-    example_text        TEXT,
-    promote_flag        TEXT,
-    promoted_at         TEXT,
-    note                TEXT,
-    searched_at         TEXT,
-    ads_in_sweeps       INTEGER,
-    products_fetched    TEXT,
-    handles_new         TEXT,
-    store_domain        TEXT
-);
-CREATE TABLE IF NOT EXISTS radar_ads (
-    ad_id           TEXT PRIMARY KEY,
-    query           TEXT,
-    source          TEXT,
-    page_id         TEXT,
-    page_name       TEXT,
-    landing_url     TEXT,
-    landing_domain  TEXT,
-    body_len        INTEGER,
-    body_snippet    TEXT,
-    start_date      TEXT,
-    first_seen      TEXT NOT NULL,
-    last_seen       TEXT NOT NULL,
-    is_active       INTEGER
-);
-CREATE INDEX IF NOT EXISTS idx_radar_ads_domain ON radar_ads(landing_domain);
-CREATE TABLE IF NOT EXISTS radar_ad_hits (
-    ad_id           TEXT NOT NULL,
-    source          TEXT NOT NULL,
-    query           TEXT,
-    landing_domain  TEXT,
-    seen            TEXT,
-    PRIMARY KEY (ad_id, source)
-);
-CREATE INDEX IF NOT EXISTS idx_radar_hits_source ON radar_ad_hits(source);
-CREATE INDEX IF NOT EXISTS idx_radar_hits_domain ON radar_ad_hits(landing_domain);
-CREATE TABLE IF NOT EXISTS radar_runs (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind        TEXT NOT NULL,      -- sweep | copycat | web | triage | import
-    query       TEXT,
-    started_at  TEXT NOT NULL,
-    ended_at    TEXT,
-    ads_found   INTEGER,
-    domains_found INTEGER,
-    note        TEXT
-);
 CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at TEXT NOT NULL);
 """
 
 # Tables of the previous layout that carry nothing the six data points need. Dropped by the migration.
 OBSOLETE_TABLES = ("variants_daily", "meta_ads_daily", "meta_ads", "meta_concepts_daily", "meta_pages_daily", "landing_pages",
                    "meta_ad_detail_daily", "meta_page_likes_daily", "meta_creatives", "fb_posts_daily", "fb_posts", "rank_checks",
-                   "hero_variants", "inventory_daily", "alerts", "products_daily_old")
+                   "hero_variants", "inventory_daily", "alerts", "products_daily_old",
+                   "radar_domains", "radar_ads", "radar_ad_hits", "radar_runs")
 
 # Columns added to a table after it was first created (ALTER is idempotent via the column check).
 MIGRATION_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "stores": [("shop_id", "INTEGER"), ("myshopify", "TEXT"), ("shop_id_source", "TEXT"), ("shop_id_checked_at", "TEXT"),
                ("shop_id_error", "TEXT"), ("store_created_est", "TEXT"), ("store_created_method", "TEXT"),
                ("platform", "TEXT"), ("platform_base", "TEXT"), ("platform_checked_at", "TEXT"), ("platform_note", "TEXT")],
-    "radar_domains": [("searched_at", "TEXT"), ("ads_in_sweeps", "INTEGER"), ("products_fetched", "TEXT"), ("handles_new", "TEXT"),
-                      ("store_domain", "TEXT")],
 }
 
 # One-off steps, applied once each (recorded in schema_migrations) and part of the schema stamp. The names of the
@@ -248,6 +183,7 @@ MIGRATION_STEPS: list[tuple[str, str]] = [
     ("2026-09-10-refetch-ambiguous-landers", ""),
     ("2026-09-10-landing-resolver-version", ""),
     ("2026-09-13-six-data-points", "six_data_points"),      # python step, see _migrate_six_data_points
+    ("2026-09-13-drop-radar", "drop_radar"),
 ]
 
 
@@ -342,6 +278,13 @@ def _migrate(conn: sqlite3.Connection) -> bool:
             continue
         if step == "six_data_points":
             dropped = _migrate_six_data_points(conn) or dropped
+        elif step == "drop_radar":
+            for t in ("radar_domains", "radar_ads", "radar_ad_hits", "radar_runs"):
+                if _table_exists(conn, t):
+                    conn.execute(f"DROP TABLE {t}")
+                    dropped = True
+            for idx in ("idx_radar_ads_domain", "idx_radar_hits_source", "idx_radar_hits_domain"):
+                conn.execute(f"DROP INDEX IF EXISTS {idx}")
         conn.execute("INSERT INTO schema_migrations (name, applied_at) VALUES (?, ?)", (name, utcnow_iso()))
     return dropped
 
@@ -390,7 +333,8 @@ def _migrate_six_data_points(conn: sqlite3.Connection) -> bool:
         if _table_exists(conn, t):
             conn.execute(f"DROP TABLE {t}")
             dropped = True
-    for idx in ("idx_meta_ads_store", "idx_meta_ads_handle", "idx_meta_ads_daily_store", "idx_page_likes_page", "idx_meta_creatives_hash"):
+    for idx in ("idx_meta_ads_store", "idx_meta_ads_handle", "idx_meta_ads_daily_store", "idx_page_likes_page", "idx_meta_creatives_hash",
+                "idx_radar_ads_domain", "idx_radar_hits_source", "idx_radar_hits_domain"):
         conn.execute(f"DROP INDEX IF EXISTS {idx}")
     # url_daily for the days already in the database, so the sheet shows history right after the update
     if _table_exists(conn, "ads_daily"):

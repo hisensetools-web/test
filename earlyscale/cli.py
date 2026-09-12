@@ -1,5 +1,4 @@
-"""Command-line interface: run (catalogues), ads (Meta Ad Library), radar (store discovery), sync-sheets, and the
-watchlist / diagnostics helpers. `python tracker.py --help` lists everything."""
+"""Command-line interface: run (catalogues), ads (Meta Ad Library), sync-sheets, and the watchlist / diagnostics helpers. `python tracker.py --help` lists everything."""
 from __future__ import annotations
 
 import argparse
@@ -11,11 +10,12 @@ import sys
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.table import Table
 
-from . import config, db, meta_ads, platforms, radar, sheets, shopify, store_age, winners
+from . import config, db, meta_ads, platforms, sheets, shopify, store_age, winners
 from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist, update_watchlist_entry
 
 console = Console()
@@ -445,6 +445,16 @@ def _same_store(landing_domain: str | None, store_domain: str) -> bool:
     return bool(a) and (a == b or a.endswith("." + b))
 
 
+def _landing_domain(url: str | None) -> str:
+    if not url:
+        return ""
+    u = url.strip().lower()
+    if "://" not in u:
+        u = "https://" + u
+    host = urlparse(u).netloc.split("@")[-1]
+    return re.sub(r"^www\.", "", host)
+
+
 def page_candidates(ads: list[dict], store_domain: str) -> list[dict]:
     """Group Ad Library results by page: ads, how many land on the store, example landing domain. Store-landing pages first."""
     from collections import Counter
@@ -455,7 +465,7 @@ def page_candidates(ads: list[dict], store_domain: str) -> list[dict]:
             continue
         p = by.setdefault(key, {"page_id": a.get("page_id") or "", "page_name": a.get("page_name") or "", "ads": 0, "on_store": 0, "domains": Counter()})
         p["ads"] += 1
-        dom = radar.normalise_landing_domain(a.get("landing_url") or a.get("landing_domain")) or ""
+        dom = _landing_domain(a.get("landing_url") or a.get("landing_domain"))
         if dom:
             p["domains"][dom] += 1
         if _same_store(dom, store_domain):
@@ -526,119 +536,6 @@ def _set_page(domain: str, name: str, page_id: str | None, args) -> None:
 def cmd_set_page(args) -> int:
     _set_page(args.domain, args.name, args.page_id, args)
     return 0
-
-
-# ---------------------------------------------------------------- radar
-
-def _radar_summary(conn, out: dict) -> None:
-    c = radar.summary_counts(conn)
-    if out.get("imports") and out["imports"]["files"]:
-        console.print(f"imports: {out['imports']['files']} file(s): {len(out['imports']['added'])} added, {len(out['imports']['existing'])} already listed, {len(out['imports']['bad'])} unreadable")
-    for key, label in (("sweep", "hook sweep"), ("copycat", "copycat")):
-        sw = out.get(key)
-        if sw:
-            console.print(f"{label}: {sw['queries']} queries, {sw['ads']} ads, {len(sw['domains'])} landing domains"
-                          + (f"; {sw['skipped']} skipped (searched in the last {config.RADAR_RESWEEP_DAYS} days)" if sw.get("skipped") else "")
-                          + (f"; [yellow]{sw['deferred']} deferred to the next sweep (budget)[/]" if sw.get("deferred") else ""))
-    if out.get("web"):
-        console.print(f"web search: {out['web']['queries']} queries, {out['web']['domains']} domains")
-    console.print(f"new landing domains: {out['found']} found -> storefronts {out['shopify']} (promoted {out['promoted']}, parked "
-                  f"{out['parked'] - out['funnels']}), funnels parked {out['funnels']}, discarded {out['discarded']} "
-                  f"(no storefront and < {config.RADAR_FUNNEL_MIN_ADS} ads)"
-                  + (f"; [yellow]{out['deferred_triage']} not checked yet (budget)[/]" if out.get("deferred_triage") else ""))
-    console.print(f"re-checked {out['retriaged']} candidate(s) from stored facts, refreshed {out['refreshed']} catalogue(s); "
-                  f"Ad Library searches run {out['searched']}"
-                  + (f", [yellow]{out['deferred_search']} waiting for the next run[/]" if out.get("deferred_search") else "")
-                  + f"; promoted later {out['promoted_later']}")
-    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']} (storefronts {c['shopify']}, funnels {c['funnel']}, "
-                  f"{c['unsearched']} not yet searched), promoted {c['promoted']}, manual {c['watchlist']}, discarded {c['discarded']}")
-
-
-def cmd_radar(args) -> int:
-    conn = db.connect(args.db)
-    today = _parse_date(args.date)
-    do_sweep = True if args.sweep else (False if args.no_sweep else None)
-    console.print(f"radar: {'sweep + ' if do_sweep or (do_sweep is None and date.fromisoformat(today).weekday() == config.RADAR_SWEEP_WEEKDAY) else ''}triage, "
-                  f"hooks={len(radar.load_hooks())}, country={config.RADAR_COUNTRY}, up to {config.RADAR_MAX_ADS_PER_QUERY} ads/query")
-    with meta_ads.KeepAwake():
-        handle = meta_ads.LazyBrowser(headless=not args.headed)   # Playwright starts only if a search is actually needed
-        try:
-            out = radar.run_radar(conn, handle, today, do_sweep=do_sweep, watchlist_path=_wl(args), max_minutes=args.max_minutes)
-        finally:
-            handle.close()
-    _radar_summary(conn, out)
-    if out.get("sweep"):
-        _hook_table(conn)
-    return _radar_table(conn, args.limit)
-
-
-def _radar_table(conn, limit: int = 40) -> int:
-    rows = radar.candidates_rows(conn)
-    h = radar.CANDIDATES_HEADERS
-    show = ["domain", "type", "status", "store_age_days", "store_first_created", "products", "active_ads", "ads_in_sweeps", "searched_at",
-            "pages", "top page", "hot new product", "source", "lander_domain"]
-    idx = [h.index(c) for c in show]
-    t = Table(title="Candidates (what the Candidates tab shows; set promote=Y in the sheet to force one; "
-                    "active_ads before searched_at is set = ads seen in sweeps only)")
-    for c in show:
-        t.add_column(c.replace("store_", "").replace("_", " "), justify="right" if c in ("store_age_days", "products", "active_ads", "ads_in_sweeps", "pages") else "left")
-    for r in rows[:limit]:
-        t.add_row(*[(str(r[i])[:28] if c not in ("top page", "source") else str(r[i])[:22]) for i, c in zip(idx, show)])
-    console.print(t)
-    return 0
-
-
-def cmd_radar_add(args) -> int:
-    conn = db.connect(args.db)
-    r = radar.manual_add(conn, args.items, _parse_date(None), watchlist_path=_wl(args))
-    for d in r["added"]:
-        console.print(f"[green]added[/] {d}")
-    for d in r["existing"]:
-        console.print(f"already listed: {d}")
-    for d in r["bad"]:
-        console.print(f"[red]not a domain or URL:[/] {d}")
-    console.print(f"{len(r['added'])} added to the watchlist (source=manual). They get their first snapshot on the next run.")
-    return 0 if r["added"] or not r["bad"] else 1
-
-
-def _hook_table(conn) -> None:
-    rows = radar.hook_yield(conn)
-    if not rows or not any(r["sweeps"] for r in rows):
-        return
-    t = Table(title="hook phrases by yield (delete a phrase with 0 promotable stores over 2 sweeps; add siblings to the top ones)")
-    for c in ("hook", "sweeps", "ads", "domains", "promoted", "store cands", "funnels", "discarded", "verdict"):
-        t.add_column(c, justify="left" if c in ("hook", "verdict") else "right")
-    for r in rows:
-        t.add_row(r["hook"], str(r["sweeps"]), str(r["ads"]), str(r["domains"]), str(r["promoted"]), str(r["candidates"]), str(r["funnels"]),
-                  str(r["discarded"]), r["verdict"])
-    console.print(t)
-
-
-def _local(iso: str | None) -> str:
-    """UTC timestamp from the database -> local wall clock, minute precision."""
-    if not iso:
-        return ""
-    try:
-        return datetime.fromisoformat(iso).astimezone().strftime("%Y-%m-%d %H:%M")
-    except ValueError:
-        return iso[:16]
-
-
-def cmd_radar_report(args) -> int:
-    conn = db.connect(args.db)
-    _hook_table(conn)
-    c = radar.summary_counts(conn)
-    console.print(f"radar totals: {c['domains']} domains seen; candidates {c['candidate']} (storefronts {c['shopify']}, funnels {c['funnel']}, "
-                  f"{c['unsearched']} not yet searched), promoted {c['promoted']}, manual {c['watchlist']}, discarded {c['discarded']}")
-    runs = conn.execute("SELECT kind, query, started_at, ads_found, domains_found, note FROM radar_runs ORDER BY id DESC LIMIT ?", (args.limit,)).fetchall()
-    if runs:
-        t = Table(title="recent radar runs")
-        for col in ("kind", "query", "started", "ads", "domains", "note"):
-            t.add_column(col)
-        for r in runs:
-            t.add_row(r["kind"], (r["query"] or "")[:40], _local(r["started_at"]), str(r["ads_found"] or ""), str(r["domains_found"] or ""), (r["note"] or "")[:40])
-        console.print(t)
-    return _radar_table(conn, args.limit)
 
 
 # ---------------------------------------------------------------- reports
@@ -842,26 +739,9 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("rebuild", help="recompute the per-URL daily numbers (delivering, wow, pages, families) from the stored ads; no scraping")
     s.set_defaults(fn=cmd_rebuild)
 
-    s = sub.add_parser("radar", help="store discovery: hook + copycat sweeps (Sundays, or --sweep), then triage new landing domains")
-    s.add_argument("--date"); s.add_argument("--watchlist")
-    s.add_argument("--sweep", action="store_true", help="run the weekly sweeps now")
-    s.add_argument("--no-sweep", action="store_true", help="triage only, even on a Sunday")
-    s.add_argument("--max-minutes", type=float, help=f"budget for this run (default RADAR_MAX_MINUTES={config.RADAR_MAX_MINUTES:.0f})")
-    s.add_argument("--headed", action="store_true")
-    s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(fn=cmd_radar)
-
-    s = sub.add_parser("radar-add", help="add domains/URLs straight to the watchlist (source=manual), no triage")
-    s.add_argument("items", nargs="+"); s.add_argument("--watchlist")
-    s.set_defaults(fn=cmd_radar_add)
-
-    s = sub.add_parser("radar-report", help="radar totals, hook yield, recent runs, the Candidates table")
-    s.add_argument("--limit", type=int, default=40)
-    s.set_defaults(fn=cmd_radar_report)
-
-    s = sub.add_parser("sync-sheets", help="rewrite the Winners, Stores and Candidates tabs from the database, then verify the row counts")
+    s = sub.add_parser("sync-sheets", help="rewrite the Winners and Stores tabs from the database, then verify the row counts")
     s.add_argument("--date", help="as of this date (default: latest)")
-    s.add_argument("--tabs", help="comma list from winners,stores,candidates (default all)")
+    s.add_argument("--tabs", help="comma list from winners,stores (default both)")
     s.add_argument("--dry-run", action="store_true", help="build and size the chunks but send nothing")
     s.add_argument("--watchlist", help="alternate watchlist.csv (only its stores are synced)")
     s.add_argument("--verify-only", action="store_true", help="send nothing; compare the live sheet's row counts with the DB")

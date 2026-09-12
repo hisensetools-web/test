@@ -1,8 +1,8 @@
 """Catalogue adapters for every D2C storefront, not only Shopify.
 
 Every adapter returns the same normalised product dicts that shopify.normalise_product produces
-(product_id, handle, title, created_at, published_at, updated_at, url_path), so the snapshot and Radar
-code do not care what the store runs on. The adapters read variants only to tell a product page that
+(product_id, handle, title, created_at, published_at, updated_at, url_path), so the snapshot code does
+not care what the store runs on. The adapters read variants only to tell a product page that
 was read from a placeholder (variant_count); nothing about variants is stored.
 
   detect(session, domain)         one homepage GET (+ the Shopify probe): {platform, base, myshopify, evidence}
@@ -775,7 +775,7 @@ def fill_dates(conn: sqlite3.Connection, store_id: int, products: list[dict], to
 
 def is_store(domain: str, session: requests.Session | None = None, page_budget: int = 5) -> tuple[str | None, list[dict]]:
     """(platform, products) when the domain sells products through any known platform, else (None, []).
-    Used by Radar triage: the generic adapter reads only `page_budget` product pages here (enough to confirm a store)."""
+    The generic adapter reads only `page_budget` product pages here (enough to confirm a store)."""
     session = session or shopify.make_session()
     try:
         cat = fetch_catalogue(domain, session, today=date.today().isoformat(), page_budget=page_budget, quiet=True)

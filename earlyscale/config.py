@@ -70,24 +70,6 @@ META_CHROMIUM_PATH = os.environ.get("META_CHROMIUM_PATH", "").strip()  # optiona
 META_AD_LIBRARY_BASE = os.environ.get("META_AD_LIBRARY_BASE", "https://www.facebook.com/ads/library/")
 META_STOP_AT = os.environ.get("META_STOP_AT", "").strip()             # e.g. 08:30 - the pass stops at this local time (set by run_daily.bat meta)
 
-# Radar (store discovery)
-RADAR_MAX_ADS_PER_QUERY = int(os.environ.get("RADAR_MAX_ADS_PER_QUERY", "500"))
-RADAR_COUNTRY = os.environ.get("RADAR_COUNTRY", "US")
-RADAR_WEB_SEARCH = os.environ.get("RADAR_WEB_SEARCH", "1").strip() not in ("0", "false", "no")
-RADAR_MAX_WEB_QUERIES = int(os.environ.get("RADAR_MAX_WEB_QUERIES", "40"))
-RADAR_MAX_TRIAGE = int(os.environ.get("RADAR_MAX_TRIAGE", "40"))            # new domains checked per run
-RADAR_MAX_AGE_DAYS = int(os.environ.get("RADAR_MAX_AGE_DAYS", "180"))
-RADAR_MIN_ACTIVE_ADS = int(os.environ.get("RADAR_MIN_ACTIVE_ADS", "10"))
-RADAR_SWEEP_WEEKDAY = int(os.environ.get("RADAR_SWEEP_WEEKDAY", "6"))        # 6 = Sunday
-RADAR_MAX_MINUTES = float(os.environ.get("RADAR_MAX_MINUTES", "240"))       # budget for one radar run (sweeps + triage)
-RADAR_MAX_COPYCAT_QUERIES = int(os.environ.get("RADAR_MAX_COPYCAT_QUERIES", "60"))   # per sweep, least recently searched first
-RADAR_FUNNEL_MIN_ADS = int(os.environ.get("RADAR_FUNNEL_MIN_ADS", "3"))     # non-Shopify lander needs this many sweep ads to be tracked as a funnel
-RADAR_CHECK_WORKERS = int(os.environ.get("RADAR_CHECK_WORKERS", "6"))       # concurrent Shopify checks in triage stage 1
-RADAR_RESEARCH_DAYS = int(os.environ.get("RADAR_RESEARCH_DAYS", "7"))       # do not re-run a candidate's Ad Library search sooner than this
-RADAR_RESWEEP_DAYS = int(os.environ.get("RADAR_RESWEEP_DAYS", "6"))         # a phrase searched this recently is skipped (sweep resume)
-RADAR_REFRESH_DAYS = int(os.environ.get("RADAR_REFRESH_DAYS", "7"))         # re-read a Shopify candidate's catalogue this often (new products)
-RADAR_TRIAGE_MINUTES = float(os.environ.get("RADAR_TRIAGE_MINUTES", "60"))  # part of RADAR_MAX_MINUTES kept back from the sweeps for triage
-RADAR_SEARCH_MAX_ADS = int(os.environ.get("RADAR_SEARCH_MAX_ADS", "200"))   # ads collected per candidate page/domain search
 # Catalogue adapters for non-Shopify platforms (earlyscale/platforms.py)
 CATALOGUE_MAX_PAGES = int(os.environ.get("CATALOGUE_MAX_PAGES", "60"))        # product pages the generic adapter reads per store per run
 CATALOGUE_MAX_SITEMAPS = int(os.environ.get("CATALOGUE_MAX_SITEMAPS", "15"))

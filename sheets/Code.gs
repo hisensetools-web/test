@@ -7,7 +7,7 @@
  * Put the resulting /exec URL in .env as SHEETS_WEBHOOK_URL.
  *
  * Protocol (one POST per chunk, JSON body):
- *   { "tab": "Winners" | "Stores" | "Candidates",
+ *   { "tab": "Winners" | "Stores",
  *     "mode": "replace",
  *     "chunk": 1, "chunks": 3,          // 1-based; replace clears the tab on chunk 1
  *     "rows": [[...], [...]] }           // values in header order
@@ -27,11 +27,6 @@ var TABS = {
   Stores: {
     headers: ["store", "shop_id", "store_age_days", "products", "ads_as_of", "last error"],
     keyCols: null, textCols: [0, 1, 4, 5], position: 2   // shop_id as text: a 12-digit id must not become 1.2E+11
-  },
-  Candidates: {
-    headers: ["domain", "type", "status", "first_seen", "store_age_days", "store_created_est", "store_first_created", "products", "active_ads", "ads_in_sweeps", "searched_at", "pages", "top page", "example ad text", "hot new product", "source", "lander_domain", "last_checked", "promote"],
-    keyCols: null,                 // rewritten each sync AFTER the tracker has read the promote column back
-    textCols: [0, 1, 2, 3, 5, 6, 10, 12, 13, 14, 15, 16, 17, 18], position: 3
   }
 };
 
@@ -39,8 +34,7 @@ var TABS = {
  *  ?tabs=1            -> JSON {tab: rows} for every tab the script knows (rows exclude the header) + the headers it writes
  *  ?tab=Winners       -> JSON {tab, rows, maxRows}
  *  ?tab=Winners&group=0 -> also {byValue: {value in column 0 (0-based): count}}, e.g. rows per store
- *  ?tab=Candidates&rows=1 -> also {rows: [[...]]} (the tracker reads the promote column back before rewriting);
- *  add &cols=domain,promote to get only those columns (by header name) */
+ *  ?tab=Winners&rows=1 -> also {rows: [[...]]}; add &cols=store,delivering to get only those columns (by header name) */
 function doGet(e) {
   var p = (e && e.parameter) || {};
   if (p.tabs) {

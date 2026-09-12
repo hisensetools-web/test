@@ -231,7 +231,7 @@ def _tags(v) -> list[str]:
 
 
 def normalise_product(p: dict) -> dict:
-    """The columns kept per product: id, handle, title, the dates (+ vendor / type / tags for Radar's query building)."""
+    """The columns kept per product: id, handle, title, the dates (+ vendor / type / tags, informational)."""
     return {
         "product_id": int(p["id"]),
         "handle": p["handle"],

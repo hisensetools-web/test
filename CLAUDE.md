@@ -44,19 +44,18 @@ Families, Signals, Early, Pages, Ads, Products and Alerts tabs, and every alert 
   delivering_wow, proven_days, pages, pages_new_7d, top_page, family_age_days, store_age_days, ads_as_of.
   Default sort: delivering_wow desc (`new` first, no history last), then delivering desc.
 - **Stores**: store, shop_id, store_age_days, products, ads_as_of, last error.
-- **Candidates**: the Radar's tab (hook sweeps, copycat search, manual imports; promote=Y read back).
 - Nothing else.
 
 ## Storage
 - SQLite at `data/tracker.db`: `stores`, `products_daily`, `ads`, `ads_daily`, `url_daily`, `meta_page_runs`, `runs`, `store_runs`,
-  the radar tables, `schema_migrations`. History is never overwritten; every run appends a dated snapshot.
-- A database from the previous layout is migrated on first open (ads copied, the rest dropped, then VACUUM).
+  `schema_migrations`. History is never overwritten; every run appends a dated snapshot.
+- A database from the previous layout is migrated on first open (ads copied, the rest, the Radar tables included, dropped, then VACUUM).
 
 ## Commands
-`run` (catalogues + shop id), `ads` (Ad Library pass within a time budget, least recently scraped store first), `radar`,
+`run` (catalogues + shop id), `ads` (Ad Library pass within a time budget, least recently scraped store first),
 `sync-sheets`, `report` (the Winners tab in the terminal), `url <landing url>` (its time series), `status`, `diag`,
 `rebuild` (recompute url_daily from the stored ads), and the watchlist helpers (`add-store`, `remove-store`, `find-page`,
-`set-page`, `prune-dead`, `restore-stores`, `radar-add`, `radar-report`, `db-check`).
+`set-page`, `prune-dead`, `restore-stores`, `db-check`). Stores are added by hand; there is no store discovery.
 
 ## Engineering rules
 - Python 3.11+, `requests`, `playwright`, `sqlite3`, `rich`. Keep dependencies minimal.

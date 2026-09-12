@@ -1,4 +1,4 @@
-"""Store age from the Shopify shop ID (used by Radar triage; not a tab of its own).
+"""Store age from the Shopify shop ID (the store_age_days column of the Winners and Stores tabs).
 
 Shopify assigns shop IDs sequentially, so the numeric ID orders stores by creation date. The ID
 and the myshopify handle are in every storefront's HTML and never change:

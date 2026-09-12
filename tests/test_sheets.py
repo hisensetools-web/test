@@ -157,7 +157,7 @@ def _tabs_session(headers=None, tabs=None):
 
 
 class SyncTests(unittest.TestCase):
-    TABS = ["Winners", "Stores", "Candidates"]
+    TABS = ["Winners", "Stores"]
 
     def test_sync_posts_every_tab_in_replace_mode(self):
         conn = two_day_db()
@@ -165,8 +165,8 @@ class SyncTests(unittest.TestCase):
         out = sheets.sync(conn, "https://x/exec", session=session)
         payloads = [json.loads(c.kwargs["data"]) for c in session.post.call_args_list]
         self.assertEqual([p["tab"] for p in payloads], self.TABS)
-        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 3)
-        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 3)
+        self.assertEqual([p["mode"] for p in payloads], ["replace"] * 2)
+        self.assertEqual([(p["chunk"], p["chunks"]) for p in payloads], [(1, 1)] * 2)
         self.assertEqual([x["tab"] for x in out], self.TABS)
 
     def test_stale_code_gs_refuses_to_write(self):
@@ -186,7 +186,7 @@ class SyncTests(unittest.TestCase):
         with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
             sheets.sync(conn, "https://x/exec", session=session)
         self.assertTrue(any("does not report its headers" in x for x in logs.output))
-        self.assertEqual(session.post.call_count, 3)
+        self.assertEqual(session.post.call_count, 2)
 
     def test_dry_run_sends_nothing_and_missing_url_is_clear(self):
         conn = two_day_db()
@@ -274,27 +274,15 @@ class CodeGsContractTests(unittest.TestCase):
 
 
 class ReadBackTests(unittest.TestCase):
-    def test_compact_rows_apply_promote_marks(self):
-        from earlyscale import radar
-        conn = db.connect(":memory:")
-        conn.execute("INSERT INTO radar_domains (domain, status, first_seen) VALUES ('a.com', 'candidate', '2026-09-01'), ('b.com', 'candidate', '2026-09-01')")
-        session = mock.Mock()
-        session.get.return_value = _resp(200, json.dumps({"ok": True, "rows": [["a.com", "Y"], ["b.com", ""]], "cols": ["domain", "promote"]}))
-        self.assertEqual(sheets.read_promote_marks(conn, "https://x/exec", session=session), 1)
-        self.assertEqual(conn.execute("SELECT promote_flag FROM radar_domains WHERE domain = 'a.com'").fetchone()[0], "Y")
-        self.assertEqual(len(radar.CANDIDATES_HEADERS), len(sheets.expected_headers()["Candidates"]))
-
-    def test_redirect_loop_is_retried_then_reported(self):
-        conn = db.connect(":memory:")
+    def test_redirect_loop_is_reported(self):
         session = mock.Mock()
         r = _resp(302, "")
         r.headers["Location"] = "https://script.googleusercontent.com/macros/echo?x=1"
         session.get.return_value = r
-        with mock.patch("earlyscale.sheets.time.sleep") as sleep:
-            with self.assertLogs("earlyscale.sheets", level="WARNING") as logs:
-                self.assertEqual(sheets.read_promote_marks(conn, "https://x/exec", session=session, retries=2), 0)
-        self.assertEqual(sleep.call_count, 1)
-        self.assertIn("kept redirecting", logs.output[0])
+        with self.assertRaises(sheets.SheetsSyncError) as cm:
+            sheets._get_json_once(session, "https://x/exec", {"tabs": "1"})
+        self.assertIn("kept redirecting", str(cm.exception))
+        self.assertIn("script.googleusercontent.com", str(cm.exception))
 
     def test_login_redirect_is_explained(self):
         session = mock.Mock()
@@ -353,7 +341,7 @@ class EchoHiccupTests(unittest.TestCase):
         session.post.return_value = _resp(302, "", location=self.ECHO)
         session.get.return_value = _resp(404, self.PAGE, url=self.ECHO, ctype="text/html")
         with mock.patch("earlyscale.sheets.time.sleep"):
-            data = sheets.post_payload(session, self.EXEC, {"tab": "Candidates", "mode": "replace", "chunk": 2, "rows": [[1], [2], [3]]},
+            data = sheets.post_payload(session, self.EXEC, {"tab": "Winners", "mode": "replace", "chunk": 2, "rows": [[1], [2], [3]]},
                                        already_applied=lambda: True)
         self.assertEqual((data["written"], data.get("recovered"), session.post.call_count), (3, True, 1))
 

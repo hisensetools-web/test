@@ -2,7 +2,7 @@
 REM Daily tracker run. Registered in Task Scheduler by register_task.ps1 (two tasks):
 REM   run_daily.bat        morning: catalogues + shop ids of every store, then a Sheets sync (about 10 min)
 REM   run_daily.bat meta   night:   Meta Ad Library pass for the whole watchlist within
-REM                                 META_NIGHT_MINUTES (default 600) or until META_STOP_AT (08:30), then radar, then a Sheets sync
+REM                                 META_NIGHT_MINUTES (default 600) or until META_STOP_AT (08:30), then a Sheets sync
 REM Appends stdout+stderr to logs\run_YYYY-MM-DD.log (or logs\meta_YYYY-MM-DD.log).
 REM tracker.py reads .env itself (SHEETS_WEBHOOK_URL, META_STORES, ...).
 setlocal EnableDelayedExpansion
@@ -48,7 +48,6 @@ if /i "%MODE%"=="meta" if %HOUR% GEQ 7 if %HOUR% LSS 20 (
 if /i "%MODE%"=="meta" (
   %PY% tracker.py ads --max-minutes %META_NIGHT_MINUTES% >> "%LOG%" 2>&1
   set RC=!ERRORLEVEL!
-  %PY% tracker.py radar >> "%LOG%" 2>&1
   %PY% tracker.py sync-sheets >> "%LOG%" 2>&1
 ) else (
   %PY% tracker.py run --no-ads >> "%LOG%" 2>&1
