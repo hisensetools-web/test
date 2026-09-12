@@ -66,9 +66,8 @@ class UrlTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             meta_ads.build_search_url()
 
-    def test_store_query_falls_back_to_the_domain_for_a_junk_name(self):
-        self.assertEqual(meta_ads.store_query({"store_domain": "x.com", "meta_page_name": "Acme"}), "Acme")
-        self.assertEqual(meta_ads.store_query({"store_domain": "x.com", "meta_page_name": "p"}), "x.com")
+    def test_store_query_is_always_the_domain(self):
+        self.assertEqual(meta_ads.store_query({"store_domain": "x.com", "meta_page_name": "Sarah Bennett"}), "x.com")
         self.assertEqual(meta_ads.store_query({"store_domain": "http://127.0.0.1:8001", "meta_page_name": ""}), "127.0.0.1:8001")
 
 

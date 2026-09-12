@@ -6,7 +6,7 @@ Six data points, collected daily; everything on the sheet is derived from them. 
 
 ## Data points (once per day per store)
 
-### 1. Per ad (Meta Ad Library, Playwright scrape of the public page)
+### 1. Per ad (Meta Ad Library, Playwright scrape of the public page; the search term is the store's domain, so every page advertising it is covered)
 - `ad_archive_id`, `page_name`, `page_id`
 - `landing_url`: raw, as shown on the card, and `landing_path`: normalised (host + path, lower-case, query string removed, no trailing slash)
 - `first_seen`: the Ad Library's start date
@@ -55,7 +55,7 @@ Families, Signals, Early, Pages, Ads, Products and Alerts tabs, and every alert 
 `run` (catalogues + shop id), `ads` (Ad Library pass within a time budget, least recently scraped store first),
 `sync-sheets`, `report` (the Winners tab in the terminal), `url <landing url>` (its time series), `status`, `diag`,
 `rebuild` (recompute url_daily from the stored ads), and the watchlist helpers (`add-store`, `remove-store`, `find-page`,
-`set-page`, `prune-dead`, `restore-stores`, `db-check`). Stores are added by hand; there is no store discovery.
+`pages`, `set-page`, `prune-dead`, `restore-stores`, `db-check`). Stores are added by hand (domains only); there is no store discovery.
 
 ## Engineering rules
 - Python 3.11+, `requests`, `playwright`, `sqlite3`, `rich`. Keep dependencies minimal.

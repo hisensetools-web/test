@@ -96,24 +96,24 @@ log by the day it *started*, so last night is `meta_<yesterday>.log`. "Last Resu
 
 ## 5. Watchlist
 
+You only need domains. The night pass searches each domain in the Ad Library, which returns every Facebook page
+advertising it (the whitepage personas included); no page name is needed and none is looked up.
+
 ```powershell
-python tracker.py add-store x.com                      # add a store (finds its Facebook page in the footer)
-python tracker.py add-store a.com b.com c.com          # add several at once
+python tracker.py add-store a.com b.com c.com          # add stores (as many as you like on one line)
+python tracker.py add-store --file domains.txt         # one domain per line (a CSV's first column works too)
 python tracker.py remove-store x.com y.com             # drop stores (history in the DB is kept)
 python tracker.py prune-dead                           # list domains that never returned a catalogue or an ad
 python tracker.py prune-dead --apply                   # ...and remove them from the watchlist
 python tracker.py restore-stores --apply               # put removed stores back (all of them, or name domains after --apply)
-python tracker.py find-page tryhappyharvest.com        # find the store's Facebook page (footer, then Ad Library search); shows candidates
-python tracker.py find-page tryhappyharvest.com --set 1   # save candidate 1;  --query "Happy Harvest" to search another name
-python tracker.py set-page getdovi.com --name "Dovi" --page-id 1234567890   # set it by hand
+python tracker.py pages elivorahealth.com              # which pages advertise this domain (the same search the night pass runs)
+python tracker.py pages elivorahealth.com --set 2      # pin the store to page 2 only (rarely wanted; the domain search covers every page)
+python tracker.py ads --only a.com b.com               # scrape the new stores now instead of waiting for 22:00
 ```
 
-A store without a Meta page name is searched by its domain, which finds nothing for most brands: set the page for
-every store whose `ads_as_of` stays empty on the Stores tab after a night pass. Keep one domain per advertiser: two
-watchlist entries sharing one Facebook page (luma.viture.com and viture.com) each get the same ads.
-
-To add many stores at once, edit `watchlist.csv` directly (columns `store_domain, meta_page_name, meta_page_id, notes`,
-one store per line); every command reads it fresh.
+Editing `watchlist.csv` by hand works the same way: one domain per line under `store_domain`, the other columns empty.
+Use the apex domain (`brand.com`, not `www.brand.com`). Keep one entry per advertiser: two entries sharing one
+Facebook page (luma.viture.com and viture.com) each get the same ads.
 
 ## 6. Settings (`.env`)
 

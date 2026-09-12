@@ -16,7 +16,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import config, db, meta_ads, platforms, sheets, shopify, store_age, winners
-from .watchlist import append_to_watchlist, read_watchlist, remove_from_watchlist, update_watchlist_entry
+from .watchlist import append_to_watchlist, normalise_domain, read_watchlist, remove_from_watchlist, update_watchlist_entry
 
 console = Console()
 log = logging.getLogger("earlyscale")
@@ -327,25 +327,30 @@ def cmd_sync_sheets(args) -> int:
 # ---------------------------------------------------------------- watchlist
 
 def cmd_add_store(args) -> int:
-    """Add one or more stores to watchlist.csv (and the database). With one domain the Facebook page link is looked up
-    in the storefront footer unless --meta-page / --no-discover is given; with several, discovery runs for each."""
+    """Add one or more stores to watchlist.csv (and the database). No Facebook page is needed: the Meta pass searches
+    the Ad Library for the domain, which returns every page advertising it."""
     conn = db.connect(args.db)
+    domains = list(args.domains)
+    if args.file:
+        for line in Path(args.file).read_text(encoding="utf-8-sig").splitlines():
+            line = line.strip().split(",")[0].strip()
+            if line and not line.startswith("#") and "." in line:
+                domains.append(line)
+    if not domains:
+        console.print("[red]no domains given[/] (list them on the command line, or --file domains.txt with one per line)")
+        return 2
     added = 0
-    for domain in args.domains:
-        meta_page = args.meta_page if len(args.domains) == 1 else None
-        if not meta_page and not args.no_discover:
-            console.print(f"looking for a Facebook page link on {domain} ...")
-            meta_page = shopify.discover_meta_page(domain)
-            console.print(f"  meta_page_name: [bold]{meta_page or '(not found; set it later with find-page or set-page)'}[/]")
-        entry = {"store_domain": domain, "meta_page_name": meta_page or "", "meta_page_id": (args.meta_page_id or "") if len(args.domains) == 1 else "",
+    for raw in domains:
+        domain = normalise_domain(raw)
+        entry = {"store_domain": domain, "meta_page_name": "", "meta_page_id": (args.page_id or "") if len(domains) == 1 else "",
                  "notes": args.notes or ""}
         ok = append_to_watchlist(entry, _wl(args))
-        db.upsert_store(conn, entry["store_domain"] if ok else domain.lower(), meta_page, entry["meta_page_id"] or None, args.notes)
+        db.upsert_store(conn, domain, None, entry["meta_page_id"] or None, args.notes)
         conn.commit()
         added += 1 if ok else 0
         console.print(f"[green]{'added' if ok else 'already listed'}[/] {domain}")
-    if len(args.domains) > 1:
-        console.print(f"{added} of {len(args.domains)} added. They get their catalogue on the next `run` and their ads on the next `ads` pass.")
+    console.print(f"{added} of {len(domains)} added. Catalogue on the next `run`, ads on the next `ads` pass "
+                  "(python tracker.py ads --only <domain> to do one now).")
     return 0
 
 
@@ -435,17 +440,6 @@ def cmd_restore_stores(args) -> int:
     return 0
 
 
-def brand_query(domain: str) -> str:
-    """'tryhappyharvest.com' -> 'happyharvest': the label without shop/try/get prefixes, for an Ad Library search."""
-    label = re.sub(r"^https?://", "", domain).split("/")[0].lower()
-    label = re.sub(r"^(www|shop|store)\.", "", label).split(".")[0]
-    for pre in ("try", "get", "shop", "buy", "the", "my"):
-        if label.startswith(pre) and len(label) > len(pre) + 3:
-            label = label[len(pre):]
-            break
-    return label.replace("-", " ").strip()
-
-
 def _same_store(landing_domain: str | None, store_domain: str) -> bool:
     a = re.sub(r"^(https?://)?(www\.)?", "", (landing_domain or "").lower()).split("/")[0]
     b = re.sub(r"^(https?://)?(www\.)?", "", store_domain.lower()).split("/")[0]
@@ -484,14 +478,12 @@ def page_candidates(ads: list[dict], store_domain: str) -> list[dict]:
     return out
 
 
-def cmd_find_page(args) -> int:
-    """Find the Facebook page behind a store: footer link first, then an Ad Library search for the brand name."""
+def cmd_pages(args) -> int:
+    """Which Facebook pages advertise a domain: an Ad Library keyword search for the domain (what the night pass does),
+    grouped by page, pages whose ads land on the store first. --set N pins the pass to that one page (rarely wanted)."""
     from playwright.sync_api import sync_playwright
     domain = args.domain
-    console.print(f"looking for a Facebook page link on {domain} ...")
-    footer = shopify.discover_meta_page(domain)
-    console.print(f"  footer link: [bold]{footer or '(none)'}[/]")
-    query = args.query or brand_query(domain)
+    query = args.query or meta_ads.store_query({"store_domain": domain})
     console.print(f"searching the Ad Library for [bold]{query}[/] (active ads, all countries) ...")
     with sync_playwright() as pw:
         handle = meta_ads.BrowserHandle(pw, headless=not args.headed)
@@ -505,23 +497,21 @@ def cmd_find_page(args) -> int:
             handle.close()
     cands = page_candidates(res.ads, domain)
     if not cands:
-        console.print("no pages found. Try --query with the brand as written on the site (e.g. --query \"Happy Harvest\"), "
-                      "or set it by hand: python tracker.py set-page <domain> --name \"Page Name\"")
+        console.print("no ads found for this search. Try --query with the brand as written in the ads, or the lander's domain if the "
+                      "ads go through one.")
         return 1
-    t = Table(title=f"pages advertising for '{query}' (pages whose ads land on {domain} first)")
+    t = Table(title=f"pages advertising '{query}' (pages whose ads land on {domain} first; {len(res.ads)} ads seen)")
     for c in ("#", "page name", "page_id", "ads", "land on store", "top landing domain"):
         t.add_column(c, justify="right" if c in ("#", "ads", "land on store") else "left")
-    for i, p in enumerate(cands[:15], start=1):
+    for i, p in enumerate(cands[:25], start=1):
         t.add_row(str(i), p["page_name"][:40], p["page_id"], str(p["ads"]), str(p["on_store"]), p["top_domain"][:40])
     console.print(t)
-    pick = args.set
-    if pick is None and cands[0]["on_store"] > 0 and args.auto:
-        pick = 1
-    if pick:
-        p = cands[pick - 1]
+    if args.set:
+        p = cands[args.set - 1]
         _set_page(domain, p["page_name"], p["page_id"], args)
     else:
-        console.print("pick one with:  python tracker.py find-page <domain> --set N   (or set-page <domain> --name \"...\" --page-id ...)")
+        console.print("the night pass already covers every page here (it searches the domain). To pin the store to one page only: "
+                      "python tracker.py pages <domain> --set N")
     return 0
 
 
@@ -535,7 +525,8 @@ def _set_page(domain: str, name: str, page_id: str | None, args) -> None:
     conn.commit()
     if ok:
         console.print(f"[green]set[/] {domain}: meta_page_name={name!r} meta_page_id={page_id or ''!r} (watchlist.csv + database). "
-                      f"Next: python tracker.py ads --only {domain}")
+                      + (f"The Meta pass now searches only that page. Next: python tracker.py ads --only {domain}" if page_id
+                         else "Without a page id the Meta pass still searches the domain; the name is a label."))
     else:
         console.print(f"[yellow]{domain} is not in watchlist.csv[/]; the database row was updated. Add the store first (add-store).")
 
@@ -612,9 +603,9 @@ def cmd_status(args) -> int:
         t.add_row(str(r["id"]), r["snapshot_date"], r["started_at"], r["finished_at"] or "-", str(r["stores_total"]), str(r["stores_ok"]), str(r["stores_failed"]))
     console.print(t)
     t = Table(title="stores")
-    for c in ("store", "meta page", "shop_id", "products", "catalogue days", "last catalogue", "ads as of", "active", "delivering", "winners", "last status"):
+    for c in ("store", "ad search", "shop_id", "products", "catalogue days", "last catalogue", "ads as of", "active", "delivering", "winners", "last status"):
         t.add_column(c, justify="right" if c in ("shop_id", "products", "catalogue days", "active", "delivering", "winners") else "left")
-    for s in conn.execute("SELECT id, store_domain, meta_page_name, shop_id FROM stores ORDER BY store_domain"):
+    for s in conn.execute("SELECT id, store_domain, meta_page_id, shop_id FROM stores ORDER BY store_domain"):
         p = conn.execute("""SELECT COUNT(DISTINCT snapshot_date), MAX(snapshot_date),
                                    (SELECT COUNT(*) FROM products_daily p2 WHERE p2.store_id = p.store_id AND p2.snapshot_date = MAX(p.snapshot_date))
                             FROM products_daily p WHERE store_id = ?""", (s["id"],)).fetchone()
@@ -625,7 +616,7 @@ def cmd_status(args) -> int:
                          (s["id"], snap, winners.MIN_DELIVERING)).fetchone()[0] if snap else 0
         last = conn.execute("SELECT status, error FROM store_runs WHERE store_id = ? ORDER BY run_id DESC LIMIT 1", (s["id"],)).fetchone()
         status = "-" if last is None else (last["status"] + (": " + (last["error"] or "")[:50] if last["status"] != "ok" else ""))
-        t.add_row(_short(s["store_domain"]), s["meta_page_name"] or "-", str(s["shop_id"] or ""), str(p[2] or 0), str(p[0] or 0), p[1] or "-",
+        t.add_row(_short(s["store_domain"]), f"page {s['meta_page_id']}" if s["meta_page_id"] else "domain", str(s["shop_id"] or ""), str(p[2] or 0), str(p[0] or 0), p[1] or "-",
                   snap or "-", str(a[0] or 0), str(a[1] or 0), str(w), f"[green]{status}[/]" if status == "ok" else f"[red]{status}[/]")
     console.print(t)
     return 0
@@ -779,12 +770,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("db-check", help="is data/tracker.db free to write? lists its files and the programs that could be holding it")
     s.set_defaults(fn=cmd_db_check)
 
-    s = sub.add_parser("add-store", help="add one or more stores to watchlist.csv (tries to discover each one's Facebook page)")
-    s.add_argument("domains", nargs="+", metavar="DOMAIN")
-    s.add_argument("--meta-page", help="Meta page name (single domain only; skips discovery)")
-    s.add_argument("--meta-page-id")
+    s = sub.add_parser("add-store", help="add one or more stores to watchlist.csv (no Facebook page needed: the Meta pass searches the domain)")
+    s.add_argument("domains", nargs="*", metavar="DOMAIN")
+    s.add_argument("--file", help="a text file with one domain per line (a CSV's first column works too)")
+    s.add_argument("--page-id", help="single domain only: pin the Meta pass to this one Facebook page instead of the domain search")
     s.add_argument("--notes")
-    s.add_argument("--no-discover", action="store_true")
     s.add_argument("--watchlist", help="alternate watchlist.csv path")
     s.set_defaults(fn=cmd_add_store)
 
@@ -804,17 +794,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--watchlist")
     s.set_defaults(fn=cmd_restore_stores)
 
-    s = sub.add_parser("find-page", help="find a store's Facebook page: footer link, then an Ad Library search for the brand; --set N saves it")
+    s = sub.add_parser("pages", aliases=["find-page"], help="which Facebook pages advertise a domain (the Ad Library search the night pass runs)")
     s.add_argument("domain")
-    s.add_argument("--query", help="search this instead of the brand name derived from the domain")
-    s.add_argument("--set", type=int, metavar="N", help="save candidate N to watchlist.csv and the database")
-    s.add_argument("--auto", action="store_true", help="save the top candidate when its ads land on the store")
-    s.add_argument("--max-ads", type=int, default=150)
+    s.add_argument("--query", help="search this instead of the domain")
+    s.add_argument("--set", type=int, metavar="N", help="pin the store to page N (the Meta pass then searches only that page)")
+    s.add_argument("--max-ads", type=int, default=300)
     s.add_argument("--headed", action="store_true")
     s.add_argument("--watchlist")
-    s.set_defaults(fn=cmd_find_page)
+    s.set_defaults(fn=cmd_pages)
 
-    s = sub.add_parser("set-page", help="set a store's Meta page name (and id) by hand")
+    s = sub.add_parser("set-page", help="pin a store to one Facebook page by hand (--page-id); without an id the name is only a label")
     s.add_argument("domain")
     s.add_argument("--name", required=True)
     s.add_argument("--page-id")

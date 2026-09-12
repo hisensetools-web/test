@@ -45,20 +45,6 @@ class UrlAndDiscoveryTests(unittest.TestCase):
         self.assertEqual(shopify.base_url("https://www.example.com/"), "https://www.example.com")
         self.assertEqual(shopify.base_url("http://127.0.0.1:8001"), "http://127.0.0.1:8001")
 
-    def test_extract_meta_page_skips_share_links(self):
-        html = ('<a href="https://www.facebook.com/sharer/sharer.php?u=x">s</a>'
-                '<a href="https://facebook.com/plugins/like.php">l</a>'
-                '<a href="https://www.facebook.com/AcmeOfficial/">fb</a>')
-        self.assertEqual(shopify.extract_meta_page(html), "AcmeOfficial")
-        self.assertIsNone(shopify.extract_meta_page("<p>no links</p>"))
-
-    def test_extract_meta_page_reads_the_newer_p_and_people_links(self):
-        # gutbiowellness.com's footer: facebook.com/p/<Name>-<id>/ used to come back as the page name "p"
-        self.assertEqual(shopify.extract_meta_page('<a href="https://www.facebook.com/p/GutBio-Wellness-100091234567890/">fb</a>'), "GutBio Wellness")
-        self.assertEqual(shopify.extract_meta_page('<a href="https://www.facebook.com/people/Natural-Remedies/61550000000000/">fb</a>'), "Natural Remedies")
-        self.assertIsNone(shopify.extract_meta_page('<a href="https://www.facebook.com/p/">x</a>'))
-        self.assertIsNone(shopify.extract_meta_page('<a href="https://www.facebook.com/ab">x</a>'))
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -94,9 +94,9 @@ cp .env.example .env          # SHEETS_WEBHOOK_URL for the sheet; everything els
 python tracker.py init-db     # creates data/tracker.db
 ```
 
-`watchlist.csv` ships with three test stores. Add yours with `python tracker.py add-store somestore.com` (finds the
-Facebook page link in the storefront footer; `find-page` searches the Ad Library when there is none) or edit
-`watchlist.csv` directly. There is no automatic store discovery: the watchlist is yours.
+`watchlist.csv` ships with three test stores. Add yours with `python tracker.py add-store a.com b.com ...` or
+`add-store --file domains.txt`, or edit `watchlist.csv` directly. Only the domain is needed: the Meta pass searches
+the domain in the Ad Library, which returns every page advertising it. There is no automatic store discovery.
 
 **Updating from the previous version:** the first command after `git pull` converts `data/tracker.db` to the new
 layout (ads and their daily rows are kept, the tables of the deleted signals are dropped, the file is compacted; a
@@ -201,8 +201,9 @@ Version: **New version** > Deploy. The URL stays the same.
 ## Meta Ad Library pass
 
 `python tracker.py ads` opens the public Ad Library in headless Chromium, one browser, one store at a time, with a
-random 3-8 s pause between scrolls and stores. It searches the store's Meta page name (`watchlist.csv`; the domain
-when none is set) for active ads, scrolls `META_MAX_SCROLLS` (20, about 350 newest ads) times and captures the
+random 3-8 s pause between scrolls and stores. It searches the store's domain as a keyword (every page whose ads
+show that domain, whitepage personas included; a `meta_page_id` in `watchlist.csv` pins a store to one page instead)
+for active ads, scrolls `META_MAX_SCROLLS` (20, about 350 newest ads) times and captures the
 GraphQL responses the page loads: ad id, page, start date, landing link. The "Low impression count" badge is not in
 those payloads; it is read off every rendered result card (before each scroll and at the end), so an ad whose card
 was never on screen keeps an unknown badge and is not counted as delivering.
@@ -296,7 +297,7 @@ run the passes (move `data/tracker.db` once and delete the Windows tasks).
 
 | table | one row per | notes |
 |---|---|---|
-| `stores` | watchlist store | Meta page, platform, `shop_id`, myshopify handle, `store_created_est` |
+| `stores` | watchlist store | platform, `shop_id`, myshopify handle, `store_created_est`, optional page-id override |
 | `products_daily` | product per day | id, handle, title, created_at, published_at, updated_at, url_path |
 | `ads` | ad per store | page, raw + normalised landing URL, first_seen (Ad Library start date), first/last scraped |
 | `ads_daily` | ad per scrape day | still_active, low_impressions (1 / 0 / NULL unknown), position |
@@ -351,7 +352,7 @@ earlyscale/cli.py       commands: run, ads, sync-sheets, report, url, status, di
 earlyscale/db.py        schema, migration from the previous layout, snapshot writers
 earlyscale/winners.py   landing path normalisation, product families, url_daily, the Winners / Stores rows
 earlyscale/meta_ads.py  Ad Library scraper (Playwright + GraphQL capture + card badges), recording
-earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + normaliser + Meta page discovery
+earlyscale/shopify.py   HTTP fetch (host resolution, retry/backoff, pagination) + normaliser
 earlyscale/platforms.py catalogue adapters for the other storefront platforms
 earlyscale/store_age.py shop id extraction and the store age estimate (calibration/shop_ids.csv)
 earlyscale/sheets.py    Google Sheets sync client (rows, chunking, 302 + retry handling, verify, lock)

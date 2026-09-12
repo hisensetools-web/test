@@ -1,4 +1,4 @@
-"""prune-dead, restore-stores, find-page helpers, set-page, the Meta pass planning and the stop time."""
+"""add-store, prune-dead, restore-stores, the pages helper, the Meta pass planning and the stop time."""
 import argparse
 import tempfile
 import unittest
@@ -47,14 +47,6 @@ class RestoreStoresTests(unittest.TestCase):
 
 
 class PageFinderTests(unittest.TestCase):
-    def test_brand_query_strips_prefixes(self):
-        self.assertEqual(cli.brand_query("tryhappyharvest.com"), "happyharvest")
-        self.assertEqual(cli.brand_query("getdovi.com"), "dovi")
-        self.assertEqual(cli.brand_query("theethiopica.com"), "ethiopica")
-        self.assertEqual(cli.brand_query("https://shop.pipitea.com/"), "pipitea")
-        self.assertEqual(cli.brand_query("neuro-bella.com"), "neuro bella")
-        self.assertEqual(cli.brand_query("try.com"), "try")            # too short to strip
-
     def test_page_candidates_rank_store_landing_pages_first(self):
         ads = [{"page_id": "1", "page_name": "Happy Harvest", "landing_url": "https://tryhappyharvest.com/products/x"},
                {"page_id": "1", "page_name": "Happy Harvest", "landing_url": "https://tryhappyharvest.com/pages/offer"},
@@ -74,6 +66,19 @@ class PageFinderTests(unittest.TestCase):
             self.assertFalse(update_watchlist_entry("nope.com", p, meta_page_name="x"))
             row = read_watchlist(p)[0]
             self.assertEqual((row["meta_page_name"], row["meta_page_id"], row["notes"]), ("Dovi", "123", "keep me"))
+
+
+class AddStoreTests(unittest.TestCase):
+    def test_list_and_file_without_any_page_lookup(self):
+        with tempfile.TemporaryDirectory() as d:
+            wl, dbp, lst = Path(d) / "w.csv", Path(d) / "t.db", Path(d) / "domains.txt"
+            lst.write_text("# my list\nhttps://www.Three.com/products/x\nfour.com,some note\n\nthree.com\n", encoding="utf-8")
+            args = argparse.Namespace(db=dbp, watchlist=str(wl), domains=["one.com", "two.com"], file=str(lst), page_id=None, notes="sep")
+            self.assertEqual(cli.cmd_add_store(args), 0)
+            rows = read_watchlist(wl)
+            self.assertEqual([r["store_domain"] for r in rows], ["one.com", "two.com", "three.com", "four.com"])
+            self.assertTrue(all(r["meta_page_name"] == "" and r["meta_page_id"] == "" for r in rows))   # the domain is the search key
+            self.assertEqual(db.connect(dbp).execute("SELECT COUNT(*) FROM stores").fetchone()[0], 4)
 
 
 class PlanTests(unittest.TestCase):

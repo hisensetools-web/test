@@ -9,7 +9,7 @@ import logging
 import random
 import re
 import time
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse
 
 import requests
 
@@ -255,45 +255,3 @@ def normalise_products(raw: list[dict]) -> list[dict]:
             continue
         out.append(normalise_product(p))
     return out
-
-
-# ---------------------------------------------------------------- meta page discovery
-
-_FB_RE = re.compile(r"https?://(?:www\.|m\.|business\.)?facebook\.com/([A-Za-z0-9_.\-]+)/?", re.I)
-_FB_SKIP = {"sharer", "sharer.php", "share", "plugins", "dialog", "login", "pages", "profile.php",
-            "tr", "policies", "help", "privacy", "groups", "events", "hashtag", "watch", "ads"}
-
-
-def discover_meta_page(store_domain: str, session: requests.Session | None = None) -> str | None:
-    """Best-effort: find a facebook.com/<page> link on the storefront home page."""
-    session = session or make_session()
-    try:
-        r = session.get(base_url(store_domain) + "/", timeout=config.REQUEST_TIMEOUT,
-                        headers={"Accept": "text/html,application/xhtml+xml,*/*;q=0.8"})
-        r.raise_for_status()
-    except requests.RequestException as e:
-        log.warning("%s: could not fetch home page for meta discovery: %s", store_domain, e)
-        return None
-    return extract_meta_page(r.text)
-
-
-_FB_PRETTY_RE = re.compile(r"https?://(?:www\.|m\.)?facebook\.com/(?:p|people)/([A-Za-z0-9_.\-%]+?)(?:-\d{5,}|/\d{5,})/?", re.I)
-
-
-def extract_meta_page(html: str) -> str | None:
-    """The page's name (or vanity slug) from the first facebook.com link on the page. Handles the newer
-    facebook.com/p/<Page-Name>-<id>/ and /people/<Name>/<id>/ links (the name, hyphens -> spaces) and skips
-    share / login / profile.php links and one- or two-character slugs."""
-    for m in _FB_RE.finditer(html):
-        name = m.group(1)
-        if name.lower() in _FB_SKIP:
-            continue
-        if name.lower() in ("p", "people"):
-            pm = _FB_PRETTY_RE.match(html, m.start())
-            if pm:
-                return unquote(pm.group(1)).replace("-", " ").strip() or None
-            continue
-        if len(name) < 3:
-            continue
-        return name
-    return None
