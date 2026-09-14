@@ -284,19 +284,63 @@ def check_deployed_headers(session: requests.Session, url: str, tabs=TAB_ORDER) 
     return [TAB_NAMES[t] for t in tabs if deployed.get(TAB_NAMES[t]) != want[TAB_NAMES[t]]]
 
 
+def pid_alive(pid: int) -> bool | None:
+    """Is a process with this id running? None when it cannot be told (no permission, unsupported platform)."""
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill(pid, 0) would TERMINATE the process on Windows; ask the kernel instead.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            handle = k32.OpenProcess(0x1000, False, pid)      # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return False if k32.GetLastError() == 87 else None   # ERROR_INVALID_PARAMETER: no such process
+            try:
+                code = wintypes.DWORD()
+                if not k32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                    return None
+                return code.value == 259                      # STILL_ACTIVE
+            finally:
+                k32.CloseHandle(handle)
+        except Exception:
+            return None
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return None
+
+
 class SyncLock:
     """Two syncs at once interleave their chunks and a replace-mode tab ends up holding a random subset of rows.
-    One sync at a time per database: a lock file next to it."""
+    One sync at a time per database: a lock file next to it, holding the owner's process id. A lock whose owner
+    is no longer running (a closed window, a crash, the machine went to sleep) is stale and taken over."""
 
     def __init__(self, path: Path | None = None):
         self.path = path or (config.DB_PATH.parent / "sync.lock")
         self.held = False
 
+    def _owner(self) -> int | None:
+        try:
+            return int(self.path.read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return None
+
     def __enter__(self):
         try:
             if self.path.exists():
                 age = time.time() - self.path.stat().st_mtime
-                if age < 3 * 3600:
+                owner = self._owner()
+                alive = pid_alive(owner) if owner is not None else None
+                if alive is False:
+                    log.warning("sheets: stale sync.lock from process %s (started %.0f min ago, no longer running); taking over", owner, age / 60)
+                elif age < 3 * 3600:
                     raise SheetsSyncError(f"another sync-sheets started {age / 60:.0f} min ago and has not finished ({self.path}); "
                                           "wait for it, or delete the file if that process is gone")
             self.path.parent.mkdir(parents=True, exist_ok=True)

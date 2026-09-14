@@ -1,5 +1,6 @@
 """Google Sheets sync client: row building, chunking, redirect/retry/error handling, the Code.gs header contract."""
 import json
+import os
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -206,6 +207,25 @@ class SyncTests(unittest.TestCase):
                     sheets.SyncLock(lock).__enter__()
                 self.assertIn("another sync-sheets", str(cm.exception))
             self.assertFalse(lock.exists())
+
+    def test_lock_of_a_dead_process_is_taken_over(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            lock = Path(d) / "sync.lock"
+            lock.write_text("999999999 2026-09-14T09:52:14")      # a pid no live process has
+            with mock.patch.object(sheets, "pid_alive", return_value=False):
+                with sheets.SyncLock(lock) as l:
+                    self.assertTrue(l.held)
+                    self.assertTrue(lock.read_text().startswith(str(os.getpid())))
+            self.assertFalse(lock.exists())
+            lock.write_text("1 2026-09-14T09:52:14")
+            with mock.patch.object(sheets, "pid_alive", return_value=True):
+                with self.assertRaises(sheets.SheetsSyncError):
+                    sheets.SyncLock(lock).__enter__()
+
+    def test_pid_alive(self):
+        self.assertTrue(sheets.pid_alive(os.getpid()))
+        self.assertFalse(sheets.pid_alive(0))
 
 
 class WatchlistRemoveTests(unittest.TestCase):

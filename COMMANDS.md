@@ -85,6 +85,7 @@ Get-Content logs\meta_2026-09-13.log -Tail 40          # same for the night run
 python tracker.py sync-sheets --verify-only            # does the sheet hold what the DB holds (per tab)
 python tracker.py sync-sheets                          # push everything to the sheet now
 python tracker.py db-check                             # 'database is locked'? shows whether tracker.db is free and what could be holding it
+Remove-Item data\sync.lock                             # only if sync-sheets says "another sync-sheets started ... has not finished" and no python is running
 python tracker.py rebuild                              # recompute the per-URL numbers from the stored ads (no scraping)
 dir logs                                               # which days actually ran (no file = the task did not run that day)
 schtasks /Query /TN "ShopifyTracker Daily" /V /FO LIST | findstr /C:"Last Run Time" /C:"Last Result" /C:"Next Run Time"
