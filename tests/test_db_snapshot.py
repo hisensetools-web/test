@@ -170,7 +170,7 @@ class MigrationTests(unittest.TestCase):
                              ("elivorahealth.com/pages/prostate", "2026-09-01", "2026-09-03", "2026-09-10"))
             self.assertEqual(conn.execute("SELECT COUNT(*) FROM ads_daily").fetchone()[0], 8)
             u = {r["snapshot_date"]: dict(r) for r in conn.execute("SELECT * FROM url_daily")}
-            self.assertEqual((u["2026-09-10"]["delivering"], u["2026-09-10"]["delivering_7d_ago"]), (3, 0))    # badges unknown a week earlier: 0 delivering then
+            self.assertEqual((u["2026-09-10"]["delivering"], u["2026-09-10"]["delivering_7d_ago"]), (3, None))   # badges unknown a week earlier: that day is no baseline
             self.assertNotIn("2026-09-03", u)                                                                    # no delivering ad that day: no row
             self.assertEqual(conn.execute("SELECT shop_id FROM stores").fetchone()[0], 12345)
             self.assertIn("2026-09-13-six-data-points", {r[0] for r in conn.execute("SELECT name FROM schema_migrations")})

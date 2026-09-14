@@ -183,12 +183,19 @@ def run_ads_pass(conn, stores: list[dict], snapshot_date: str, only: set[str] | 
                 t0 = time.monotonic()
                 try:
                     res = meta_ads.scrape_page(url, headless=headless, max_scrolls=max_scrolls, browser=browser)
-                    counts = meta_ads.record_scrape(conn, store_id, snapshot_date, res.ads, query)
-                    meta_ads.record_page_run(conn, store_id, snapshot_date, query, "ok", res.note, len(res.ads), res.scrolls, time.monotonic() - t0)
-                    log.info("%-28s ads=%-4d new=%-4d disappeared=%-3d badge_known=%-4d urls=%-3d scrolls=%d %.0fs  %s",
-                             domain, counts["total"], counts["new"], counts["disappeared"], counts["badge_known"], counts["urls"],
-                             res.scrolls, time.monotonic() - t0, res.note)
-                    ok += 1
+                    bad = meta_ads.unusable_scrape(res)
+                    if bad:
+                        # not a data point: recording it would mark every ad of the store gone / not delivering
+                        meta_ads.record_page_run(conn, store_id, snapshot_date, query, "empty", bad, len(res.ads), res.scrolls, time.monotonic() - t0)
+                        log.error("%-28s NOT RECORDED: %s (the store keeps its last good scrape; retried next pass)", domain, bad)
+                        failed += 1
+                    else:
+                        counts = meta_ads.record_scrape(conn, store_id, snapshot_date, res.ads, query)
+                        meta_ads.record_page_run(conn, store_id, snapshot_date, query, "ok", res.note, len(res.ads), res.scrolls, time.monotonic() - t0)
+                        log.info("%-28s ads=%-4d new=%-4d disappeared=%-3d badge_known=%-4d urls=%-3d scrolls=%d %.0fs  %s",
+                                 domain, counts["total"], counts["new"], counts["disappeared"], counts["badge_known"], counts["urls"],
+                                 res.scrolls, time.monotonic() - t0, res.note)
+                        ok += 1
                 except meta_ads.MetaBlocked as e:
                     meta_ads.record_page_run(conn, store_id, snapshot_date, query, "blocked", str(e), 0, 0, time.monotonic() - t0)
                     log.error("%-28s BLOCKED by Meta: %s (stopping this pass; try again later)", domain, e)

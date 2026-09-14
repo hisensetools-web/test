@@ -58,7 +58,7 @@ One row per landing URL (host + path, query string removed) with at least 3 deli
 | column | meaning |
 |---|---|
 | `delivering` | active ads on this URL whose card shows no "Low impression count" badge |
-| `delivering_7d_ago` | the same number from the scrape 6-8 days earlier; blank = no scrape then |
+| `delivering_7d_ago` | the same number from the scrape 6-8 days earlier; blank = no scrape with badges read then (the days copied from the old layout never count, so the column fills in a week after the update) |
 | `delivering_wow` | delivering / delivering_7d_ago; `new` = 0 a week ago; the tab is sorted on it (`new` first, blank last), then on delivering |
 | `proven_days` | age of the oldest still-delivering ad on the URL (start date from the Ad Library) |
 | `pages` / `pages_new_7d` | distinct Facebook pages with a delivering ad here / those whose first delivering ad here is under 7 days old |

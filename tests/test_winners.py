@@ -129,6 +129,29 @@ class UrlDailyTests(unittest.TestCase):
         winners.rebuild_url_daily(self.conn)
         self.assertEqual(before, [tuple(r) for r in self.conn.execute("SELECT * FROM url_daily ORDER BY 1, 2, 3")])
 
+    def test_a_week_ago_day_without_any_badge_is_no_baseline(self):
+        """Days copied from the previous layout (badge column absent) or a night whose cards never rendered count
+        nothing as delivering; they must not turn every URL into 'new' a week later."""
+        week_ago = d(7)
+        old = [ad("1", "Elivora", d(20), "https://elivorahealth.com/pages/prostate"), ad("2", "Elivora", d(20), "https://elivorahealth.com/pages/prostate")]
+        for a in old:
+            a["low_impressions"] = None
+        meta_ads.record_scrape(self.conn, self.sid, week_ago, old, "Elivora")
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) FROM url_daily WHERE snapshot_date = ?", (week_ago,)).fetchone()[0], 0)
+        today = [ad(str(i), "Elivora", d(2), "https://elivorahealth.com/pages/prostate") for i in range(1, 6)]
+        meta_ads.record_scrape(self.conn, self.sid, TODAY, today, "Elivora")
+        row = self.conn.execute("SELECT delivering, delivering_7d_ago FROM url_daily WHERE snapshot_date = ?", (TODAY,)).fetchone()
+        self.assertEqual((row["delivering"], row["delivering_7d_ago"]), (5, None))
+        stores = [dict(r) for r in self.conn.execute("SELECT id, store_domain, shop_id, store_created_est FROM stores")]
+        r = dict(zip(winners.WINNERS_HEADERS, winners.winners_rows(self.conn, stores, TODAY)[0]))
+        self.assertEqual((r["delivering_7d_ago"], r["delivering_wow"]), ("", ""))
+        # one badge read that day is enough: the day becomes a baseline and a URL absent then is 'new'
+        old[0]["low_impressions"] = True
+        meta_ads.record_scrape(self.conn, self.sid, week_ago, old, "Elivora")
+        winners.rebuild_url_daily(self.conn, self.sid)
+        row = self.conn.execute("SELECT delivering_7d_ago FROM url_daily WHERE snapshot_date = ?", (TODAY,)).fetchone()
+        self.assertEqual(row["delivering_7d_ago"], 0)
+
     def test_min_delivering_threshold_and_stores_rows(self):
         meta_ads.record_scrape(self.conn, self.sid, TODAY, [ad("1", "P", d(1), "https://elivorahealth.com/pages/a"), ad("2", "P", d(1), "https://elivorahealth.com/pages/a")], "q")
         stores = [dict(r) for r in self.conn.execute("SELECT id, store_domain, shop_id, store_created_est FROM stores")]

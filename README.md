@@ -122,7 +122,7 @@ One row per landing URL with at least 3 delivering ads in the store's latest scr
 |---|---|
 | `store`, `landing_url` | the watchlist store and the normalised URL (host + path, lower-case, no query string) |
 | `delivering` | active ads on the URL whose card shows no "Low impression count" badge. An ad whose card never rendered (badge unknown) is not delivering: a smaller number, never a wrong one |
-| `delivering_7d_ago` | the same from the scrape 6-8 days earlier (blank without one) |
+| `delivering_7d_ago` | the same from the scrape 6-8 days earlier (blank without one; a day whose badges were never read does not count) |
 | `delivering_wow` | `delivering / delivering_7d_ago`; `new` when it was 0 a week ago; blank without history. The tab sorts on it (`new` first, blank last), then on `delivering` |
 | `proven_days` | age of the oldest still-delivering ad on the URL |
 | `pages`, `pages_new_7d` | distinct Facebook pages with a delivering ad on the URL; those whose first delivering ad here is under 7 days old |

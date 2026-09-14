@@ -122,5 +122,17 @@ class RecordTests(unittest.TestCase):
         self.assertIsNone(meta_ads.days_running("bad", "also-bad", "2026-09-06"))
 
 
+class UnusableScrapeTests(unittest.TestCase):
+    def test_empty_or_unrendered_scrape_is_not_a_data_point(self):
+        r = meta_ads.ScrapeResult(url="u")
+        self.assertIn("no results loaded", meta_ads.unusable_scrape(r))
+        r = meta_ads.ScrapeResult(url="u", responses=2)                       # the search answered: the store has no ads
+        self.assertEqual(meta_ads.unusable_scrape(r), "")
+        r = meta_ads.ScrapeResult(url="u", responses=2, ads=[{"ad_id": "1"}], badges_read=0)
+        self.assertIn("no card rendered", meta_ads.unusable_scrape(r))
+        r = meta_ads.ScrapeResult(url="u", responses=2, ads=[{"ad_id": "1"}], badges_read=1)
+        self.assertEqual(meta_ads.unusable_scrape(r), "")
+
+
 if __name__ == "__main__":
     unittest.main()

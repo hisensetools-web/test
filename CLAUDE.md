@@ -31,7 +31,7 @@ Families, Signals, Early, Pages, Ads, Products and Alerts tabs, and every alert 
 
 ## Derived (per landing URL, per day; `url_daily`)
 - `delivering`: active ads on the URL without the badge
-- `delivering_7d_ago` (the scrape 6-8 days earlier; blank without one) and `delivering_wow = delivering / delivering_7d_ago`
+- `delivering_7d_ago` (the scrape 6-8 days earlier that read at least one badge; blank without one, so days from the previous layout never serve as a baseline) and `delivering_wow = delivering / delivering_7d_ago`
   (`new` when it was 0 a week ago)
 - `proven_days`: age of the oldest still-delivering ad on the URL
 - `pages`: distinct page_ids with a delivering ad on the URL; `pages_new_7d`: pages whose first delivering ad on the URL is < 7 days old

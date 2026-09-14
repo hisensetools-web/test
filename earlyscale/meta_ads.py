@@ -455,6 +455,17 @@ def _check_blocked(page, result: ScrapeResult) -> None:
 
 # ---------------------------------------------------------------- SQLite
 
+def unusable_scrape(res: "ScrapeResult") -> str:
+    """Why this scrape must not be written as the store's day, or '' when it is fine. Zero ads with no result
+    response at all means the search never loaded (not: the store stopped advertising); ads whose cards never
+    rendered carry no badge, so nothing would count as delivering."""
+    if not res.ads and res.responses == 0:
+        return "no results loaded from the Ad Library"
+    if res.ads and res.badges_read == 0:
+        return f"{len(res.ads)} ads but no card rendered (badge unknown for all of them)"
+    return ""
+
+
 def record_scrape(conn: sqlite3.Connection, store_id: int, snapshot_date: str, ads: list[dict], query: str) -> dict:
     """Write one page's scrape: ads (upsert), today's ads_daily rows, still_active=0 rows for ads of this store
     that were not in today's results, then the store's url_daily rows for the day.

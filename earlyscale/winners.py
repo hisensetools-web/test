@@ -179,6 +179,14 @@ def scrape_dates(conn: sqlite3.Connection, store_id: int) -> list[str]:
     return [r[0] for r in conn.execute("SELECT DISTINCT snapshot_date FROM ads_daily WHERE store_id = ? ORDER BY snapshot_date", (store_id,))]
 
 
+def baseline_dates(conn: sqlite3.Connection, store_id: int) -> list[str]:
+    """Scrape days that can serve as a week-ago baseline: at least one badge was read that day. A day whose badges
+    are all unknown (the previous layout before the badge existed, a night the cards never rendered) counted
+    nothing as delivering, and comparing against it would call every URL 'new'."""
+    return [r[0] for r in conn.execute("""SELECT DISTINCT snapshot_date FROM ads_daily WHERE store_id = ? AND low_impressions IS NOT NULL
+                                          ORDER BY snapshot_date""", (store_id,))]
+
+
 def week_ago_scrape(dates: list[str], today: str) -> str | None:
     """The scrape day closest to today - 7 within today - 8 .. today - 6, else None (no week-over-week)."""
     t = date.fromisoformat(today)
@@ -201,7 +209,7 @@ def compute_url_daily(conn: sqlite3.Connection, store_id: int, today: str, famil
     for r in rows:
         if r["low_impressions"] == 0:                     # 1 = badge, NULL = unknown: neither is delivering
             per_url[r["landing_path"]].append(r)
-    prev_day = week_ago_scrape(scrape_dates(conn, store_id), today)
+    prev_day = week_ago_scrape(baseline_dates(conn, store_id), today)
     prev: dict[str, int] = {}
     if prev_day:
         prev = {r[0]: r[1] for r in conn.execute("SELECT landing_path, delivering FROM url_daily WHERE store_id = ? AND snapshot_date = ?",
