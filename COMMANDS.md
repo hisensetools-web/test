@@ -132,3 +132,20 @@ python tracker.py ads --only a.com b.com               # scrape new stores now i
 | `META_ADS=1` | `run` includes the Meta pass when run by hand (the night task does it anyway) |
 | `META_STORES=a.com,b.com` | limit the Meta pass to these stores (default: all, least recently scraped first) |
 | `META_MAX_SCROLLS=20` | how deep each store's Meta scrape goes (~350 newest ads, ~3 min per store) |
+
+## 6. Adspy videos: `adspy.py`
+
+Downloads every Adspy link of the **Main TikTok Prods V2** tab into `adspy_output\<product>\`, clean (no TikTok
+watermark) and at the best quality available. Once: `pip install -r requirements.txt` and `winget install Gyan.FFmpeg`.
+
+```powershell
+python adspy.py check                                  # yt-dlp / ffmpeg present, sheet readable, products and link counts
+python adspy.py download                               # all products; run again any time, only missing or failed links are fetched
+python adspy.py download --only "ghostface"            # one product (any part of its name)
+python adspy.py download --cookies-from-browser chrome # Instagram reels need a logged-in browser (close Chrome first)
+python adspy.py links --urls                           # what is on the sheet, without downloading
+```
+
+"Google returned the sign-in page" = the sheet is not shared as *Anyone with the link: Viewer*. Either share it that
+way, or with the tab open do File > Download > CSV and run `python adspy.py download --csv "<that file>"`.
+

@@ -10,3 +10,5 @@ logs/
 pdp_output/
 data/shopify_token.json
 stores.txt
+adspy_output/
+cookies.txt
