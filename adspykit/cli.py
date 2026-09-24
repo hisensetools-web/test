@@ -71,11 +71,50 @@ def cmd_download(args) -> int:
         failed += [(p.name, r) for r in results if r.status == "failed"]
     print(f"\ndone: {totals['downloaded']} downloaded, {totals['exists']} already there, {totals['failed']} failed"
           + (f", {totals['dry-run']} would be fetched" if args.dry_run else ""))
+    if not args.dry_run and not args.keep_metadata and config.STRIP_METADATA:
+        _strip_all(products, out_root, force=False)
     if failed:
         print("failed links (run again to retry; Instagram usually needs --cookies-from-browser chrome):")
         for name, r in failed[:40]:
             print(f"  {name}: {r.url}  {r.error[:120]}")
     return 0 if not failed or totals["downloaded"] or totals["exists"] else 1
+
+
+def _strip_all(products, out_root: Path, force: bool) -> dict[str, int]:
+    from . import download as dl, metadata
+    totals = {"cleaned": 0, "skipped": 0, "failed": 0}
+    if not metadata.find_ffmpeg():
+        print("\nmetadata NOT removed: ffmpeg not found (winget install Gyan.FFmpeg, reopen the terminal, then `python adspy.py clean`)")
+        return totals
+    print("\nremoving metadata (stream copy, quality untouched)...")
+    for p in products:
+        folder = out_root / p.slug
+        if not folder.exists():
+            continue
+        counts = dl.strip_product(p, out_root, force=force, progress=print)
+        for k, v in counts.items():
+            totals[k] += v
+    print(f"metadata: {totals['cleaned']} files cleaned, {totals['skipped']} already clean, {totals['failed']} failed")
+    return totals
+
+
+def cmd_clean(args) -> int:
+    products, _ = _products(args)
+    out_root = Path(args.out) if args.out else config.OUTPUT_ROOT
+    totals = _strip_all(products, out_root, force=args.force)
+    if args.verify:
+        from . import metadata
+        left = 0
+        for p in products:
+            folder = out_root / p.slug
+            for f in (metadata.video_files(folder) if folder.exists() else []):
+                t = metadata.tags(f)
+                if t:
+                    left += 1
+                    print(f"  still tagged {p.slug}/{f.name}: {', '.join(f'{k}={v[:40]}' for k, v in t.items())}")
+        print(f"verify: {left} files still carry tags" if left else "verify: no tags left on any file")
+        return 1 if left else 0
+    return 1 if totals["failed"] else 0
 
 
 def cmd_check(args) -> int:
@@ -86,7 +125,10 @@ def cmd_check(args) -> int:
     except ImportError:
         print("yt-dlp : NOT INSTALLED  ->  pip install -r requirements.txt")
         return 1
-    print(f"ffmpeg : {'found' if dl.ffmpeg_available() else 'NOT FOUND (winget install Gyan.FFmpeg, then reopen the terminal)'}")
+    from . import metadata
+    ff = metadata.find_ffmpeg()
+    print(f"ffmpeg : {ff or 'NOT FOUND (winget install Gyan.FFmpeg, then reopen the terminal; needed for merging and for the metadata removal)'}")
+    print(f"strip  : {'metadata removed after every download' if config.STRIP_METADATA else 'OFF (ADSPY_STRIP_METADATA=0)'}")
     print(f"format : {dl.format_expression()}")
     print(f"sheet  : {args.sheet_id}  tab '{args.tab}' (gid {args.gid})  columns '{args.product_column}' / '{args.link_column}'")
     print(f"output : {config.OUTPUT_ROOT}")
@@ -129,7 +171,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pause", type=float, default=None, help=f"seconds between downloads (default {config.PAUSE_S})")
     p.add_argument("--cookies", default="", help="Netscape cookies.txt (ADSPY_COOKIES); Instagram needs a logged-in session")
     p.add_argument("--cookies-from-browser", default="", metavar="BROWSER", help="chrome | edge | firefox ... (ADSPY_COOKIES_FROM_BROWSER)")
+    p.add_argument("--keep-metadata", action="store_true", help="skip the metadata removal that runs after the downloads")
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("clean", help="remove metadata from every downloaded video (runs automatically after `download`)")
+    common(p)
+    p.add_argument("--out", help=f"output root (default {config.OUTPUT_ROOT})")
+    p.add_argument("--force", action="store_true", help="re-clean files already marked clean")
+    p.add_argument("--verify", action="store_true", help="afterwards, list any file that still carries a tag")
+    p.set_defaults(func=cmd_clean)
 
     p = sub.add_parser("check", help="yt-dlp / ffmpeg present, sheet readable")
     common(p)

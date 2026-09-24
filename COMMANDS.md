@@ -157,6 +157,7 @@ python adspy.py download                               # all products; run again
 python adspy.py download --only "ghostface"            # one product (any part of its name)
 python adspy.py download --cookies-from-browser chrome # Instagram reels need a logged-in browser (close Chrome first)
 python adspy.py links --urls                           # what is on the sheet, without downloading
+python adspy.py clean --verify                         # metadata removal on its own (download already runs it), then prove no tag is left
 ```
 
 "Google returned the sign-in page" = the sheet is not shared as *Anyone with the link: Viewer*. Either share it that

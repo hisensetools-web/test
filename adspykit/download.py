@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Protocol
 
-from . import config
+from . import config, metadata
 from .sheet import Product
 
 log = logging.getLogger("adspy.download")
@@ -43,6 +43,7 @@ class VideoResult:
     format_note: str = ""
     error: str = ""
     at: str = ""
+    clean: bool = False          # metadata stripped after the download
 
 
 class Downloader(Protocol):
@@ -50,7 +51,7 @@ class Downloader(Protocol):
 
 
 def ffmpeg_available() -> bool:
-    return shutil.which("ffmpeg") is not None
+    return metadata.find_ffmpeg() is not None
 
 
 def format_expression(has_ffmpeg: bool | None = None) -> str:
@@ -79,6 +80,9 @@ def ydl_options(dest: Path, cookies: str = "", cookies_from_browser: str = "", q
         "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}] if ffmpeg_available() else [],
         "http_headers": {"User-Agent": config.USER_AGENT},
     }
+    ff = metadata.find_ffmpeg()
+    if ff and shutil.which("ffmpeg") is None:
+        opts["ffmpeg_location"] = ff
     cookies = cookies or config.COOKIES_FILE
     browser = cookies_from_browser or config.COOKIES_FROM_BROWSER
     if cookies:
@@ -140,7 +144,7 @@ def load_manifest(folder: Path) -> dict[str, VideoResult]:
     out = {}
     for row in data.get("videos", []):
         try:
-            out[row["url"]] = VideoResult(**{k: row.get(k, "") for k in VideoResult.__dataclass_fields__})
+            out[row["url"]] = VideoResult(**{k: row[k] for k in VideoResult.__dataclass_fields__ if k in row})
         except TypeError:
             continue
     return out
@@ -201,3 +205,34 @@ def summarise(results: list[VideoResult]) -> dict[str, int]:
     for r in results:
         out[r.status] = out.get(r.status, 0) + 1
     return out
+
+
+def strip_product(product: Product, out_root: Path, force: bool = False, progress: Callable[[str], None] | None = None,
+                  stripper: Callable[[Path], tuple[bool, str]] | None = None) -> dict[str, int]:
+    """Remove the metadata of every video in the product folder that is not yet marked clean in the manifest.
+    Files not in the manifest (copied in by hand) are stripped too. Returns counts: cleaned / skipped / failed."""
+    folder = out_root / product.slug
+    say = progress or (lambda s: None)
+    counts = {"cleaned": 0, "skipped": 0, "failed": 0}
+    if not folder.exists():
+        return counts
+    strip = stripper or metadata.strip_file
+    manifest = load_manifest(folder)
+    by_file = {r.file: r for r in manifest.values() if r.file}
+    for f in metadata.video_files(folder):
+        entry = by_file.get(f.name)
+        if entry and entry.clean and not force:
+            counts["skipped"] += 1
+            continue
+        ok, err = strip(f)
+        if ok:
+            counts["cleaned"] += 1
+            if entry:
+                entry.clean = True
+            say(f"  cleaned     {f.name}")
+        else:
+            counts["failed"] += 1
+            say(f"  NOT cleaned {f.name}  ({err})")
+    if manifest:
+        save_manifest(folder, product, manifest)
+    return counts

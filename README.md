@@ -89,7 +89,11 @@ python adspy.py download --cookies-from-browser chrome     # Instagram reels nee
 python adspy.py download --csv "Main TikTok Prods V2.csv"  # from a CSV downloaded by hand instead of the live sheet
 ```
 
-Each product folder holds the videos (`TikTok-<id>.mp4`, `Instagram-<id>.mp4`), `links.txt` (the links as they were on
+Once the downloads are done the same run removes the metadata of every file (title, description, creator handle,
+encoder, creation time, per-stream tags, chapters): ffmpeg rewrites the file with stream copy, so nothing is re-encoded and
+the quality is untouched. `manifest.json` marks each file `clean`; `python adspy.py clean` runs the pass on its own
+(`--verify` lists any file still carrying a tag, `--force` re-cleans), `download --keep-metadata` or
+`ADSPY_STRIP_METADATA=0` skips it. Each product folder holds the videos (`TikTok-<id>.mp4`, `Instagram-<id>.mp4`), `links.txt` (the links as they were on
 the sheet) and `manifest.json` (per link: file, id, size, status, error). Failed links are listed at the end of the run and
 retried on the next one; `--force` refetches everything. The sheet is read through its CSV export, which needs it shared
 as *Anyone with the link: Viewer*; a private sheet gets the sign-in page instead, which the tool detects and explains

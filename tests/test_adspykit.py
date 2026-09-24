@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from adspykit import cli, download, sheet
+from adspykit import cli, download, metadata, sheet
 from adspykit.sheet import Product
 
 FIX = Path(__file__).parent / "fixtures_adspy" / "main_tiktok_prods_v2.csv"
@@ -198,6 +198,72 @@ class YtdlpWrapperTests(unittest.TestCase):
             self.assertIn(".downloaded.txt", r.error)
 
 
+class StripTests(unittest.TestCase):
+    def _setup(self, root):
+        p = Product(name="Skull Candle Warmer", links=["https://vm.tiktok.com/AAA/", "https://vm.tiktok.com/BBB/"])
+        download.download_product(p, root, FakeDownloader(), pause_s=0)
+        (root / p.slug / "by-hand.mp4").write_bytes(b"\x00")      # not in the manifest, still cleaned
+        (root / p.slug / "notes.txt").write_text("x")
+        return p
+
+    def test_strip_marks_manifest_skips_clean_files_and_records_failures(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            p = self._setup(root)
+            seen = []
+
+            def fake_strip(path):
+                seen.append(path.name)
+                return (False, "boom") if path.name == "TikTok-BBB.mp4" else (True, "")
+
+            counts = download.strip_product(p, root, stripper=fake_strip)
+            self.assertEqual(sorted(seen), ["TikTok-AAA.mp4", "TikTok-BBB.mp4", "by-hand.mp4"])
+            self.assertEqual(counts, {"cleaned": 2, "skipped": 0, "failed": 1})
+            m = {v["file"]: v["clean"] for v in json.loads((root / p.slug / "manifest.json").read_text())["videos"]}
+            self.assertEqual(m, {"TikTok-AAA.mp4": True, "TikTok-BBB.mp4": False})
+            seen.clear()
+            counts = download.strip_product(p, root, stripper=fake_strip)
+            self.assertEqual(sorted(seen), ["TikTok-BBB.mp4", "by-hand.mp4"])              # AAA is marked clean; the hand-copied file has no manifest row
+            self.assertEqual(counts, {"cleaned": 1, "skipped": 1, "failed": 1})
+            forced = []
+            counts = download.strip_product(p, root, stripper=lambda pth: forced.append(pth.name) or (True, ""), force=True)
+            self.assertEqual(sorted(forced), ["TikTok-AAA.mp4", "TikTok-BBB.mp4", "by-hand.mp4"])
+            self.assertEqual(counts, {"cleaned": 3, "skipped": 0, "failed": 0})
+            # the clean flag survives a re-download run (manifest round trip)
+            res = download.download_product(p, root, FakeDownloader(), pause_s=0)
+            self.assertEqual([(r.status, r.clean) for r in res], [("exists", True), ("exists", True)])
+
+    def test_missing_folder_and_no_ffmpeg(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = Product(name="Nothing Yet", links=[])
+            self.assertEqual(download.strip_product(p, Path(d)), {"cleaned": 0, "skipped": 0, "failed": 0})
+            with mock.patch.object(metadata, "find_ffmpeg", return_value=None):
+                ok, err = metadata.strip_file(Path(d) / "x.mp4")
+                self.assertFalse(ok)
+                self.assertIn("ffmpeg not found", err)
+
+    @unittest.skipUnless(metadata.find_ffmpeg(), "ffmpeg not available")
+    def test_real_ffmpeg_removes_every_tag_without_reencoding(self):
+        import subprocess
+        ff = metadata.find_ffmpeg()
+        with tempfile.TemporaryDirectory() as d:
+            src = Path(d) / "TikTok-1.mp4"
+            subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", "testsrc=size=64x64:rate=10:duration=1",
+                            "-f", "lavfi", "-i", "sine=frequency=440:duration=1", "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac",
+                            "-metadata", "title=TikTok clip", "-metadata", "comment=@creator 7381", "-metadata", "description=desc",
+                            "-metadata:s:v", "handler_name=VideoHandler X", str(src)], check=True)
+            before = metadata.tags(src)
+            self.assertEqual(before.get("title"), "TikTok clip")
+            self.assertIn("encoder", before)
+            ok, err = metadata.strip_file(src)
+            self.assertTrue(ok, err)
+            self.assertEqual(metadata.tags(src), {})
+            self.assertFalse((Path(d) / "TikTok-1.clean.mp4").exists())
+            probe = subprocess.run([ff, "-hide_banner", "-i", str(src)], capture_output=True, text=True).stderr
+            self.assertIn("h264", probe)                       # still the same codec: stream copy, not re-encoded
+            self.assertIn("aac", probe)
+
+
 class CliTests(unittest.TestCase):
     def test_links_and_dry_run_download_from_csv(self):
         with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out:
@@ -209,6 +275,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("Trunk Horror Prop", printed)
         self.assertIn("https://www.instagram.com/reel/Ddb7uPzx9gA/", printed)
         self.assertIn("2 would be fetched", printed)
+
+    def test_clean_command_without_ffmpeg_says_so(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out, mock.patch.object(metadata, "find_ffmpeg", return_value=None):
+            self.assertEqual(cli.main(["clean", "--csv", str(FIX), "--out", d]), 0)
+            printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
+        self.assertIn("ffmpeg not found", printed)
 
     def test_unknown_product_is_a_clear_exit(self):
         with self.assertRaises(SystemExit) as cm:
