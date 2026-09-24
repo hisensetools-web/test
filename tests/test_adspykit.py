@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from adspykit import cli, download, metadata, sheet
+from adspykit import cli, dedup, download, metadata, sheet
 from adspykit.sheet import Product
 
 FIX = Path(__file__).parent / "fixtures_adspy" / "main_tiktok_prods_v2.csv"
@@ -110,7 +110,7 @@ class DownloadLoopTests(unittest.TestCase):
             m = json.loads((folder / "manifest.json").read_text())
             self.assertEqual((m["product"], m["links"], m["downloaded"]), ("Skull Candle Warmer", 3, 2))
             self.assertEqual({v["url"]: v["status"] for v in m["videos"]}, {p.links[0]: "downloaded", p.links[1]: "failed", p.links[2]: "downloaded"})
-            self.assertEqual(download.summarise(res), {"downloaded": 2, "exists": 0, "failed": 1, "dry-run": 0})
+            self.assertEqual(download.summarise(res), {"downloaded": 2, "exists": 0, "failed": 1, "dry-run": 0, "duplicate": 0})
             # second run: only the failed link is retried
             fake2 = FakeDownloader()
             res2 = download.download_product(p, root, fake2, pause_s=0)
@@ -264,6 +264,64 @@ class StripTests(unittest.TestCase):
             self.assertIn("aac", probe)
 
 
+class DedupTests(unittest.TestCase):
+    def _folders(self, root):
+        a = Product(name="Skull Candle Warmer", links=["https://vm.tiktok.com/A1/", "https://vm.tiktok.com/A2/", "https://vm.tiktok.com/A3/"])
+        b = Product(name="Swinging Ghost Decor", links=["https://vm.tiktok.com/B1/", "https://vm.tiktok.com/B2/"])
+        for p in (a, b):
+            download.download_product(p, root, FakeDownloader(), pause_s=0)
+        fa, fb = root / a.slug, root / b.slug
+        (fa / "TikTok-A1.mp4").write_bytes(b"same clip" * 1000)
+        (fa / "TikTok-A2.mp4").write_bytes(b"same clip" * 1000)          # repost of A1 under another id
+        (fa / "TikTok-A3.mp4").write_bytes(b"other clip" * 1000)
+        (fa / "TikTok-A3.webm").write_bytes(b"other clip, smaller")      # same id, second container
+        (fa / "TikTok-A9.mp4.part").write_bytes(b"\x00" * 50)            # interrupted download
+        (fa / "TikTok-A3.clean.mp4").write_bytes(b"\x00")                 # interrupted strip
+        (fb / "TikTok-B1.mp4").write_bytes(b"same clip" * 1000)          # the A1 clip again, other product
+        (fb / "TikTok-B2.mp4").write_bytes(b"b only" * 1000)
+        return a, b, fa, fb
+
+    def test_removes_reposts_second_containers_leftovers_and_cross_product_copies(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            a, b, fa, fb = self._folders(root)
+            lines = []
+            counts = dedup.dedup([a, b], root, across_products=True, progress=lines.append)
+            self.assertEqual((counts["duplicates"], counts["leftovers"]), (3, 2))
+            self.assertGreater(counts["bytes"], 9000 * 2)
+            self.assertEqual(sorted(f.name for f in fa.iterdir()), ["TikTok-A1.mp4", "TikTok-A3.mp4", "links.txt", "manifest.json"])
+            self.assertEqual(sorted(f.name for f in fb.iterdir()), ["TikTok-B2.mp4", "links.txt", "manifest.json"])
+            ma = {v["url"]: v for v in json.loads((fa / "manifest.json").read_text())["videos"]}
+            self.assertEqual((ma["https://vm.tiktok.com/A2/"]["status"], ma["https://vm.tiktok.com/A2/"]["file"]), ("downloaded", "TikTok-A1.mp4"))
+            mb = {v["url"]: v for v in json.loads((fb / "manifest.json").read_text())["videos"]}
+            self.assertEqual((mb["https://vm.tiktok.com/B1/"]["status"], mb["https://vm.tiktok.com/B1/"]["file"], mb["https://vm.tiktok.com/B1/"]["duplicate_of"]),
+                             ("duplicate", "", "skull-candle-warmer/TikTok-A1.mp4"))
+            self.assertTrue(any("TikTok-A9.mp4.part" in l for l in lines))
+            # a second download run refetches nothing: A2 maps to the kept file, B1 is a known duplicate
+            fake = FakeDownloader()
+            res = download.download_product(b, root, fake, pause_s=0)
+            self.assertEqual(fake.calls, [])
+            self.assertEqual([r.status for r in res], ["duplicate", "exists"])
+            fake = FakeDownloader()
+            res = download.download_product(a, root, fake, pause_s=0)
+            self.assertEqual(fake.calls, [])
+            self.assertEqual([(r.status, r.file) for r in res], [("exists", "TikTok-A1.mp4"), ("exists", "TikTok-A1.mp4"), ("exists", "TikTok-A3.mp4")])
+            # and a second dedup pass finds nothing
+            self.assertEqual(dedup.dedup([a, b], root, across_products=True), {"leftovers": 0, "duplicates": 0, "bytes": 0})
+
+    def test_per_product_scope_and_dry_run_keep_files(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            a, b, fa, fb = self._folders(root)
+            counts = dedup.dedup([a, b], root, across_products=True, dry_run=True)
+            self.assertEqual((counts["duplicates"], counts["leftovers"]), (3, 2))
+            self.assertTrue((fb / "TikTok-B1.mp4").exists() and (fa / "TikTok-A2.mp4").exists() and (fa / "TikTok-A9.mp4.part").exists())
+            counts = dedup.dedup([a, b], root, across_products=False)
+            self.assertEqual(counts["duplicates"], 2)
+            self.assertTrue((fb / "TikTok-B1.mp4").exists())                # cross-product copy kept in this scope
+            self.assertFalse((fa / "TikTok-A2.mp4").exists())
+
+
 class CliTests(unittest.TestCase):
     def test_links_and_dry_run_download_from_csv(self):
         with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out:
@@ -281,6 +339,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual(cli.main(["clean", "--csv", str(FIX), "--out", d]), 0)
             printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
         self.assertIn("ffmpeg not found", printed)
+
+    def test_dedup_command_dry_run(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out:
+            p = Product(name="Trunk Horror Prop", links=["https://x/1", "https://x/2"])
+            download.download_product(p, Path(d), FakeDownloader(), pause_s=0)
+            self.assertEqual(cli.main(["dedup", "--csv", str(FIX), "--out", d, "--dry-run"]), 0)
+            printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
+            self.assertTrue((Path(d) / "trunk-horror-prop" / "TikTok-1.mp4").exists())
+        self.assertIn("1 duplicate videos", printed)            # FakeDownloader writes identical bytes for both links
+        self.assertIn("would free", printed)
 
     def test_unknown_product_is_a_clear_exit(self):
         with self.assertRaises(SystemExit) as cm:

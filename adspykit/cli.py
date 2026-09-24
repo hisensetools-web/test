@@ -49,7 +49,7 @@ def cmd_download(args) -> int:
     print(f"format: {dl.format_expression(has_ffmpeg)}" + ("" if has_ffmpeg else "   (ffmpeg not found: single-file formats only; install it for merged best video+audio)"))
     downloader = (lambda url, dest: dl.VideoResult(url=url, status="dry-run")) if args.dry_run else \
         dl.ytdlp_downloader(args.cookies, args.cookies_from_browser, quiet=not args.verbose)
-    totals = {"downloaded": 0, "exists": 0, "failed": 0, "dry-run": 0}
+    totals = {"downloaded": 0, "exists": 0, "failed": 0, "dry-run": 0, "duplicate": 0}
     failed: list[tuple[str, dl.VideoResult]] = []
     for p in products:
         if not p.links:
@@ -70,9 +70,12 @@ def cmd_download(args) -> int:
             totals[k] = totals.get(k, 0) + v
         failed += [(p.name, r) for r in results if r.status == "failed"]
     print(f"\ndone: {totals['downloaded']} downloaded, {totals['exists']} already there, {totals['failed']} failed"
+          + (f", {totals['duplicate']} known duplicates skipped" if totals["duplicate"] else "")
           + (f", {totals['dry-run']} would be fetched" if args.dry_run else ""))
     if not args.dry_run and not args.keep_metadata and config.STRIP_METADATA:
         _strip_all(products, out_root, force=False)
+    if not args.dry_run and not args.no_dedup and config.DEDUP:
+        _dedup_all(products, out_root, dry_run=False)
     if failed:
         print("failed links (run again to retry; Instagram usually needs --cookies-from-browser chrome):")
         for name, r in failed[:40]:
@@ -96,6 +99,22 @@ def _strip_all(products, out_root: Path, force: bool) -> dict[str, int]:
             totals[k] += v
     print(f"metadata: {totals['cleaned']} files cleaned, {totals['skipped']} already clean, {totals['failed']} failed")
     return totals
+
+
+def _dedup_all(products, out_root: Path, dry_run: bool) -> dict[str, int]:
+    from . import dedup
+    print("\nchecking for duplicates..." + (" (dry run)" if dry_run else ""))
+    counts = dedup.dedup(products, out_root, dry_run=dry_run, progress=print)
+    verb = "would free" if dry_run else "freed"
+    print(f"duplicates: {counts['duplicates']} duplicate videos, {counts['leftovers']} leftover files, {verb} {counts['bytes'] / 1_048_576:.1f} MB")
+    return counts
+
+
+def cmd_dedup(args) -> int:
+    products, _ = _products(args)
+    out_root = Path(args.out) if args.out else config.OUTPUT_ROOT
+    _dedup_all(products, out_root, dry_run=args.dry_run)
+    return 0
 
 
 def cmd_clean(args) -> int:
@@ -129,6 +148,7 @@ def cmd_check(args) -> int:
     ff = metadata.find_ffmpeg()
     print(f"ffmpeg : {ff or 'NOT FOUND (winget install Gyan.FFmpeg, then reopen the terminal; needed for merging and for the metadata removal)'}")
     print(f"strip  : {'metadata removed after every download' if config.STRIP_METADATA else 'OFF (ADSPY_STRIP_METADATA=0)'}")
+    print(f"dedup  : {('duplicates removed after every download, one copy ' + ('per sheet' if config.DEDUP_ACROSS else 'per product')) if config.DEDUP else 'OFF (ADSPY_DEDUP=0)'}")
     print(f"format : {dl.format_expression()}")
     print(f"sheet  : {args.sheet_id}  tab '{args.tab}' (gid {args.gid})  columns '{args.product_column}' / '{args.link_column}'")
     print(f"output : {config.OUTPUT_ROOT}")
@@ -172,7 +192,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cookies", default="", help="Netscape cookies.txt (ADSPY_COOKIES); Instagram needs a logged-in session")
     p.add_argument("--cookies-from-browser", default="", metavar="BROWSER", help="chrome | edge | firefox ... (ADSPY_COOKIES_FROM_BROWSER)")
     p.add_argument("--keep-metadata", action="store_true", help="skip the metadata removal that runs after the downloads")
+    p.add_argument("--no-dedup", action="store_true", help="skip the duplicate removal that runs after the downloads")
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("dedup", help="remove duplicate videos and leftover partial files (runs automatically after `download`)")
+    common(p)
+    p.add_argument("--out", help=f"output root (default {config.OUTPUT_ROOT})")
+    p.add_argument("--dry-run", action="store_true", help="list what would be removed, delete nothing")
+    p.set_defaults(func=cmd_dedup)
 
     p = sub.add_parser("clean", help="remove metadata from every downloaded video (runs automatically after `download`)")
     common(p)

@@ -57,6 +57,8 @@ PAUSE_S = float(os.environ.get("ADSPY_PAUSE_S", "2"))          # polite pause be
 RETRIES = int(os.environ.get("ADSPY_RETRIES", "3"))
 FORMAT_OVERRIDE = os.environ.get("ADSPY_FORMAT", "").strip()    # a raw yt-dlp -f expression, if you ever need one
 FFMPEG = os.environ.get("ADSPY_FFMPEG", "").strip()              # full path to ffmpeg.exe when it is not on PATH
+DEDUP = os.environ.get("ADSPY_DEDUP", "1").strip().lower() not in ("0", "false", "no")
+DEDUP_ACROSS = os.environ.get("ADSPY_DEDUP_ACROSS", "1").strip().lower() not in ("0", "false", "no")   # one copy per sheet, not per product
 STRIP_METADATA = os.environ.get("ADSPY_STRIP_METADATA", "1").strip().lower() not in ("0", "false", "no")
 
 REQUEST_TIMEOUT = (10, 60)

@@ -34,7 +34,7 @@ FORMAT_NO_FFMPEG = f"b{NO_WATERMARK}/b"       # a single muxed file; nothing to 
 @dataclass
 class VideoResult:
     url: str
-    status: str                  # downloaded | exists | failed | dry-run
+    status: str                  # downloaded | exists | failed | dry-run | duplicate
     file: str = ""
     video_id: str = ""
     title: str = ""
@@ -44,6 +44,7 @@ class VideoResult:
     error: str = ""
     at: str = ""
     clean: bool = False          # metadata stripped after the download
+    duplicate_of: str = ""       # "<slug>/<file>" when the dedup pass removed this file as a copy of that one
 
 
 class Downloader(Protocol):
@@ -178,6 +179,11 @@ def download_product(product: Product, out_root: Path, downloader: Downloader, m
             results.append(r)
             say(f"  [{i}/{len(links)}] exists      {r.file}")
             continue
+        if prev and not force and prev.status == "duplicate":
+            r = VideoResult(**asdict(prev))
+            results.append(r)
+            say(f"  [{i}/{len(links)}] duplicate   of {prev.duplicate_of} (not fetched again)")
+            continue
         if dry_run:
             r = VideoResult(url=url, status="dry-run")
             results.append(r)
@@ -201,7 +207,7 @@ def download_product(product: Product, out_root: Path, downloader: Downloader, m
 
 
 def summarise(results: list[VideoResult]) -> dict[str, int]:
-    out = {"downloaded": 0, "exists": 0, "failed": 0, "dry-run": 0}
+    out = {"downloaded": 0, "exists": 0, "failed": 0, "dry-run": 0, "duplicate": 0}
     for r in results:
         out[r.status] = out.get(r.status, 0) + 1
     return out
