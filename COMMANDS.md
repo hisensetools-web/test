@@ -136,7 +136,20 @@ python tracker.py ads --only a.com b.com               # scrape new stores now i
 ## 6. Adspy videos: `adspy.py`
 
 Downloads every Adspy link of the **Main TikTok Prods V2** tab into `adspy_output\<product>\`, clean (no TikTok
-watermark) and at the best quality available. Once: `pip install -r requirements.txt` and `winget install Gyan.FFmpeg`.
+watermark) and at the best quality available. It runs on its own in `C:\Users\top2\Desktop\vid` (no tracker needed there).
+Once, to put it there (or refresh it after an update):
+
+```powershell
+cd C:\Users\top2\Desktop
+git clone --depth 1 -b claude/ecstatic-brahmagupta-9esg5e https://github.com/hisensetools-web/test vid-src
+New-Item -ItemType Directory -Force vid | Out-Null
+Copy-Item vid-src\adspy.py, vid-src\requirements-adspy.txt -Destination vid
+Copy-Item vid-src\adspykit -Destination vid -Recurse -Force
+Remove-Item -Recurse -Force vid-src
+cd vid
+pip install -r requirements-adspy.txt
+winget install Gyan.FFmpeg                             # once; reopen the terminal afterwards
+```
 
 ```powershell
 python adspy.py check                                  # yt-dlp / ffmpeg present, sheet readable, products and link counts

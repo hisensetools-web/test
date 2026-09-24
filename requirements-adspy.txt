@@ -1,0 +1,3 @@
+# adspy.py on its own (copied to another folder): pip install -r requirements-adspy.txt
+requests>=2.31
+yt-dlp>=2026.1        # ffmpeg on PATH for merged best video+audio (winget install Gyan.FFmpeg)

@@ -1,12 +1,42 @@
-"""Settings for adspy.py (all optional, read from .env through the shared loader in pdpkit.config)."""
+"""Settings for adspy.py (all optional, from .env next to adspy.py). Self-contained: the adspy.py + adspykit/
+pair can be copied to any folder and run there without the rest of this repository."""
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 
-from pdpkit.config import ROOT, USER_AGENT, load_dotenv, slugify  # noqa: F401  (one .env for every tool)
+ROOT = Path(__file__).resolve().parent.parent      # the folder that holds adspy.py
+
+
+def load_dotenv(path: Path = ROOT / ".env") -> None:
+    """Minimal .env loader: KEY=VALUE lines, '#' comments, no interpolation. Existing environment variables win."""
+    if not path.exists():
+        return
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.split(" #", 1)[0].strip().strip("'\"")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
 
 load_dotenv()
+
+USER_AGENT = os.environ.get(
+    "USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+)
+
+
+def slugify(text: str, max_len: int = 60) -> str:
+    """Filesystem-safe folder name from a product name."""
+    text = re.sub(r"[^\w\s-]", "", text, flags=re.UNICODE).strip().lower()
+    text = re.sub(r"[\s_-]+", "-", text).strip("-")
+    return (text or "product")[:max_len].rstrip("-")
 
 # The sheet: id + tab. The gid is what the browser URL shows after `#gid=`; the tab name is the fallback lookup.
 SHEET_ID = os.environ.get("ADSPY_SHEET_ID", "1O35L85zhY_5WMnsG8gEKN0bKx7oziTUMlbn6r3TJ1J0").strip()
