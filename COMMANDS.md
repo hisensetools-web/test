@@ -141,11 +141,12 @@ Once, to put it there (or refresh it after an update):
 
 ```powershell
 cd C:\Users\top2\Desktop
-git clone --depth 1 -b claude/ecstatic-brahmagupta-9esg5e https://github.com/hisensetools-web/test vid-src
+if (Test-Path vid -PathType Leaf) { Remove-Item vid -Force }          # a stray *file* named vid breaks the copies
 New-Item -ItemType Directory -Force vid | Out-Null
-Copy-Item vid-src\adspy.py, vid-src\requirements-adspy.txt -Destination vid
-Copy-Item vid-src\adspykit -Destination vid -Recurse -Force
-Copy-Item vid-src\adspy_dist\* -Destination vid -Force                # setup.bat, DOWNLOAD.bat, INSTRUCTIONS.txt for non-technical users
+git clone --depth 1 -b claude/ecstatic-brahmagupta-9esg5e https://github.com/hisensetools-web/test vid-src
+Copy-Item vid-src\adspy.py, vid-src\requirements-adspy.txt -Destination vid\ -Force
+Copy-Item vid-src\adspykit -Destination vid\adspykit -Recurse -Force
+Copy-Item vid-src\adspy_dist\* -Destination vid\ -Force               # setup.bat, DOWNLOAD.bat, INSTRUCTIONS.txt for non-technical users
 Remove-Item -Recurse -Force vid-src
 cd vid
 pip install -r requirements-adspy.txt
