@@ -1,0 +1,79 @@
+ADSPY VIDEO DOWNLOADER - HOW TO USE IT
+======================================
+
+WHAT IT DOES
+------------
+It opens our Google Sheet, reads the "Adspy" column of the "Main TikTok Prods V2" tab, and downloads every video
+linked there. Each product gets its own folder. The videos have no TikTok watermark, are in the best quality
+available, and all hidden file information (metadata) is removed. Running it again only fetches new links; it
+never downloads the same video twice, and it deletes duplicates by itself.
+
+You never have to type any code. Everything is a double-click.
+
+
+ONE-TIME SETUP (about 5 minutes, only the first time)
+-----------------------------------------------------
+1. Put the "vid" folder somewhere easy, for example on your Desktop. Do not put it inside OneDrive.
+
+2. Double-click  setup.bat
+   - A black window opens and installs what is needed (Python, ffmpeg, the downloader).
+   - If it says "Close this window ... double-click setup.bat once more", do exactly that. It can say this
+     twice (once for Python, once for ffmpeg). That is normal.
+   - If Windows shows "Windows protected your PC", click "More info" then "Run anyway".
+   - When it ends with "Setup finished", you are done.
+
+3. Only if the sheet has Instagram links (it does): install Firefox (https://www.mozilla.org/firefox), open
+   instagram.com in Firefox and log in once. The downloader reads that login from Firefox for the Instagram
+   videos. TikTok needs no login.
+
+
+EVERY TIME YOU WANT THE VIDEOS
+------------------------------
+Double-click  DOWNLOAD.bat
+
+- A black window shows each product and each video as it comes in. Leave it open.
+- It ends with a line like:  done: 42 downloaded, 130 already there, 2 failed
+- Press any key to close the window.
+- The videos are in the folder  adspy_output  next to DOWNLOAD.bat, one folder per product, for example
+      adspy_output\skull-candle-warmer\TikTok-7381234567890.mp4
+
+Run it as often as you like. Videos that are already there are skipped in a second, only new links are fetched.
+
+
+JUST ONE PRODUCT
+----------------
+Double-click  DOWNLOAD ONE PRODUCT.bat  and type part of the product name (for example  skull  or  ghostface),
+then press Enter.
+
+
+WHAT THE MESSAGES MEAN
+----------------------
+"FAILED ... Video not available"       The link is dead (the creator deleted the video). Nothing to do.
+"FAILED ... login required" (Instagram) Open Firefox, make sure you are logged into instagram.com, run DOWNLOAD.bat
+                                       again. If it still fails, close Firefox completely and run it again.
+"Google returned the sign-in page"     The sheet is not shared. Tell the sheet owner; nothing you can fix here.
+"ffmpeg not found"                     Run setup.bat once more, then close the window and try again.
+Downloads fail for everything          TikTok or Instagram changed something. Double-click UPDATE.bat, then
+                                       DOWNLOAD.bat again. If that does not help, tell the sheet owner.
+
+
+RULES OF THE FOLDER
+-------------------
+- COPY videos out of the adspy_output folders if you need them elsewhere; do not MOVE or rename them there.
+  A missing file is downloaded again on the next run.
+- Do not delete  manifest.json  or  links.txt  inside the product folders; they are how the tool knows what it
+  already has.
+- If a product folder gets a video you do not want, just delete that video; it is not fetched again unless it
+  disappeared because you moved it.
+- Do not edit  .env  unless the sheet owner tells you what to change.
+
+
+FILES IN THIS FOLDER
+--------------------
+setup.bat                  one-time setup
+DOWNLOAD.bat               download everything new
+DOWNLOAD ONE PRODUCT.bat   download one product only
+UPDATE.bat                 update the downloader when TikTok / Instagram change
+INSTRUCTIONS.txt           this file
+adspy_output\              the videos, one folder per product
+everything else            the tool itself; leave it alone

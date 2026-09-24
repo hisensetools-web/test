@@ -145,6 +145,7 @@ git clone --depth 1 -b claude/ecstatic-brahmagupta-9esg5e https://github.com/his
 New-Item -ItemType Directory -Force vid | Out-Null
 Copy-Item vid-src\adspy.py, vid-src\requirements-adspy.txt -Destination vid
 Copy-Item vid-src\adspykit -Destination vid -Recurse -Force
+Copy-Item vid-src\adspy_dist\* -Destination vid -Force                # setup.bat, DOWNLOAD.bat, INSTRUCTIONS.txt for non-technical users
 Remove-Item -Recurse -Force vid-src
 cd vid
 pip install -r requirements-adspy.txt
@@ -163,4 +164,20 @@ python adspy.py dedup --dry-run                        # what the duplicate pass
 
 "Google returned the sign-in page" = the sheet is not shared as *Anyone with the link: Viewer*. Either share it that
 way, or with the tab open do File > Download > CSV and run `python adspy.py download --csv "<that file>"`.
+
+### Giving it to someone else
+
+The `vid` folder is the whole tool. Zip it without the videos and send it; the recipient unzips it, double-clicks
+`setup.bat` once (installs Python, ffmpeg and the packages, creates `.env`), then `DOWNLOAD.bat` whenever they want the
+videos. `INSTRUCTIONS.txt` inside the folder explains everything in plain language, no terminal needed.
+
+```powershell
+cd C:\Users\top2\Desktop
+Compress-Archive -Path (Get-ChildItem vid -Exclude adspy_output,__pycache__) -DestinationPath adspy-downloader.zip -Force
+```
+
+Before sending: the sheet must be shared as *Anyone with the link: Viewer* (or shared with their Google account
+and they download the tab as CSV each time, which is not double-click friendly). Instagram links need them logged into
+instagram.com in Firefox once; `setup.bat` writes `ADSPY_COOKIES_FROM_BROWSER=firefox` into their `.env`. For updates,
+send a new zip; they replace the folder's files and keep their `adspy_output`.
 

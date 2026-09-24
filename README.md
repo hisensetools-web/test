@@ -105,6 +105,8 @@ as *Anyone with the link: Viewer*; a private sheet gets the sign-in page instead
 (`--csv` is the fallback). Sheet id, tab, column names, output folder and cookies are `ADSPY_*` keys in `.env` (see
 `.env.example`). The tool is self-contained: copy `adspy.py`, `adspykit\` and `requirements-adspy.txt` to any folder
 (`pip install -r requirements-adspy.txt` there) and it runs without the rest of the repository; `.env` is read from that folder.
+`adspy_dist\` holds double-click launchers for people who do not use a terminal (`setup.bat` installs Python, ffmpeg and the
+packages; `DOWNLOAD.bat`, `DOWNLOAD ONE PRODUCT.bat`, `UPDATE.bat`) plus `INSTRUCTIONS.txt`; see COMMANDS.md > Giving it to someone else.
 Update yt-dlp when TikTok or Instagram change (`pip install -U yt-dlp`); every download has a timeout,
 retries with backoff and a polite pause, and a failing link never stops the product. Tests: `python -m unittest tests.test_adspykit`.
 
