@@ -96,6 +96,27 @@ def impersonate_target():
         return None
 
 
+def usable_cookies(cookies_file: str = "", browser: str = "") -> tuple[str, str, str]:
+    """(cookies file, browser, warning): the cookie source that can actually be used this run. A cookies.txt that is
+    missing, or a browser that is not installed / has no profile, is dropped with a warning instead of failing every
+    link (yt-dlp refuses to start any download when the configured cookie source cannot be opened)."""
+    cookies_file = cookies_file or config.COOKIES_FILE
+    browser = browser or config.COOKIES_FROM_BROWSER
+    if cookies_file:
+        if Path(cookies_file).is_file():
+            return cookies_file, "", ""
+        return "", "", f"cookies file {cookies_file} not found; continuing without a login"
+    if browser:
+        try:
+            from yt_dlp.cookies import extract_cookies_from_browser
+            extract_cookies_from_browser(browser, logger=_YdlLogger())
+            return "", browser, ""
+        except Exception as e:  # noqa: BLE001  FileNotFoundError, ValueError, DownloadError... all mean "not usable"
+            reason = str(e).split("\n")[0][:160]
+            return "", "", f"{browser} login not available ({reason}); continuing without a login. Instagram usually works anyway; if reels fail with 'login required', install {browser}, log into instagram.com there, and run again"
+    return "", "", ""
+
+
 def ffmpeg_available() -> bool:
     return metadata.find_ffmpeg() is not None
 
@@ -133,12 +154,10 @@ def ydl_options(dest: Path, cookies: str = "", cookies_from_browser: str = "", q
     ff = metadata.find_ffmpeg()
     if ff and shutil.which("ffmpeg") is None:
         opts["ffmpeg_location"] = ff
-    cookies = cookies or config.COOKIES_FILE
-    browser = cookies_from_browser or config.COOKIES_FROM_BROWSER
     if cookies:
         opts["cookiefile"] = cookies
-    elif browser:
-        opts["cookiesfrombrowser"] = (browser,)
+    elif cookies_from_browser:
+        opts["cookiesfrombrowser"] = (cookies_from_browser,)
     return opts
 
 

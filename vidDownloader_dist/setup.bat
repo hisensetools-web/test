@@ -52,7 +52,7 @@ echo packages: installed
 rem --- 4. settings file (created once, never overwritten) ---
 if not exist ".env" (
     > .env echo # vidDownloader settings. One KEY=VALUE per line, lines starting with # are ignored.
-    >> .env echo # Instagram links need a logged-in browser. Log into instagram.com in Firefox once, then leave this as is.
+    >> .env echo # Instagram: if Firefox is installed and logged into instagram.com, that login is used; otherwise downloads run without one.
     >> .env echo VIDDL_COOKIES_FROM_BROWSER=firefox
     echo settings: .env created
 ) else (

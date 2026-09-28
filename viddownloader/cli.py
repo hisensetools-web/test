@@ -44,8 +44,13 @@ def cmd_download(args) -> int:
     has_ffmpeg = dl.ffmpeg_available()
     print(f"{source}: {len(products)} products, {sum(len(p.links) for p in products)} links -> {out_root}")
     print(f"format: {dl.format_expression(has_ffmpeg)}" + ("" if has_ffmpeg else "   (ffmpeg not found: single-file formats only; install it for merged best video+audio)"))
+    cookies, browser, warning = dl.usable_cookies(args.cookies, args.cookies_from_browser)
+    if warning:
+        print(f"note  : {warning}")
+    elif cookies or browser:
+        print(f"login : {'cookies file ' + cookies if cookies else browser + ' browser login'}")
     downloader = (lambda url, dest: dl.VideoResult(url=url, status="dry-run")) if args.dry_run else \
-        dl.ytdlp_downloader(args.cookies, args.cookies_from_browser, quiet=not args.verbose)
+        dl.ytdlp_downloader(cookies, browser, quiet=not args.verbose)
     totals = {"downloaded": 0, "exists": 0, "failed": 0, "dry-run": 0, "duplicate": 0}
     failed: list[tuple[str, dl.VideoResult]] = []
     for p in products:
@@ -151,7 +156,8 @@ def cmd_check(args) -> int:
     tok = args.clickup_token or config.CLICKUP_TOKEN
     print(f"clickup: list {args.clickup_list or config.CLICKUP_LIST_ID}, token {'set (' + tok[:5] + '...)' if tok else 'MISSING -> VIDDL_CLICKUP_TOKEN in .env (run setup.bat)'}, skipping statuses {', '.join(config.CLICKUP_SKIP_STATUSES)}")
     print(f"output : {config.OUTPUT_ROOT}")
-    print(f"cookies: {config.COOKIES_FILE or (config.COOKIES_FROM_BROWSER + ' (browser)' if config.COOKIES_FROM_BROWSER else 'none')}")
+    cookies, browser, warning = dl.usable_cookies()
+    print(f"login  : {warning or ('cookies file ' + cookies if cookies else browser + ' browser login' if browser else 'none (Instagram usually works without; set VIDDL_COOKIES_FROM_BROWSER=firefox after logging in there if reels fail)')}")
     try:
         products, _ = _products(args)
         print(f"reads  : OK, {len(products)} products, {sum(len(p.links) for p in products)} links")

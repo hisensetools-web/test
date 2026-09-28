@@ -26,9 +26,9 @@ ONE-TIME SETUP (about 5 minutes, only the first time)
      pastes), then press Enter.
    - When it ends with "Setup finished", you are done.
 
-3. For the Instagram links: install Firefox (https://www.mozilla.org/firefox), open
-   instagram.com in Firefox and log in once. The downloader reads that login from Firefox for the Instagram
-   videos. TikTok needs no login.
+3. Nothing else. Instagram and TikTok videos download without any login. Only if Instagram videos start failing
+   with "login required": install Firefox (https://www.mozilla.org/firefox), log into instagram.com in it once, and
+   run DOWNLOAD.bat again; the downloader picks that login up by itself.
 
 
 EVERY TIME YOU WANT THE VIDEOS
@@ -54,8 +54,8 @@ then press Enter.
 WHAT THE MESSAGES MEAN
 ----------------------
 "FAILED ... Video not available"       The link is dead (the creator deleted the video). Nothing to do.
-"FAILED ... login required" (Instagram) Open Firefox, make sure you are logged into instagram.com, run DOWNLOAD.bat
-                                       again. If it still fails, close Firefox completely and run it again.
+"FAILED ... login required" (Instagram) Install Firefox, log into instagram.com in it once, run DOWNLOAD.bat again.
+"note : firefox login not available"   Just information: Firefox is not installed, downloads run without a login.
 "ClickUp rejected the token"           Run setup.bat again and paste a fresh token (ClickUp > Settings > Apps).
 "no ClickUp token"                     Same: run setup.bat and paste the token when asked.
 "ffmpeg not found"                     Run setup.bat once more, then close the window and try again.

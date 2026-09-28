@@ -148,6 +148,29 @@ class YtdlpWrapperTests(unittest.TestCase):
             self.assertEqual(r.status, "exists")
 
 
+class CookieTests(unittest.TestCase):
+    def test_missing_browser_is_a_warning_not_a_failure(self):
+        with mock.patch("yt_dlp.cookies.extract_cookies_from_browser", side_effect=FileNotFoundError("could not find firefox cookies database in 'C:\\x'")):
+            cookies, browser, warning = download.usable_cookies("", "firefox")
+        self.assertEqual((cookies, browser), ("", ""))
+        self.assertIn("firefox login not available", warning)
+        self.assertIn("continuing without a login", warning)
+        with mock.patch("yt_dlp.cookies.extract_cookies_from_browser", return_value=object()):
+            self.assertEqual(download.usable_cookies("", "firefox"), ("", "firefox", ""))
+        self.assertEqual(download.usable_cookies("", "")[2], "")
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "c.txt"
+            self.assertIn("not found", download.usable_cookies(str(f), "firefox")[2])
+            f.write_text("# Netscape HTTP Cookie File\n")
+            self.assertEqual(download.usable_cookies(str(f), "firefox"), (str(f), "", ""))
+
+    def test_ydl_options_only_carry_what_was_verified(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(download.config, "COOKIES_FROM_BROWSER", "firefox"):
+            opts = download.ydl_options(Path(d))            # config alone never puts an unverified browser in
+            self.assertNotIn("cookiesfrombrowser", opts)
+            self.assertNotIn("cookiefile", opts)
+
+
 class ThrottleTests(unittest.TestCase):
     def test_transient_vs_permanent(self):
         self.assertTrue(download.is_transient("ERROR: [vm.tiktok] X: Unable to download webpage: ('Connection aborted.', ConnectionResetError(10054, ...))"))
