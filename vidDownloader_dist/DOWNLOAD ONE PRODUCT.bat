@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0"
 title vidDownloader - one product
-echo Type part of the product name exactly as it is on the sheet (for example: skull  or  ghostface)
+echo Type part of the product name as it is in ClickUp (for example: skull  or  ghostface)
 echo.
 set /p NAME=Product name: 
 if "%NAME%"=="" (
