@@ -69,13 +69,13 @@ if errorlevel 1 (
         >> .env echo VIDDL_CLICKUP_TOKEN=!CU_TOKEN!
         echo settings: ClickUp token saved to .env
     ) else (
-        echo settings: no token given; the tool falls back to the Google Sheet until you run setup.bat again
+        echo settings: no token given; nothing can be downloaded until you run setup.bat again and paste it
     )
 )
 
 rem --- 5. prove it works ---
 echo.
-echo Checking the tool and the Google Sheet...
+echo Checking the tool and ClickUp...
 echo.
 python vidDownloader.py check
 echo.

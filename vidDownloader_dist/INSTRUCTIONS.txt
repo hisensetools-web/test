@@ -25,7 +25,7 @@ ONE-TIME SETUP (about 5 minutes, only the first time)
      pastes), then press Enter.
    - When it ends with "Setup finished", you are done.
 
-3. Only if the sheet has Instagram links (it does): install Firefox (https://www.mozilla.org/firefox), open
+3. For the Instagram links: install Firefox (https://www.mozilla.org/firefox), open
    instagram.com in Firefox and log in once. The downloader reads that login from Firefox for the Instagram
    videos. TikTok needs no login.
 
@@ -59,7 +59,7 @@ WHAT THE MESSAGES MEAN
 "no ClickUp token"                     Same: run setup.bat and paste the token when asked.
 "ffmpeg not found"                     Run setup.bat once more, then close the window and try again.
 Downloads fail for everything          TikTok or Instagram changed something. Double-click UPDATE.bat, then
-                                       DOWNLOAD.bat again. If that does not help, tell the sheet owner.
+                                       DOWNLOAD.bat again. If that does not help, tell whoever gave you the tool.
 
 
 RULES OF THE FOLDER
@@ -70,7 +70,7 @@ RULES OF THE FOLDER
   already has.
 - If a product folder gets a video you do not want, just delete that video; it is not fetched again unless it
   disappeared because you moved it.
-- Do not edit  .env  unless the sheet owner tells you what to change.
+- Do not edit  .env  unless whoever gave you the tool tells you what to change.
 
 
 FILES IN THIS FOLDER
