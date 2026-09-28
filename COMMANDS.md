@@ -135,8 +135,10 @@ python tracker.py ads --only a.com b.com               # scrape new stores now i
 
 ## 6. Adspy videos: `adspy.py`
 
-Downloads every Adspy link of the **Main TikTok Prods V2** tab into `adspy_output\<product>\`, clean (no TikTok
-watermark) and at the best quality available. It runs on its own in `C:\Users\top2\Desktop\vid` (no tracker needed there).
+Downloads every TikTok / Instagram link in the descriptions of the ClickUp **Product Research** tasks (cancelled and
+lesson skipped) into `adspy_output\<product>\`, clean (no TikTok watermark) and at the best quality available.
+`setup.bat` asks once for the ClickUp API token (avatar > Settings > Apps > API Token). `--source sheet` reads the old
+Google Sheet tab instead. It runs on its own in `C:\Users\top2\Desktop\vid` (no tracker needed there).
 Once, to put it there (or refresh it after an update):
 
 ```powershell

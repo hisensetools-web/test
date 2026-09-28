@@ -45,6 +45,13 @@ SHEET_TAB = os.environ.get("ADSPY_SHEET_TAB", "Main TikTok Prods V2").strip()
 PRODUCT_COLUMN = os.environ.get("ADSPY_PRODUCT_COLUMN", "Product Name").strip()
 LINK_COLUMN = os.environ.get("ADSPY_LINK_COLUMN", "Adspy").strip()
 
+# ClickUp (the current workflow): the Product Research list, one task per product, links in the description.
+CLICKUP_TOKEN = os.environ.get("ADSPY_CLICKUP_TOKEN", "").strip()          # personal token, pk_...
+CLICKUP_LIST_ID = os.environ.get("ADSPY_CLICKUP_LIST_ID", "901222590753").strip()
+CLICKUP_SKIP_STATUSES = tuple(s.strip() for s in os.environ.get("ADSPY_CLICKUP_SKIP_STATUSES", "cancelled,lesson").split(","))
+# Where the products come from: clickup | sheet. Default: clickup when a token is set, else the sheet.
+SOURCE = os.environ.get("ADSPY_SOURCE", "clickup" if CLICKUP_TOKEN else "sheet").strip().lower()
+
 # One folder per product under here: adspy_output/<product-slug>/
 OUTPUT_ROOT = Path(os.environ.get("ADSPY_OUTPUT_DIR", ROOT / "adspy_output"))
 

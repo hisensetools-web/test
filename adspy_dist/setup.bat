@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 title Adspy video downloader - one-time setup
 echo ==========================================================
@@ -57,6 +57,20 @@ if not exist ".env" (
     echo settings: .env created
 ) else (
     echo settings: .env kept
+)
+findstr /B /C:"ADSPY_CLICKUP_TOKEN=pk_" .env >nul 2>&1
+if errorlevel 1 (
+    echo.
+    echo The products come from ClickUp. You need your personal API token, one time:
+    echo   ClickUp ^> your avatar bottom-left ^> Settings ^> Apps ^> API Token ^> Generate / Copy
+    echo It starts with pk_ . Paste it here and press Enter ^(right-click pastes in this window^).
+    set /p CU_TOKEN=ClickUp token: 
+    if not "!CU_TOKEN!"=="" (
+        >> .env echo ADSPY_CLICKUP_TOKEN=!CU_TOKEN!
+        echo settings: ClickUp token saved to .env
+    ) else (
+        echo settings: no token given; the tool falls back to the Google Sheet until you run setup.bat again
+    )
 )
 
 rem --- 5. prove it works ---

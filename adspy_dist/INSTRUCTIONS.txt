@@ -3,8 +3,8 @@ ADSPY VIDEO DOWNLOADER - HOW TO USE IT
 
 WHAT IT DOES
 ------------
-It opens our Google Sheet, reads the "Adspy" column of the "Main TikTok Prods V2" tab, and downloads every video
-linked there. Each product gets its own folder. The videos have no TikTok watermark, are in the best quality
+It reads our ClickUp "Product Research" list (one task per product), takes every TikTok / Instagram link in the
+task description, and downloads those videos. Each product gets its own folder. The videos have no TikTok watermark, are in the best quality
 available, and all hidden file information (metadata) is removed. Running it again only fetches new links; it
 never downloads the same video twice, and it deletes duplicates by itself.
 
@@ -20,6 +20,9 @@ ONE-TIME SETUP (about 5 minutes, only the first time)
    - If it says "Close this window ... double-click setup.bat once more", do exactly that. It can say this
      twice (once for Python, once for ffmpeg). That is normal.
    - If Windows shows "Windows protected your PC", click "More info" then "Run anyway".
+   - It asks once for your ClickUp API token. In ClickUp click your avatar (bottom left) > Settings > Apps >
+     API Token > Generate, copy the code that starts with pk_ and paste it into the black window (right-click
+     pastes), then press Enter.
    - When it ends with "Setup finished", you are done.
 
 3. Only if the sheet has Instagram links (it does): install Firefox (https://www.mozilla.org/firefox), open
@@ -31,6 +34,7 @@ EVERY TIME YOU WANT THE VIDEOS
 ------------------------------
 Double-click  DOWNLOAD.bat
 
+- It downloads for every product in ClickUp except the ones marked cancelled or lesson.
 - A black window shows each product and each video as it comes in. Leave it open.
 - It ends with a line like:  done: 42 downloaded, 130 already there, 2 failed
 - Press any key to close the window.
@@ -51,7 +55,8 @@ WHAT THE MESSAGES MEAN
 "FAILED ... Video not available"       The link is dead (the creator deleted the video). Nothing to do.
 "FAILED ... login required" (Instagram) Open Firefox, make sure you are logged into instagram.com, run DOWNLOAD.bat
                                        again. If it still fails, close Firefox completely and run it again.
-"Google returned the sign-in page"     The sheet is not shared. Tell the sheet owner; nothing you can fix here.
+"ClickUp rejected the token"           Run setup.bat again and paste a fresh token (ClickUp > Settings > Apps).
+"no ClickUp token"                     Same: run setup.bat and paste the token when asked.
 "ffmpeg not found"                     Run setup.bat once more, then close the window and try again.
 Downloads fail for everything          TikTok or Instagram changed something. Double-click UPDATE.bat, then
                                        DOWNLOAD.bat again. If that does not help, tell the sheet owner.

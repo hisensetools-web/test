@@ -73,8 +73,13 @@ Tests: `python -m unittest tests.test_pdpkit tests.test_pdpkit_shopify tests.tes
 
 ## Adspy video puller (`adspy.py`)
 
-Also separate from the tracker: reads the **Main TikTok Prods V2** tab of the products sheet, takes every link in the
-**Adspy** column and downloads the videos, one folder per product under `adspy_output/<product-slug>/`. TikTok's
+Also separate from the tracker: reads the products (by default the ClickUp **Product Research** list, one task per
+product, every TikTok / Instagram link in the task description; or the **Main TikTok Prods V2** sheet tab's **Adspy**
+column with `--source sheet`) and downloads the videos, one folder per product under `adspy_output/<product-slug>/`.
+ClickUp needs a personal token in `.env` (`ADSPY_CLICKUP_TOKEN=pk_...`, ClickUp > Settings > Apps > API Token); tasks whose
+status is `cancelled` or `lesson` are skipped (`ADSPY_CLICKUP_SKIP_STATUSES`), links are taken from any heading, only video
+hosts count (competition / PDP / PipiAds links never do), and a task that lists bare TikTok ids under a
+`tiktok.com/@creator/video/` prefix note gets its links rebuilt. TikTok's
 watermarked "download" file is never taken: yt-dlp labels it `watermarked` and the format rule rejects it, so you get
 the clean stream the app itself plays, at the highest resolution and bitrate offered (video + audio merged with
 ffmpeg when they come separately; nothing is re-encoded). Instagram reels are served clean.

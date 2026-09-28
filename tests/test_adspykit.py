@@ -5,10 +5,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from adspykit import cli, dedup, download, metadata, sheet
+from adspykit import cli, clickup, dedup, download, metadata, sheet
 from adspykit.sheet import Product
 
 FIX = Path(__file__).parent / "fixtures_adspy" / "main_tiktok_prods_v2.csv"
+CU_FIX = Path(__file__).parent / "fixtures_adspy" / "clickup_tasks.json"
 
 
 class LinkExtractTests(unittest.TestCase):
@@ -322,7 +323,80 @@ class DedupTests(unittest.TestCase):
             self.assertFalse((fa / "TikTok-A2.mp4").exists())
 
 
+class ClickUpParseTests(unittest.TestCase):
+    def setUp(self):
+        self.tasks = json.loads(CU_FIX.read_text())["tasks"]
+        self.by = {p.name: p for p in clickup.products_from_tasks(self.tasks)}
+
+    def test_only_video_links_from_the_description_any_heading(self):
+        self.assertEqual(self.by["Trunk Horror Prop"].links, ["https://www.instagram.com/reel/Ddb7uPzx9gA/", "https://www.instagram.com/reel/Ddh6ES_REyO/"])
+        self.assertEqual(self.by["The Freaky Nikki Costume"].links, ["https://vm.tiktok.com/ZN8My63PS/", "https://vm.tiktok.com/ZN8My6Dx9/"])   # competition + post ids ignored
+        self.assertEqual(self.by["The Pawcket Hoodie"].links, [])
+
+    def test_bare_tiktok_ids_are_rebuilt_from_the_prefix_note(self):
+        self.assertEqual(self.by["Winking Spidey Mask"].links, ["https://www.tiktok.com/@thespideygear/video/7688192053603208470",
+                                                                "https://www.tiktok.com/@thespideygear/video/7687462050565459222",
+                                                                "https://www.tiktok.com/@thespideygear/video/7686184836092103938"])
+
+    def test_free_form_task_scheme_added_profiles_ignored_share_token_kept(self):
+        self.assertEqual(self.by["Rosabella"].links, ["https://www.tiktok.com/@shop/video/7400830224608382241", "https://www.instagram.com/reel/DdYSYT4O9Zx/?stkn=abc"])
+        # the plain-text description (no scheme) gives the same result
+        p = clickup.task_to_product({"name": "Rosabella", "description": self.tasks[-1]["description"]})
+        self.assertEqual(p.links, self.by["Rosabella"].links)
+
+    def test_cancelled_and_lesson_skipped_configurable(self):
+        self.assertNotIn("Wicked For Good Tumbler", self.by)
+        self.assertNotIn("Glow Panel - Illuminated Wall Art", self.by)
+        names = [p.name for p in clickup.products_from_tasks(self.tasks, skip_statuses=("cancelled",))]
+        self.assertIn("Glow Panel - Illuminated Wall Art", names)
+        wicked = {p.name: p for p in clickup.products_from_tasks(self.tasks, skip_statuses=())}["Wicked For Good Tumbler"]
+        self.assertEqual(wicked.links, ["https://vm.tiktok.com/ZN8CANCEL/"])          # pipiads is never a video link
+
+    def test_same_slugs_as_the_sheet_so_folders_are_reused(self):
+        sheet_slugs = {p.slug for p in sheet.parse_products(FIX.read_text(encoding="utf-8"))}
+        self.assertIn(self.by["Trunk Horror Prop"].slug, sheet_slugs)
+        self.assertIn(self.by["The Freaky Nikki Costume"].slug, sheet_slugs)
+
+
+class ClickUpFetchTests(unittest.TestCase):
+    def test_pages_until_last_page_with_token_header(self):
+        page0 = {"tasks": [{"name": "A", "status": {"status": "testing"}, "markdown_description": "https://vm.tiktok.com/a/"}], "last_page": False}
+        page1 = {"tasks": [{"name": "B", "status": {"status": "testing"}, "markdown_description": "https://vm.tiktok.com/b/"}], "last_page": True}
+        session = mock.Mock()
+        session.get.side_effect = [mock.Mock(status_code=200, json=lambda: page0), mock.Mock(status_code=200, json=lambda: page1)]
+        with mock.patch("time.sleep"):
+            products = clickup.fetch_products("123", "pk_test", session=session)
+        self.assertEqual([p.name for p in products], ["A", "B"])
+        call = session.get.call_args_list[0]
+        self.assertEqual(call.args[0], "https://api.clickup.com/api/v2/list/123/task")
+        self.assertEqual(call.kwargs["headers"]["Authorization"], "pk_test")
+        self.assertEqual(call.kwargs["params"]["include_markdown_description"], "true")
+        self.assertEqual(session.get.call_args_list[1].kwargs["params"]["page"], 1)
+
+    def test_errors_are_explained(self):
+        with self.assertRaises(clickup.ClickUpError) as cm:
+            clickup.fetch_tasks("123", "", session=mock.Mock())
+        self.assertIn("ADSPY_CLICKUP_TOKEN", str(cm.exception))
+        session = mock.Mock()
+        session.get.return_value = mock.Mock(status_code=401, text="")
+        with self.assertRaises(clickup.ClickUpError) as cm:
+            clickup.fetch_tasks("123", "pk_bad", session=session)
+        self.assertIn("401", str(cm.exception))
+
+
 class CliTests(unittest.TestCase):
+    def test_clickup_source_end_to_end_dry_run(self):
+        data = json.loads(CU_FIX.read_text())
+        session = mock.Mock()
+        session.get.return_value = mock.Mock(status_code=200, json=lambda: data)
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out, mock.patch("requests.Session", return_value=session):
+            rc = cli.main(["download", "--source", "clickup", "--clickup-token", "pk_x", "--clickup-list", "1", "--dry-run", "--out", d, "--only", "spidey"])
+            printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
+            self.assertEqual(rc, 0)
+            self.assertTrue((Path(d) / "winking-spidey-mask" / "links.txt").exists())
+        self.assertIn("ClickUp list 1", printed)
+        self.assertIn("3 would be fetched", printed)
+
     def test_links_and_dry_run_download_from_csv(self):
         with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out:
             self.assertEqual(cli.main(["links", "--csv", str(FIX), "--urls", "--only", "trunk"]), 0)

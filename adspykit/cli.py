@@ -7,6 +7,7 @@ import sys
 from pathlib import Path
 
 from . import config
+from .clickup import ClickUpError
 from .sheet import SheetAccessError, fetch_tab_csv, parse_products, select
 
 
@@ -16,13 +17,22 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def _products(args):
-    if args.csv:
+    source_kind = "csv" if args.csv else (args.source or config.SOURCE)
+    if source_kind == "csv":
         text = Path(args.csv).read_text(encoding="utf-8-sig")
         source = args.csv
-    else:
+        products = parse_products(text, args.product_column, args.link_column)
+    elif source_kind == "clickup":
+        from . import clickup
+        products = clickup.fetch_products(args.clickup_list, args.clickup_token)
+        source = f"ClickUp list {args.clickup_list or config.CLICKUP_LIST_ID}"
+    elif source_kind == "sheet":
         text = fetch_tab_csv(args.sheet_id, args.gid, args.tab)
         source = f"sheet {args.sheet_id} / '{args.tab}'"
-    products = select(parse_products(text, args.product_column, args.link_column), args.only)
+        products = parse_products(text, args.product_column, args.link_column)
+    else:
+        raise SystemExit(f"unknown source '{source_kind}' (clickup | sheet)")
+    products = select(products, args.only)
     if not products:
         raise SystemExit(f"no products{' matching ' + ', '.join(args.only) if args.only else ''} in {source}")
     return products, source
@@ -150,13 +160,19 @@ def cmd_check(args) -> int:
     print(f"strip  : {'metadata removed after every download' if config.STRIP_METADATA else 'OFF (ADSPY_STRIP_METADATA=0)'}")
     print(f"dedup  : {('duplicates removed after every download, one copy ' + ('per sheet' if config.DEDUP_ACROSS else 'per product')) if config.DEDUP else 'OFF (ADSPY_DEDUP=0)'}")
     print(f"format : {dl.format_expression()}")
-    print(f"sheet  : {args.sheet_id}  tab '{args.tab}' (gid {args.gid})  columns '{args.product_column}' / '{args.link_column}'")
+    src = "csv" if args.csv else (args.source or config.SOURCE)
+    print(f"source : {src}")
+    if src == "clickup":
+        tok = args.clickup_token or config.CLICKUP_TOKEN
+        print(f"clickup: list {args.clickup_list or config.CLICKUP_LIST_ID}, token {'set (' + tok[:5] + '...)' if tok else 'MISSING -> ADSPY_CLICKUP_TOKEN in .env'}, skipping statuses {', '.join(config.CLICKUP_SKIP_STATUSES)}")
+    else:
+        print(f"sheet  : {args.sheet_id}  tab '{args.tab}' (gid {args.gid})  columns '{args.product_column}' / '{args.link_column}'")
     print(f"output : {config.OUTPUT_ROOT}")
     print(f"cookies: {config.COOKIES_FILE or (config.COOKIES_FROM_BROWSER + ' (browser)' if config.COOKIES_FROM_BROWSER else 'none')}")
     try:
         products, _ = _products(args)
         print(f"reads  : OK, {len(products)} products, {sum(len(p.links) for p in products)} links")
-    except (SheetAccessError, SystemExit) as e:
+    except (SheetAccessError, ClickUpError, SystemExit) as e:
         print(f"reads  : FAILED\n{e}")
         return 1
     return 0
@@ -169,7 +185,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("--csv", help="read this CSV (File > Download > CSV of the tab) instead of fetching the sheet")
+        p.add_argument("--source", choices=["clickup", "sheet"], default=None, help=f"where the products come from (ADSPY_SOURCE, currently {config.SOURCE})")
+        p.add_argument("--clickup-list", default="", metavar="ID", help="ClickUp list id (ADSPY_CLICKUP_LIST_ID)")
+        p.add_argument("--clickup-token", default="", metavar="pk_...", help="ClickUp personal API token (ADSPY_CLICKUP_TOKEN)")
+        p.add_argument("--csv", help="read this CSV (File > Download > CSV of the sheet tab) instead of any live source")
         p.add_argument("--sheet-id", default=config.SHEET_ID, help="Google Sheet id (ADSPY_SHEET_ID)")
         p.add_argument("--gid", default=config.SHEET_GID, help="tab gid from the URL (ADSPY_SHEET_GID)")
         p.add_argument("--tab", default=config.SHEET_TAB, help="tab name, used when the gid does not resolve (ADSPY_SHEET_TAB)")
@@ -219,7 +238,7 @@ def main(argv=None) -> int:
     _setup_logging(args.verbose)
     try:
         return args.func(args)
-    except SheetAccessError as e:
+    except (SheetAccessError, ClickUpError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
