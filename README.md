@@ -71,13 +71,13 @@ prompts), `upload --handle x` / `--product-id N` (attach to an existing product)
 `--dry-run` on `generate` and `upload`. A starter template is in `templates/pdp_template.example.md`.
 Tests: `python -m unittest tests.test_pdpkit tests.test_pdpkit_shopify tests.test_pdpkit_higgsfield_cli`.
 
-## Adspy video puller (`adspy.py`)
+## vidDownloader (`vidDownloader.py`)
 
 Also separate from the tracker: reads the products (by default the ClickUp **Product Research** list, one task per
 product, every TikTok / Instagram link in the task description; or the **Main TikTok Prods V2** sheet tab's **Adspy**
-column with `--source sheet`) and downloads the videos, one folder per product under `adspy_output/<product-slug>/`.
-ClickUp needs a personal token in `.env` (`ADSPY_CLICKUP_TOKEN=pk_...`, ClickUp > Settings > Apps > API Token); tasks whose
-status is `cancelled` or `lesson` are skipped (`ADSPY_CLICKUP_SKIP_STATUSES`), links are taken from any heading, only video
+column with `--source sheet`) and downloads the videos, one folder per product under `vidDownloader_output/<product-slug>/`.
+ClickUp needs a personal token in `.env` (`VIDDL_CLICKUP_TOKEN=pk_...`, ClickUp > Settings > Apps > API Token); tasks whose
+status is `cancelled` or `lesson` are skipped (`VIDDL_CLICKUP_SKIP_STATUSES`), links are taken from any heading, only video
 hosts count (competition / PDP / PipiAds links never do), and a task that lists bare TikTok ids under a
 `tiktok.com/@creator/video/` prefix note gets its links rebuilt. TikTok's
 watermarked "download" file is never taken: yt-dlp labels it `watermarked` and the format rule rejects it, so you get
@@ -86,34 +86,34 @@ ffmpeg when they come separately; nothing is re-encoded). Instagram reels are se
 
 ```bash
 pip install -r requirements.txt            # adds yt-dlp;  winget install Gyan.FFmpeg  (once, then reopen the terminal)
-python adspy.py check                      # yt-dlp + ffmpeg present, sheet readable, how many products / links
-python adspy.py links                      # products and link counts (--urls prints the links)
-python adspy.py download                   # everything, resumable: run it again and only missing / failed links are fetched
-python adspy.py download --only "skull candle" --max 3     # one product, first 3 links (a quick test)
-python adspy.py download --cookies-from-browser chrome     # Instagram reels need a logged-in session (or --cookies cookies.txt)
-python adspy.py download --csv "Main TikTok Prods V2.csv"  # from a CSV downloaded by hand instead of the live sheet
+python vidDownloader.py check                      # yt-dlp + ffmpeg present, sheet readable, how many products / links
+python vidDownloader.py links                      # products and link counts (--urls prints the links)
+python vidDownloader.py download                   # everything, resumable: run it again and only missing / failed links are fetched
+python vidDownloader.py download --only "skull candle" --max 3     # one product, first 3 links (a quick test)
+python vidDownloader.py download --cookies-from-browser chrome     # Instagram reels need a logged-in session (or --cookies cookies.txt)
+python vidDownloader.py download --csv "Main TikTok Prods V2.csv"  # from a CSV downloaded by hand instead of the live sheet
 ```
 
 Once the downloads are done the same run removes the metadata of every file (title, description, creator handle,
 encoder, creation time, per-stream tags, chapters): ffmpeg rewrites the file with stream copy, so nothing is re-encoded and
-the quality is untouched. `manifest.json` marks each file `clean`; `python adspy.py clean` runs the pass on its own
+the quality is untouched. `manifest.json` marks each file `clean`; `python vidDownloader.py clean` runs the pass on its own
 (`--verify` lists any file still carrying a tag, `--force` re-cleans), `download --keep-metadata` or
-`ADSPY_STRIP_METADATA=0` skips it. Then a duplicate pass keeps the folders from growing when the command is run again:
+`VIDDL_STRIP_METADATA=0` skips it. Then a duplicate pass keeps the folders from growing when the command is run again:
 leftover partial files are deleted, a video saved twice under one id keeps only the mp4, and byte-identical files
 (the same clip reposted under another id, or listed under two products) keep one copy, in the first product on the
 sheet; the other manifests get a `duplicate` row pointing at it, so the next run does not fetch it again.
-`python adspy.py dedup [--dry-run]` runs it alone, `download --no-dedup` / `ADSPY_DEDUP=0` skips it, and
-`ADSPY_DEDUP_ACROSS=0` keeps one copy per product instead of one per sheet. Each product folder holds the videos (`TikTok-<id>.mp4`, `Instagram-<id>.mp4`), `links.txt` (the links as they were on
+`python vidDownloader.py dedup [--dry-run]` runs it alone, `download --no-dedup` / `VIDDL_DEDUP=0` skips it, and
+`VIDDL_DEDUP_ACROSS=0` keeps one copy per product instead of one per sheet. Each product folder holds the videos (`TikTok-<id>.mp4`, `Instagram-<id>.mp4`), `links.txt` (the links as they were on
 the sheet) and `manifest.json` (per link: file, id, size, status, error). Failed links are listed at the end of the run and
 retried on the next one; `--force` refetches everything. The sheet is read through its CSV export, which needs it shared
 as *Anyone with the link: Viewer*; a private sheet gets the sign-in page instead, which the tool detects and explains
-(`--csv` is the fallback). Sheet id, tab, column names, output folder and cookies are `ADSPY_*` keys in `.env` (see
-`.env.example`). The tool is self-contained: copy `adspy.py`, `adspykit\` and `requirements-adspy.txt` to any folder
-(`pip install -r requirements-adspy.txt` there) and it runs without the rest of the repository; `.env` is read from that folder.
-`adspy_dist\` holds double-click launchers for people who do not use a terminal (`setup.bat` installs Python, ffmpeg and the
+(`--csv` is the fallback). Sheet id, tab, column names, output folder and cookies are `VIDDL_*` keys in `.env` (see
+`.env.example`). The tool is self-contained: copy `vidDownloader.py`, `viddownloader\` and `requirements-vidDownloader.txt` to any folder
+(`pip install -r requirements-vidDownloader.txt` there) and it runs without the rest of the repository; `.env` is read from that folder.
+`vidDownloader_dist\` holds double-click launchers for people who do not use a terminal (`setup.bat` installs Python, ffmpeg and the
 packages; `DOWNLOAD.bat`, `DOWNLOAD ONE PRODUCT.bat`, `UPDATE.bat`) plus `INSTRUCTIONS.txt`; see COMMANDS.md > Giving it to someone else.
 Update yt-dlp when TikTok or Instagram change (`pip install -U yt-dlp`); every download has a timeout,
-retries with backoff and a polite pause, and a failing link never stops the product. Tests: `python -m unittest tests.test_adspykit`.
+retries with backoff and a polite pause, and a failing link never stops the product. Tests: `python -m unittest tests.test_viddownloader`.
 
 ## What is collected
 
@@ -390,7 +390,7 @@ may contain a traceback. `tests/test_winners.py` covers the derived numbers with
 
 ```
 tracker.py              CLI entry point
-adspy.py / adspykit/    Adspy video puller: sheet.py (tab CSV -> products + links), download.py (yt-dlp, no-watermark best quality, manifests), cli.py
+vidDownloader.py / viddownloader/    vidDownloader: sheet.py (tab CSV -> products + links), download.py (yt-dlp, no-watermark best quality, manifests), cli.py
 run_daily.bat           Windows daily runner (day / meta modes; logs to logs\)
 run_hidden.vbs          runs run_daily.bat without a console window (used by the scheduled tasks)
 register_task.ps1       registers the two Task Scheduler tasks

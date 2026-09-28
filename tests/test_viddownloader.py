@@ -1,15 +1,15 @@
-"""adspykit unit tests: sheet CSV parsing, link extraction, product selection, the per-product download loop and manifests."""
+"""viddownloader unit tests: sheet CSV parsing, link extraction, product selection, the per-product download loop and manifests."""
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from adspykit import cli, clickup, dedup, download, metadata, sheet
-from adspykit.sheet import Product
+from viddownloader import cli, clickup, dedup, download, metadata, sheet
+from viddownloader.sheet import Product
 
-FIX = Path(__file__).parent / "fixtures_adspy" / "main_tiktok_prods_v2.csv"
-CU_FIX = Path(__file__).parent / "fixtures_adspy" / "clickup_tasks.json"
+FIX = Path(__file__).parent / "fixtures_viddownloader" / "main_tiktok_prods_v2.csv"
+CU_FIX = Path(__file__).parent / "fixtures_viddownloader" / "clickup_tasks.json"
 
 
 class LinkExtractTests(unittest.TestCase):
@@ -450,7 +450,7 @@ class ClickUpFetchTests(unittest.TestCase):
     def test_errors_are_explained(self):
         with self.assertRaises(clickup.ClickUpError) as cm:
             clickup.fetch_tasks("123", "", session=mock.Mock())
-        self.assertIn("ADSPY_CLICKUP_TOKEN", str(cm.exception))
+        self.assertIn("VIDDL_CLICKUP_TOKEN", str(cm.exception))
         session = mock.Mock()
         session.get.return_value = mock.Mock(status_code=401, text="")
         with self.assertRaises(clickup.ClickUpError) as cm:

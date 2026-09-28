@@ -19,7 +19,7 @@ import requests
 from . import config
 from .sheet import Product
 
-log = logging.getLogger("adspy.clickup")
+log = logging.getLogger("viddownloader.clickup")
 
 API = "https://api.clickup.com/api/v2"
 VIDEO_HOSTS = ("tiktok.com", "instagram.com", "facebook.com/reel", "fb.watch", "youtube.com/shorts", "youtu.be")
@@ -104,9 +104,9 @@ def fetch_tasks(list_id: str = "", token: str = "", session: requests.Session | 
     list_id = list_id or config.CLICKUP_LIST_ID
     token = token or config.CLICKUP_TOKEN
     if not token:
-        raise ClickUpError("no ClickUp token: put ADSPY_CLICKUP_TOKEN=pk_... in .env (ClickUp > Settings > Apps > API Token)")
+        raise ClickUpError("no ClickUp token: put VIDDL_CLICKUP_TOKEN=pk_... in .env (ClickUp > Settings > Apps > API Token)")
     if not list_id:
-        raise ClickUpError("no ClickUp list id: put ADSPY_CLICKUP_LIST_ID=<id> in .env (the number in the list's URL)")
+        raise ClickUpError("no ClickUp list id: put VIDDL_CLICKUP_LIST_ID=<id> in .env (the number in the list's URL)")
     session = session or requests.Session()
     headers = {"Authorization": token, "Accept": "application/json", "User-Agent": config.USER_AGENT}
     tasks: list[dict] = []
@@ -136,9 +136,9 @@ def _get(session: requests.Session, url: str, headers: dict, params: dict) -> di
             delay *= 2
             continue
         if r.status_code == 401:
-            raise ClickUpError("ClickUp rejected the token (401): check ADSPY_CLICKUP_TOKEN in .env")
+            raise ClickUpError("ClickUp rejected the token (401): check VIDDL_CLICKUP_TOKEN in .env")
         if r.status_code == 404:
-            raise ClickUpError("ClickUp list not found (404): check ADSPY_CLICKUP_LIST_ID (the number in the list's URL)")
+            raise ClickUpError("ClickUp list not found (404): check VIDDL_CLICKUP_LIST_ID (the number in the list's URL)")
         if r.status_code == 429 or r.status_code >= 500:
             if attempt == config.RETRIES:
                 raise ClickUpError(f"ClickUp returned HTTP {r.status_code} after {config.RETRIES} retries")

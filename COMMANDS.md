@@ -133,10 +133,10 @@ python tracker.py ads --only a.com b.com               # scrape new stores now i
 | `META_STORES=a.com,b.com` | limit the Meta pass to these stores (default: all, least recently scraped first) |
 | `META_MAX_SCROLLS=20` | how deep each store's Meta scrape goes (~350 newest ads, ~3 min per store) |
 
-## 6. Adspy videos: `adspy.py`
+## 6. vidDownloader: `vidDownloader.py`
 
 Downloads every TikTok / Instagram link in the descriptions of the ClickUp **Product Research** tasks (cancelled and
-lesson skipped) into `adspy_output\<product>\`, clean (no TikTok watermark) and at the best quality available.
+lesson skipped) into `vidDownloader_output\<product>\`, clean (no TikTok watermark) and at the best quality available.
 `setup.bat` asks once for the ClickUp API token (avatar > Settings > Apps > API Token). `--source sheet` reads the old
 Google Sheet tab instead. It runs on its own in `C:\Users\top2\Desktop\vid` (no tracker needed there).
 Once, to put it there (or refresh it after an update):
@@ -146,28 +146,29 @@ cd C:\Users\top2\Desktop
 if (Test-Path vid -PathType Leaf) { Remove-Item vid -Force }          # a stray *file* named vid breaks the copies
 New-Item -ItemType Directory -Force vid | Out-Null
 git clone --depth 1 -b claude/ecstatic-brahmagupta-9esg5e https://github.com/hisensetools-web/test vid-src
-Copy-Item vid-src\adspy.py, vid-src\requirements-adspy.txt -Destination vid\ -Force
-Remove-Item -Recurse -Force vid\adspykit -ErrorAction SilentlyContinue    # an existing folder would receive the copy *inside* it
-Copy-Item vid-src\adspykit -Destination vid\adspykit -Recurse
-Copy-Item vid-src\adspy_dist\* -Destination vid\ -Force               # setup.bat, DOWNLOAD.bat, INSTRUCTIONS.txt for non-technical users
+Remove-Item vid\adspy.py, vid\requirements-adspy.txt, vid\adspykit -Recurse -Force -ErrorAction SilentlyContinue   # the tool's previous name
+Copy-Item vid-src\vidDownloader.py, vid-src\requirements-vidDownloader.txt -Destination vid\ -Force
+Remove-Item -Recurse -Force vid\viddownloader -ErrorAction SilentlyContinue    # an existing folder would receive the copy *inside* it
+Copy-Item vid-src\viddownloader -Destination vid\viddownloader -Recurse
+Copy-Item vid-src\vidDownloader_dist\* -Destination vid\ -Force               # setup.bat, DOWNLOAD.bat, INSTRUCTIONS.txt for non-technical users
 Remove-Item -Recurse -Force vid-src
 cd vid
-pip install -r requirements-adspy.txt
+pip install -r requirements-vidDownloader.txt
 winget install Gyan.FFmpeg                             # once; reopen the terminal afterwards
 ```
 
 ```powershell
-python adspy.py check                                  # yt-dlp / ffmpeg present, sheet readable, products and link counts
-python adspy.py download                               # all products; run again any time, only missing or failed links are fetched
-python adspy.py download --only "ghostface"            # one product (any part of its name)
-python adspy.py download --cookies-from-browser chrome # Instagram reels need a logged-in browser (close Chrome first)
-python adspy.py links --urls                           # what is on the sheet, without downloading
-python adspy.py clean --verify                         # metadata removal on its own (download already runs it), then prove no tag is left
-python adspy.py dedup --dry-run                        # what the duplicate pass would delete (download already runs it for real)
+python vidDownloader.py check                                  # yt-dlp / ffmpeg present, sheet readable, products and link counts
+python vidDownloader.py download                               # all products; run again any time, only missing or failed links are fetched
+python vidDownloader.py download --only "ghostface"            # one product (any part of its name)
+python vidDownloader.py download --cookies-from-browser chrome # Instagram reels need a logged-in browser (close Chrome first)
+python vidDownloader.py links --urls                           # what is on the sheet, without downloading
+python vidDownloader.py clean --verify                         # metadata removal on its own (download already runs it), then prove no tag is left
+python vidDownloader.py dedup --dry-run                        # what the duplicate pass would delete (download already runs it for real)
 ```
 
 "Google returned the sign-in page" = the sheet is not shared as *Anyone with the link: Viewer*. Either share it that
-way, or with the tab open do File > Download > CSV and run `python adspy.py download --csv "<that file>"`.
+way, or with the tab open do File > Download > CSV and run `python vidDownloader.py download --csv "<that file>"`.
 
 ### Giving it to someone else
 
@@ -177,11 +178,11 @@ videos. `INSTRUCTIONS.txt` inside the folder explains everything in plain langua
 
 ```powershell
 cd C:\Users\top2\Desktop
-Compress-Archive -Path (Get-ChildItem vid -Exclude adspy_output,__pycache__) -DestinationPath adspy-downloader.zip -Force
+Compress-Archive -Path (Get-ChildItem vid -Exclude vidDownloader_output,__pycache__) -DestinationPath vidDownloader.zip -Force
 ```
 
 Before sending: the sheet must be shared as *Anyone with the link: Viewer* (or shared with their Google account
 and they download the tab as CSV each time, which is not double-click friendly). Instagram links need them logged into
-instagram.com in Firefox once; `setup.bat` writes `ADSPY_COOKIES_FROM_BROWSER=firefox` into their `.env`. For updates,
-send a new zip; they replace the folder's files and keep their `adspy_output`.
+instagram.com in Firefox once; `setup.bat` writes `VIDDL_COOKIES_FROM_BROWSER=firefox` into their `.env`. For updates,
+send a new zip; they replace the folder's files and keep their `vidDownloader_output`.
 

@@ -19,7 +19,7 @@ from .download import VideoResult, load_manifest, save_manifest
 from .metadata import video_files
 from .sheet import Product
 
-log = logging.getLogger("adspy.dedup")
+log = logging.getLogger("viddownloader.dedup")
 
 LEFTOVER_SUFFIXES = (".part", ".ytdl", ".part-Frag0", ".temp.mp4", ".temp.webm", ".temp.mkv")
 

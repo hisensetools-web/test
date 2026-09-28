@@ -18,7 +18,7 @@ import requests
 
 from . import config
 
-log = logging.getLogger("adspy.sheet")
+log = logging.getLogger("viddownloader.sheet")
 
 URL_RE = re.compile(r"https?://[^\s\"'<>|]+", re.IGNORECASE)
 _TRAILING = ".,;:)]}\\"

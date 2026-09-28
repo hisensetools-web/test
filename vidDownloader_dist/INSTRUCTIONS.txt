@@ -1,4 +1,4 @@
-ADSPY VIDEO DOWNLOADER - HOW TO USE IT
+VIDDOWNLOADER - HOW TO USE IT
 ======================================
 
 WHAT IT DOES
@@ -38,8 +38,8 @@ Double-click  DOWNLOAD.bat
 - A black window shows each product and each video as it comes in. Leave it open.
 - It ends with a line like:  done: 42 downloaded, 130 already there, 2 failed
 - Press any key to close the window.
-- The videos are in the folder  adspy_output  next to DOWNLOAD.bat, one folder per product, for example
-      adspy_output\skull-candle-warmer\TikTok-7381234567890.mp4
+- The videos are in the folder  vidDownloader_output  next to DOWNLOAD.bat, one folder per product, for example
+      vidDownloader_output\skull-candle-warmer\TikTok-7381234567890.mp4
 
 Run it as often as you like. Videos that are already there are skipped in a second, only new links are fetched.
 
@@ -64,7 +64,7 @@ Downloads fail for everything          TikTok or Instagram changed something. Do
 
 RULES OF THE FOLDER
 -------------------
-- COPY videos out of the adspy_output folders if you need them elsewhere; do not MOVE or rename them there.
+- COPY videos out of the vidDownloader_output folders if you need them elsewhere; do not MOVE or rename them there.
   A missing file is downloaded again on the next run.
 - Do not delete  manifest.json  or  links.txt  inside the product folders; they are how the tool knows what it
   already has.
@@ -80,5 +80,5 @@ DOWNLOAD.bat               download everything new
 DOWNLOAD ONE PRODUCT.bat   download one product only
 UPDATE.bat                 update the downloader when TikTok / Instagram change
 INSTRUCTIONS.txt           this file
-adspy_output\              the videos, one folder per product
+vidDownloader_output\              the videos, one folder per product
 everything else            the tool itself; leave it alone

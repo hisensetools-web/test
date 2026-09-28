@@ -20,7 +20,7 @@ from typing import Callable, Protocol
 from . import config, metadata
 from .sheet import Product
 
-log = logging.getLogger("adspy.download")
+log = logging.getLogger("viddownloader.download")
 
 MANIFEST = "manifest.json"
 LINKS = "links.txt"

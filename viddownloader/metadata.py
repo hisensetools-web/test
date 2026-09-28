@@ -17,7 +17,7 @@ from pathlib import Path
 
 from . import config
 
-log = logging.getLogger("adspy.metadata")
+log = logging.getLogger("viddownloader.metadata")
 
 VIDEO_EXTS = {".mp4", ".m4v", ".mov", ".webm", ".mkv"}
 GENERIC_TAGS = {"handler_name", "vendor_id", "major_brand", "minor_version", "compatible_brands"}
@@ -26,7 +26,7 @@ STRIP_ARGS = ["-map", "0", "-map_metadata", "-1", "-map_metadata:s", "-1", "-map
 
 
 def find_ffmpeg() -> str | None:
-    """ADSPY_FFMPEG, then PATH, then the imageio-ffmpeg wheel if someone installed it."""
+    """VIDDL_FFMPEG, then PATH, then the imageio-ffmpeg wheel if someone installed it."""
     if config.FFMPEG and Path(config.FFMPEG).exists():
         return config.FFMPEG
     found = shutil.which("ffmpeg")

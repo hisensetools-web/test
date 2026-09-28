@@ -7,5 +7,5 @@ reportlab>=4.0         # PDF guide for Fudge
 anthropic>=1.0         # optional: Claude rewrites product_summary and writes the guide (ANTHROPIC_API_KEY)
 higgsfield-client>=0.1 # optional: Higgsfield Cloud image generation (HF_KEY)
 # optional template readers: python-docx (for .docx templates), pypdf (for .pdf templates)
-# --- adspy.py (Adspy video puller) ---
+# --- vidDownloader.py (vidDownloader) ---
 yt-dlp[default,curl-cffi]>=2026.1   # TikTok / Instagram downloads (curl-cffi: browser TLS fingerprint); ffmpeg on PATH (winget install Gyan.FFmpeg)

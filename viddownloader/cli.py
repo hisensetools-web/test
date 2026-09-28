@@ -1,4 +1,4 @@
-"""python adspy.py <command>. Run `python adspy.py --help`."""
+"""python vidDownloader.py <command>. Run `python vidDownloader.py --help`."""
 from __future__ import annotations
 
 import argparse
@@ -97,7 +97,7 @@ def _strip_all(products, out_root: Path, force: bool) -> dict[str, int]:
     from . import download as dl, metadata
     totals = {"cleaned": 0, "skipped": 0, "failed": 0}
     if not metadata.find_ffmpeg():
-        print("\nmetadata NOT removed: ffmpeg not found (winget install Gyan.FFmpeg, reopen the terminal, then `python adspy.py clean`)")
+        print("\nmetadata NOT removed: ffmpeg not found (winget install Gyan.FFmpeg, reopen the terminal, then `python vidDownloader.py clean`)")
         return totals
     print("\nremoving metadata (stream copy, quality untouched)...")
     for p in products:
@@ -157,15 +157,15 @@ def cmd_check(args) -> int:
     from . import metadata
     ff = metadata.find_ffmpeg()
     print(f"ffmpeg : {ff or 'NOT FOUND (winget install Gyan.FFmpeg, then reopen the terminal; needed for merging and for the metadata removal)'}")
-    print(f"strip  : {'metadata removed after every download' if config.STRIP_METADATA else 'OFF (ADSPY_STRIP_METADATA=0)'}")
-    print(f"dedup  : {('duplicates removed after every download, one copy ' + ('per sheet' if config.DEDUP_ACROSS else 'per product')) if config.DEDUP else 'OFF (ADSPY_DEDUP=0)'}")
+    print(f"strip  : {'metadata removed after every download' if config.STRIP_METADATA else 'OFF (VIDDL_STRIP_METADATA=0)'}")
+    print(f"dedup  : {('duplicates removed after every download, one copy ' + ('per sheet' if config.DEDUP_ACROSS else 'per product')) if config.DEDUP else 'OFF (VIDDL_DEDUP=0)'}")
     print(f"format : {dl.format_expression()}")
     print(f"tls    : {'browser fingerprint ' + str(dl.impersonate_target()) if dl.impersonate_target() else 'plain (pip install curl_cffi to look like a browser to TikTok)'}; rate-limit waits {', '.join(str(w) + 's' for w in config.THROTTLE_WAITS)}")
     src = "csv" if args.csv else (args.source or config.SOURCE)
     print(f"source : {src}")
     if src == "clickup":
         tok = args.clickup_token or config.CLICKUP_TOKEN
-        print(f"clickup: list {args.clickup_list or config.CLICKUP_LIST_ID}, token {'set (' + tok[:5] + '...)' if tok else 'MISSING -> ADSPY_CLICKUP_TOKEN in .env'}, skipping statuses {', '.join(config.CLICKUP_SKIP_STATUSES)}")
+        print(f"clickup: list {args.clickup_list or config.CLICKUP_LIST_ID}, token {'set (' + tok[:5] + '...)' if tok else 'MISSING -> VIDDL_CLICKUP_TOKEN in .env'}, skipping statuses {', '.join(config.CLICKUP_SKIP_STATUSES)}")
     else:
         print(f"sheet  : {args.sheet_id}  tab '{args.tab}' (gid {args.gid})  columns '{args.product_column}' / '{args.link_column}'")
     print(f"output : {config.OUTPUT_ROOT}")
@@ -181,18 +181,18 @@ def cmd_check(args) -> int:
 
 # --------------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="adspy.py", description="Pull the Adspy links of one Google Sheet tab and download every video (clean, best quality) into a folder per product.")
+    ap = argparse.ArgumentParser(prog="vidDownloader.py", description="vidDownloader: read the products from ClickUp (or the Google Sheet) and download every TikTok / Instagram video, clean and best quality, into a folder per product.")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging and yt-dlp's own output")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("--source", choices=["clickup", "sheet"], default=None, help=f"where the products come from (ADSPY_SOURCE, currently {config.SOURCE})")
-        p.add_argument("--clickup-list", default="", metavar="ID", help="ClickUp list id (ADSPY_CLICKUP_LIST_ID)")
-        p.add_argument("--clickup-token", default="", metavar="pk_...", help="ClickUp personal API token (ADSPY_CLICKUP_TOKEN)")
+        p.add_argument("--source", choices=["clickup", "sheet"], default=None, help=f"where the products come from (VIDDL_SOURCE, currently {config.SOURCE})")
+        p.add_argument("--clickup-list", default="", metavar="ID", help="ClickUp list id (VIDDL_CLICKUP_LIST_ID)")
+        p.add_argument("--clickup-token", default="", metavar="pk_...", help="ClickUp personal API token (VIDDL_CLICKUP_TOKEN)")
         p.add_argument("--csv", help="read this CSV (File > Download > CSV of the sheet tab) instead of any live source")
-        p.add_argument("--sheet-id", default=config.SHEET_ID, help="Google Sheet id (ADSPY_SHEET_ID)")
-        p.add_argument("--gid", default=config.SHEET_GID, help="tab gid from the URL (ADSPY_SHEET_GID)")
-        p.add_argument("--tab", default=config.SHEET_TAB, help="tab name, used when the gid does not resolve (ADSPY_SHEET_TAB)")
+        p.add_argument("--sheet-id", default=config.SHEET_ID, help="Google Sheet id (VIDDL_SHEET_ID)")
+        p.add_argument("--gid", default=config.SHEET_GID, help="tab gid from the URL (VIDDL_SHEET_GID)")
+        p.add_argument("--tab", default=config.SHEET_TAB, help="tab name, used when the gid does not resolve (VIDDL_SHEET_TAB)")
         p.add_argument("--product-column", default=config.PRODUCT_COLUMN)
         p.add_argument("--link-column", default=config.LINK_COLUMN)
         p.add_argument("--only", action="append", metavar="NAME", help="only products whose name contains this (repeatable)")
@@ -209,8 +209,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force", action="store_true", help="re-download links that already have a file")
     p.add_argument("--dry-run", action="store_true", help="show what would be fetched, download nothing")
     p.add_argument("--pause", type=float, default=None, help=f"seconds between downloads (default {config.PAUSE_S})")
-    p.add_argument("--cookies", default="", help="Netscape cookies.txt (ADSPY_COOKIES); Instagram needs a logged-in session")
-    p.add_argument("--cookies-from-browser", default="", metavar="BROWSER", help="chrome | edge | firefox ... (ADSPY_COOKIES_FROM_BROWSER)")
+    p.add_argument("--cookies", default="", help="Netscape cookies.txt (VIDDL_COOKIES); Instagram needs a logged-in session")
+    p.add_argument("--cookies-from-browser", default="", metavar="BROWSER", help="chrome | edge | firefox ... (VIDDL_COOKIES_FROM_BROWSER)")
     p.add_argument("--keep-metadata", action="store_true", help="skip the metadata removal that runs after the downloads")
     p.add_argument("--no-dedup", action="store_true", help="skip the duplicate removal that runs after the downloads")
     p.set_defaults(func=cmd_download)
