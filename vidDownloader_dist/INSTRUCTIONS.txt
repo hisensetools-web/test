@@ -13,7 +13,8 @@ You never have to type any code. Everything is a double-click.
 
 ONE-TIME SETUP (about 5 minutes, only the first time)
 -----------------------------------------------------
-1. Put the "vid" folder somewhere easy, for example on your Desktop. Do not put it inside OneDrive.
+1. Right-click the zip > Extract All. Put the vidDownloader folder that comes out somewhere easy, for example
+   on your Desktop. Do not put it inside OneDrive.
 
 2. Double-click  setup.bat
    - A black window opens and installs what is needed (Python, ffmpeg, the downloader).

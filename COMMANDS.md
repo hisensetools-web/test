@@ -178,7 +178,8 @@ videos. `INSTRUCTIONS.txt` inside the folder explains everything in plain langua
 
 ```powershell
 cd C:\Users\top2\Desktop
-Compress-Archive -Path (Get-ChildItem vid -Exclude vidDownloader_output,__pycache__) -DestinationPath vidDownloader.zip -Force
+Get-ChildItem vid -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse -Force
+Compress-Archive -Path (Get-ChildItem vid -Exclude .env,vidDownloader_output,adspy_output,__pycache__) -DestinationPath vidDownloader.zip -Force   # never ship .env: it holds YOUR ClickUp token
 ```
 
 Before sending: the sheet must be shared as *Anyone with the link: Viewer* (or shared with their Google account
