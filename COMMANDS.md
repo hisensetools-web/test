@@ -185,3 +185,17 @@ Before sending: they must be a member of the ClickUp workspace with access to th
 `setup.bat` writes `VIDDL_COOKIES_FROM_BROWSER=firefox` into their `.env`. For updates,
 send a new zip; they replace the folder's files and keep their `vidDownloader_output`.
 
+
+### One-off: moving what the Google Sheet still held into ClickUp (`sheet_to_clickup.py`)
+
+Run once, on a machine where `.env` holds `VIDDL_CLICKUP_TOKEN`, with the three tab exports in `sheet_export/`
+(File > Download > CSV for "Main TikTok Prods V2", "TT Ad Accounts", "Competition Checklist"):
+
+```powershell
+python sheet_to_clickup.py            # dry run: prints every change, writes nothing
+python sheet_to_clickup.py --apply    # makes the changes, then re-reads the tasks to confirm
+```
+
+Additive only: missing links, post ids and research notes are appended under a dated heading, empty custom fields are
+filled, products without a task are created, and every difference that would need an overwrite is printed as a NOTE.
+Delete `sheet_export/` afterwards; it holds ad-account emails.
