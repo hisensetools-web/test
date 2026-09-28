@@ -157,11 +157,11 @@ winget install Gyan.FFmpeg                             # once; reopen the termin
 ```
 
 ```powershell
-python vidDownloader.py check                                  # yt-dlp / ffmpeg present, sheet readable, products and link counts
+python vidDownloader.py check                                  # yt-dlp / ffmpeg present, ClickUp readable, products and link counts
 python vidDownloader.py download                               # all products; run again any time, only missing or failed links are fetched
 python vidDownloader.py download --only "ghostface"            # one product (any part of its name)
 python vidDownloader.py download --cookies-from-browser chrome # Instagram reels need a logged-in browser (close Chrome first)
-python vidDownloader.py links --urls                           # what is on the sheet, without downloading
+python vidDownloader.py links --urls                           # what is in ClickUp, without downloading
 python vidDownloader.py clean --verify                         # metadata removal on its own (download already runs it), then prove no tag is left
 python vidDownloader.py dedup --dry-run                        # what the duplicate pass would delete (download already runs it for real)
 ```
