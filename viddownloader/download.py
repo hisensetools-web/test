@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Callable, Protocol
 
 from . import config, metadata
-from .sheet import Product
+from .products import Product
 
 log = logging.getLogger("viddownloader.download")
 
@@ -168,7 +168,7 @@ def existing_file(dest: Path, extractor_key: str, video_id: str) -> Path | None:
 
 
 def ytdlp_downloader(cookies: str = "", cookies_from_browser: str = "", quiet: bool = True) -> Downloader:
-    """The real thing. Imported lazily so the sheet / ClickUp commands never need yt-dlp.
+    """The real thing. Imported lazily so the ClickUp-only commands never need yt-dlp.
 
     Two steps on purpose: resolve the link to a video id first (no download), look for that id in the folder, and only
     then download. yt-dlp's own download archive is not used: it answers an already-seen video with an empty result on

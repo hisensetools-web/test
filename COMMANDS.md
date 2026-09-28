@@ -137,8 +137,7 @@ python tracker.py ads --only a.com b.com               # scrape new stores now i
 
 Downloads every TikTok / Instagram link in the descriptions of the ClickUp **Product Research** tasks (cancelled and
 lesson skipped) into `vidDownloader_output\<product>\`, clean (no TikTok watermark) and at the best quality available.
-`setup.bat` asks once for the ClickUp API token (avatar > Settings > Apps > API Token). `--source sheet` reads the old
-Google Sheet tab instead. It runs on its own in `C:\Users\top2\Desktop\vid` (no tracker needed there).
+`setup.bat` asks once for the ClickUp API token (avatar > Settings > Apps > API Token). ClickUp is the only source. It runs on its own in `C:\Users\top2\Desktop\vid` (no tracker needed there).
 Once, to put it there (or refresh it after an update):
 
 ```powershell
@@ -167,8 +166,7 @@ python vidDownloader.py clean --verify                         # metadata remova
 python vidDownloader.py dedup --dry-run                        # what the duplicate pass would delete (download already runs it for real)
 ```
 
-"Google returned the sign-in page" = the sheet is not shared as *Anyone with the link: Viewer*. Either share it that
-way, or with the tab open do File > Download > CSV and run `python vidDownloader.py download --csv "<that file>"`.
+"ClickUp rejected the token" = run `setup.bat` again and paste a fresh token (ClickUp > avatar > Settings > Apps > API Token).
 
 ### Giving it to someone else
 
@@ -182,8 +180,8 @@ Get-ChildItem vid -Recurse -Directory -Filter __pycache__ | Remove-Item -Recurse
 Compress-Archive -Path (Get-ChildItem vid -Exclude .env,vidDownloader_output,adspy_output,__pycache__) -DestinationPath vidDownloader.zip -Force   # never ship .env: it holds YOUR ClickUp token
 ```
 
-Before sending: the sheet must be shared as *Anyone with the link: Viewer* (or shared with their Google account
-and they download the tab as CSV each time, which is not double-click friendly). Instagram links need them logged into
-instagram.com in Firefox once; `setup.bat` writes `VIDDL_COOKIES_FROM_BROWSER=firefox` into their `.env`. For updates,
+Before sending: they must be a member of the ClickUp workspace with access to the Product Research list, since
+`setup.bat` asks for their own API token. Instagram links may need them logged into instagram.com in Firefox once;
+`setup.bat` writes `VIDDL_COOKIES_FROM_BROWSER=firefox` into their `.env`. For updates,
 send a new zip; they replace the folder's files and keep their `vidDownloader_output`.
 

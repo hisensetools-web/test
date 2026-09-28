@@ -44,19 +44,10 @@ def slugify(text: str, max_len: int = 60) -> str:
     text = re.sub(r"[\s_-]+", "-", text).strip("-")
     return (text or "product")[:max_len].rstrip("-")
 
-# The sheet: id + tab. The gid is what the browser URL shows after `#gid=`; the tab name is the fallback lookup.
-SHEET_ID = env("SHEET_ID", "1O35L85zhY_5WMnsG8gEKN0bKx7oziTUMlbn6r3TJ1J0").strip()
-SHEET_GID = env("SHEET_GID", "395636284").strip()
-SHEET_TAB = env("SHEET_TAB", "Main TikTok Prods V2").strip()
-PRODUCT_COLUMN = env("PRODUCT_COLUMN", "Product Name").strip()
-LINK_COLUMN = env("LINK_COLUMN", "Adspy").strip()
-
-# ClickUp (the current workflow): the Product Research list, one task per product, links in the description.
+# ClickUp, the only source: the Product Research list, one task per product, links in the description.
 CLICKUP_TOKEN = env("CLICKUP_TOKEN", "").strip()          # personal token, pk_...
 CLICKUP_LIST_ID = env("CLICKUP_LIST_ID", "901222590753").strip()
 CLICKUP_SKIP_STATUSES = tuple(s.strip() for s in env("CLICKUP_SKIP_STATUSES", "cancelled,lesson").split(","))
-# Where the products come from: clickup | sheet. Default: clickup when a token is set, else the sheet.
-SOURCE = env("SOURCE", "clickup" if CLICKUP_TOKEN else "sheet").strip().lower()
 
 # One folder per product under here: vidDownloader_output/<product-slug>/
 OUTPUT_ROOT = Path(env("OUTPUT_DIR", ROOT / "vidDownloader_output"))
@@ -77,7 +68,7 @@ RETRIES = int(env("RETRIES", "3"))
 FORMAT_OVERRIDE = env("FORMAT", "").strip()    # a raw yt-dlp -f expression, if you ever need one
 FFMPEG = env("FFMPEG", "").strip()              # full path to ffmpeg.exe when it is not on PATH
 DEDUP = env("DEDUP", "1").strip().lower() not in ("0", "false", "no")
-DEDUP_ACROSS = env("DEDUP_ACROSS", "1").strip().lower() not in ("0", "false", "no")   # one copy per sheet, not per product
+DEDUP_ACROSS = env("DEDUP_ACROSS", "1").strip().lower() not in ("0", "false", "no")   # one copy across all products, not per product
 STRIP_METADATA = env("STRIP_METADATA", "1").strip().lower() not in ("0", "false", "no")
 
 REQUEST_TIMEOUT = (10, 60)

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from . import config
 from .clickup import ClickUpError
-from .sheet import SheetAccessError, fetch_tab_csv, parse_products, select
+from .products import select
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -17,22 +17,9 @@ def _setup_logging(verbose: bool) -> None:
 
 
 def _products(args):
-    source_kind = "csv" if args.csv else (args.source or config.SOURCE)
-    if source_kind == "csv":
-        text = Path(args.csv).read_text(encoding="utf-8-sig")
-        source = args.csv
-        products = parse_products(text, args.product_column, args.link_column)
-    elif source_kind == "clickup":
-        from . import clickup
-        products = clickup.fetch_products(args.clickup_list, args.clickup_token)
-        source = f"ClickUp list {args.clickup_list or config.CLICKUP_LIST_ID}"
-    elif source_kind == "sheet":
-        text = fetch_tab_csv(args.sheet_id, args.gid, args.tab)
-        source = f"sheet {args.sheet_id} / '{args.tab}'"
-        products = parse_products(text, args.product_column, args.link_column)
-    else:
-        raise SystemExit(f"unknown source '{source_kind}' (clickup | sheet)")
-    products = select(products, args.only)
+    from . import clickup
+    products = select(clickup.fetch_products(args.clickup_list, args.clickup_token), args.only)
+    source = f"ClickUp list {args.clickup_list or config.CLICKUP_LIST_ID}"
     if not products:
         raise SystemExit(f"no products{' matching ' + ', '.join(args.only) if args.only else ''} in {source}")
     return products, source
@@ -158,22 +145,17 @@ def cmd_check(args) -> int:
     ff = metadata.find_ffmpeg()
     print(f"ffmpeg : {ff or 'NOT FOUND (winget install Gyan.FFmpeg, then reopen the terminal; needed for merging and for the metadata removal)'}")
     print(f"strip  : {'metadata removed after every download' if config.STRIP_METADATA else 'OFF (VIDDL_STRIP_METADATA=0)'}")
-    print(f"dedup  : {('duplicates removed after every download, one copy ' + ('per sheet' if config.DEDUP_ACROSS else 'per product')) if config.DEDUP else 'OFF (VIDDL_DEDUP=0)'}")
+    print(f"dedup  : {('duplicates removed after every download, one copy ' + ('across products' if config.DEDUP_ACROSS else 'per product')) if config.DEDUP else 'OFF (VIDDL_DEDUP=0)'}")
     print(f"format : {dl.format_expression()}")
     print(f"tls    : {'browser fingerprint ' + str(dl.impersonate_target()) if dl.impersonate_target() else 'plain (pip install curl_cffi to look like a browser to TikTok)'}; rate-limit waits {', '.join(str(w) + 's' for w in config.THROTTLE_WAITS)}")
-    src = "csv" if args.csv else (args.source or config.SOURCE)
-    print(f"source : {src}")
-    if src == "clickup":
-        tok = args.clickup_token or config.CLICKUP_TOKEN
-        print(f"clickup: list {args.clickup_list or config.CLICKUP_LIST_ID}, token {'set (' + tok[:5] + '...)' if tok else 'MISSING -> VIDDL_CLICKUP_TOKEN in .env'}, skipping statuses {', '.join(config.CLICKUP_SKIP_STATUSES)}")
-    else:
-        print(f"sheet  : {args.sheet_id}  tab '{args.tab}' (gid {args.gid})  columns '{args.product_column}' / '{args.link_column}'")
+    tok = args.clickup_token or config.CLICKUP_TOKEN
+    print(f"clickup: list {args.clickup_list or config.CLICKUP_LIST_ID}, token {'set (' + tok[:5] + '...)' if tok else 'MISSING -> VIDDL_CLICKUP_TOKEN in .env (run setup.bat)'}, skipping statuses {', '.join(config.CLICKUP_SKIP_STATUSES)}")
     print(f"output : {config.OUTPUT_ROOT}")
     print(f"cookies: {config.COOKIES_FILE or (config.COOKIES_FROM_BROWSER + ' (browser)' if config.COOKIES_FROM_BROWSER else 'none')}")
     try:
         products, _ = _products(args)
         print(f"reads  : OK, {len(products)} products, {sum(len(p.links) for p in products)} links")
-    except (SheetAccessError, ClickUpError, SystemExit) as e:
+    except (ClickUpError, SystemExit) as e:
         print(f"reads  : FAILED\n{e}")
         return 1
     return 0
@@ -181,20 +163,13 @@ def cmd_check(args) -> int:
 
 # --------------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(prog="vidDownloader.py", description="vidDownloader: read the products from ClickUp (or the Google Sheet) and download every TikTok / Instagram video, clean and best quality, into a folder per product.")
+    ap = argparse.ArgumentParser(prog="vidDownloader.py", description="vidDownloader: read the products from ClickUp and download every TikTok / Instagram video, clean and best quality, into a folder per product.")
     ap.add_argument("-v", "--verbose", action="store_true", help="debug logging and yt-dlp's own output")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def common(p):
-        p.add_argument("--source", choices=["clickup", "sheet"], default=None, help=f"where the products come from (VIDDL_SOURCE, currently {config.SOURCE})")
         p.add_argument("--clickup-list", default="", metavar="ID", help="ClickUp list id (VIDDL_CLICKUP_LIST_ID)")
         p.add_argument("--clickup-token", default="", metavar="pk_...", help="ClickUp personal API token (VIDDL_CLICKUP_TOKEN)")
-        p.add_argument("--csv", help="read this CSV (File > Download > CSV of the sheet tab) instead of any live source")
-        p.add_argument("--sheet-id", default=config.SHEET_ID, help="Google Sheet id (VIDDL_SHEET_ID)")
-        p.add_argument("--gid", default=config.SHEET_GID, help="tab gid from the URL (VIDDL_SHEET_GID)")
-        p.add_argument("--tab", default=config.SHEET_TAB, help="tab name, used when the gid does not resolve (VIDDL_SHEET_TAB)")
-        p.add_argument("--product-column", default=config.PRODUCT_COLUMN)
-        p.add_argument("--link-column", default=config.LINK_COLUMN)
         p.add_argument("--only", action="append", metavar="NAME", help="only products whose name contains this (repeatable)")
 
     p = sub.add_parser("links", help="list the products and how many links each has (--urls prints them)")
@@ -228,7 +203,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--verify", action="store_true", help="afterwards, list any file that still carries a tag")
     p.set_defaults(func=cmd_clean)
 
-    p = sub.add_parser("check", help="yt-dlp / ffmpeg present, sheet readable")
+    p = sub.add_parser("check", help="yt-dlp / ffmpeg present, ClickUp readable")
     common(p)
     p.set_defaults(func=cmd_check)
     return ap
@@ -239,7 +214,7 @@ def main(argv=None) -> int:
     _setup_logging(args.verbose)
     try:
         return args.func(args)
-    except (SheetAccessError, ClickUpError) as e:
+    except ClickUpError as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 

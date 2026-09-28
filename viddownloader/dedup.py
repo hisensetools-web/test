@@ -4,7 +4,7 @@ Three kinds are handled, in this order:
 1. leftovers: `.part`, `.ytdl`, `.clean.*` and `.temp.*` files from an interrupted run or strip;
 2. the same video id saved twice with different extensions in one folder (keeps the largest);
 3. byte-identical files (SHA-256, compared after the metadata strip so tags do not hide a match), within a product
-   folder and, by default, across product folders: the first product on the sheet keeps the file, the others get a
+   folder and, by default, across product folders: the first product in the ClickUp list keeps the file, the others get a
    `duplicate` row in their manifest pointing at it, which `download` honours on the next run (no refetch).
 """
 from __future__ import annotations
@@ -17,7 +17,7 @@ from typing import Callable
 from . import config
 from .download import VideoResult, load_manifest, save_manifest
 from .metadata import video_files
-from .sheet import Product
+from .products import Product
 
 log = logging.getLogger("viddownloader.dedup")
 
@@ -47,7 +47,7 @@ def dedup(products: list[Product], out_root: Path, across_products: bool | None 
     say = progress or (lambda s: None)
     across = config.DEDUP_ACROSS if across_products is None else across_products
     counts = {"leftovers": 0, "duplicates": 0, "bytes": 0}
-    seen: dict[str, tuple[Product, Path]] = {}        # hash -> first file kept, in sheet order
+    seen: dict[str, tuple[Product, Path]] = {}        # hash -> first file kept, in list order
     retired: set[Path] = set()                         # removed this pass (or would be, in a dry run)
 
     for product in products:

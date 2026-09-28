@@ -17,7 +17,7 @@ import time
 import requests
 
 from . import config
-from .sheet import Product
+from .products import Product
 
 log = logging.getLogger("viddownloader.clickup")
 

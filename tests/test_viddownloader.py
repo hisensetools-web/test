@@ -1,85 +1,14 @@
-"""viddownloader unit tests: sheet CSV parsing, link extraction, product selection, the per-product download loop and manifests."""
+"""viddownloader unit tests: ClickUp task parsing and fetching, product selection, the download loop, manifests, throttle backoff, metadata strip, dedup, CLI."""
 import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from viddownloader import cli, clickup, dedup, download, metadata, sheet
-from viddownloader.sheet import Product
+from viddownloader import cli, clickup, dedup, download, metadata
+from viddownloader.products import Product, select
 
-FIX = Path(__file__).parent / "fixtures_viddownloader" / "main_tiktok_prods_v2.csv"
 CU_FIX = Path(__file__).parent / "fixtures_viddownloader" / "clickup_tasks.json"
-
-
-class LinkExtractTests(unittest.TestCase):
-    def test_urls_split_on_whitespace_and_commas_trailing_punctuation_dropped(self):
-        cell = "https://vm.tiktok.com/ZN8My63PS/ https://vm.tiktok.com/ZN8My6Dx9/, https://vm.tiktok.com/ZN8MyLv8A/.\nhttps://a.example/x?y=1&z=2)"
-        self.assertEqual(sheet.extract_links(cell), ["https://vm.tiktok.com/ZN8My63PS/", "https://vm.tiktok.com/ZN8My6Dx9/",
-                                                     "https://vm.tiktok.com/ZN8MyLv8A/", "https://a.example/x?y=1&z=2"])
-
-    def test_duplicates_and_markdown_escapes(self):
-        self.assertEqual(sheet.extract_links("https://x.example/a\\_b?c=1\\&d=2 https://x.example/a_b?c=1&d=2 nothing here"),
-                         ["https://x.example/a_b?c=1&d=2"])
-        self.assertEqual(sheet.extract_links(""), [])
-        self.assertEqual(sheet.extract_links(None), [])
-
-
-class ParseTests(unittest.TestCase):
-    def setUp(self):
-        self.products = sheet.parse_products(FIX.read_text(encoding="utf-8"))
-
-    def test_products_in_sheet_order_across_header_blocks(self):
-        self.assertEqual([p.name for p in self.products], ["Trunk Horror Prop", "The Freaky Nikki Costume",
-                                                             "B&BW x Nightmare Before Christmas Candle Holder", "Wicked For Good Tumbler"])
-
-    def test_multiline_cell_and_continuation_row_dedup(self):
-        by = {p.name: p for p in self.products}
-        self.assertEqual(by["Trunk Horror Prop"].links, ["https://www.instagram.com/reel/Ddb7uPzx9gA/?stkn=aWFodzFjMzB0cDhi",
-                                                          "https://www.instagram.com/reel/Ddb9dcGRfqr/?stkn=MWx2eXphaXlzb3diMw=="])
-        self.assertEqual(by["The Freaky Nikki Costume"].links, ["https://vm.tiktok.com/ZN8My63PS/", "https://vm.tiktok.com/ZN8My6Dx9/",
-                                                                 "https://vm.tiktok.com/ZN8MyLv8A/", "https://vm.tiktok.com/ZN8Myf7ck/"])
-        self.assertEqual(by["B&BW x Nightmare Before Christmas Candle Holder"].links, [])
-        self.assertEqual(by["Wicked For Good Tumbler"].links, ["https://www.pipiads.com/product-search/68e9773876337861bef2b330/"])   # Adspy column only, not Competition / Result
-        self.assertEqual(by["Trunk Horror Prop"].row, 4)
-
-    def test_slug_is_the_folder_name(self):
-        by = {p.name: p for p in self.products}
-        self.assertEqual(by["B&BW x Nightmare Before Christmas Candle Holder"].slug, "bbw-x-nightmare-before-christmas-candle-holder")
-        self.assertEqual(by["Trunk Horror Prop"].slug, "trunk-horror-prop")
-
-    def test_missing_header_is_an_error(self):
-        with self.assertRaises(sheet.SheetAccessError):
-            sheet.parse_products("a,b\n1,2\n")
-
-    def test_select_by_name_fragment(self):
-        self.assertEqual([p.name for p in sheet.select(self.products, ["nikki", "TRUNK"])], ["Trunk Horror Prop", "The Freaky Nikki Costume"])
-        self.assertEqual(len(sheet.select(self.products, None)), 4)
-        self.assertEqual(sheet.select(self.products, ["nothing"]), [])
-
-
-class _Resp:
-    def __init__(self, status, text, ctype="text/csv"):
-        self.status_code, self.content, self.headers = status, text.encode(), {"Content-Type": ctype}
-
-
-class FetchTests(unittest.TestCase):
-    def test_gid_export_first_then_gviz_by_name(self):
-        session = mock.Mock()
-        session.get.side_effect = [_Resp(200, "<!DOCTYPE html><html>sign in</html>", "text/html"), _Resp(200, "Product Name,Adspy\nA,https://x/1\n")]
-        text = sheet.fetch_tab_csv("SHEET", "42", "Main TikTok Prods V2", session=session)
-        self.assertTrue(text.startswith("Product Name"))
-        urls = [c.args[0] for c in session.get.call_args_list]
-        self.assertEqual(urls[0], "https://docs.google.com/spreadsheets/d/SHEET/export?format=csv&gid=42")
-        self.assertEqual(urls[1], "https://docs.google.com/spreadsheets/d/SHEET/gviz/tq?tqx=out:csv&sheet=Main%20TikTok%20Prods%20V2")
-
-    def test_private_sheet_explains_itself(self):
-        session = mock.Mock()
-        session.get.return_value = _Resp(403, "")
-        with self.assertRaises(sheet.SheetAccessError) as cm:
-            sheet.fetch_tab_csv("SHEET", "42", "Tab", session=session)
-        self.assertIn("--csv", str(cm.exception))
-        self.assertIn("Anyone with the link", str(cm.exception))
 
 
 class FakeDownloader:
@@ -426,10 +355,13 @@ class ClickUpParseTests(unittest.TestCase):
         wicked = {p.name: p for p in clickup.products_from_tasks(self.tasks, skip_statuses=())}["Wicked For Good Tumbler"]
         self.assertEqual(wicked.links, ["https://vm.tiktok.com/ZN8CANCEL/"])          # pipiads is never a video link
 
-    def test_same_slugs_as_the_sheet_so_folders_are_reused(self):
-        sheet_slugs = {p.slug for p in sheet.parse_products(FIX.read_text(encoding="utf-8"))}
-        self.assertIn(self.by["Trunk Horror Prop"].slug, sheet_slugs)
-        self.assertIn(self.by["The Freaky Nikki Costume"].slug, sheet_slugs)
+    def test_slug_is_the_folder_name_and_select_filters(self):
+        self.assertEqual(self.by["Trunk Horror Prop"].slug, "trunk-horror-prop")
+        self.assertEqual(self.by["Winking Spidey Mask"].slug, "winking-spidey-mask")
+        products = list(self.by.values())
+        self.assertEqual([p.name for p in select(products, ["spidey", "TRUNK"])], ["Trunk Horror Prop", "Winking Spidey Mask"])
+        self.assertEqual(select(products, None), products)
+        self.assertEqual(select(products, ["zzz"]), [])
 
 
 class ClickUpFetchTests(unittest.TestCase):
@@ -459,48 +391,51 @@ class ClickUpFetchTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def test_clickup_source_end_to_end_dry_run(self):
+    """Every command goes through ClickUp; the API is a mocked session returning the fixture."""
+    def _session(self):
         data = json.loads(CU_FIX.read_text())
         session = mock.Mock()
         session.get.return_value = mock.Mock(status_code=200, json=lambda: data)
-        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out, mock.patch("requests.Session", return_value=session):
-            rc = cli.main(["download", "--source", "clickup", "--clickup-token", "pk_x", "--clickup-list", "1", "--dry-run", "--out", d, "--only", "spidey"])
-            printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
-            self.assertEqual(rc, 0)
-            self.assertTrue((Path(d) / "winking-spidey-mask" / "links.txt").exists())
-        self.assertIn("ClickUp list 1", printed)
-        self.assertIn("3 would be fetched", printed)
+        return session
 
-    def test_links_and_dry_run_download_from_csv(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out:
-            self.assertEqual(cli.main(["links", "--csv", str(FIX), "--urls", "--only", "trunk"]), 0)
-            self.assertEqual(cli.main(["download", "--csv", str(FIX), "--dry-run", "--out", d, "--only", "nikki", "--max", "2"]), 0)
+    def test_links_and_dry_run_download(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out, mock.patch("requests.Session", return_value=self._session()):
+            self.assertEqual(cli.main(["links", "--clickup-token", "pk_x", "--clickup-list", "1", "--urls", "--only", "trunk"]), 0)
+            self.assertEqual(cli.main(["download", "--clickup-token", "pk_x", "--clickup-list", "1", "--dry-run", "--out", d, "--only", "spidey", "--max", "2"]), 0)
             printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
-            self.assertTrue((Path(d) / "the-freaky-nikki-costume" / "links.txt").exists())
-            self.assertFalse((Path(d) / "the-freaky-nikki-costume" / "manifest.json").exists())
-        self.assertIn("Trunk Horror Prop", printed)
+            self.assertTrue((Path(d) / "winking-spidey-mask" / "links.txt").exists())
+            self.assertFalse((Path(d) / "winking-spidey-mask" / "manifest.json").exists())
+        self.assertIn("ClickUp list 1", printed)
         self.assertIn("https://www.instagram.com/reel/Ddb7uPzx9gA/", printed)
         self.assertIn("2 would be fetched", printed)
 
-    def test_clean_command_without_ffmpeg_says_so(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out, mock.patch.object(metadata, "find_ffmpeg", return_value=None):
-            self.assertEqual(cli.main(["clean", "--csv", str(FIX), "--out", d]), 0)
-            printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
-        self.assertIn("ffmpeg not found", printed)
-
     def test_dedup_command_dry_run(self):
-        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out:
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out, mock.patch("requests.Session", return_value=self._session()):
             p = Product(name="Trunk Horror Prop", links=["https://x/1", "https://x/2"])
             download.download_product(p, Path(d), FakeDownloader(), pause_s=0)
-            self.assertEqual(cli.main(["dedup", "--csv", str(FIX), "--out", d, "--dry-run"]), 0)
+            self.assertEqual(cli.main(["dedup", "--clickup-token", "pk_x", "--clickup-list", "1", "--out", d, "--dry-run"]), 0)
             printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
             self.assertTrue((Path(d) / "trunk-horror-prop" / "TikTok-1.mp4").exists())
         self.assertIn("1 duplicate videos", printed)            # FakeDownloader writes identical bytes for both links
         self.assertIn("would free", printed)
 
+    def test_clean_command_without_ffmpeg_says_so(self):
+        with tempfile.TemporaryDirectory() as d, mock.patch("sys.stdout") as out, mock.patch.object(metadata, "find_ffmpeg", return_value=None), \
+                mock.patch("requests.Session", return_value=self._session()):
+            self.assertEqual(cli.main(["clean", "--clickup-token", "pk_x", "--clickup-list", "1", "--out", d]), 0)
+            printed = "".join(str(c.args[0]) for c in out.write.call_args_list)
+        self.assertIn("ffmpeg not found", printed)
+
+    def test_missing_token_is_a_clear_error_no_fallback(self):
+        with mock.patch("sys.stderr") as err, mock.patch.object(clickup.config, "CLICKUP_TOKEN", ""):
+            self.assertEqual(cli.main(["links", "--clickup-list", "1"]), 2)
+            printed = "".join(str(c.args[0]) for c in err.write.call_args_list)
+        self.assertIn("VIDDL_CLICKUP_TOKEN", printed)
+        self.assertNotIn("sheet", printed.lower())
+
     def test_unknown_product_is_a_clear_exit(self):
-        with self.assertRaises(SystemExit) as cm:
-            cli.main(["links", "--csv", str(FIX), "--only", "zzz"])
+        with mock.patch("requests.Session", return_value=self._session()), self.assertRaises(SystemExit) as cm:
+            cli.main(["links", "--clickup-token", "pk_x", "--clickup-list", "1", "--only", "zzz"])
         self.assertIn("no products matching zzz", str(cm.exception))
 
 
