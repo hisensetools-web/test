@@ -24,8 +24,7 @@ log = logging.getLogger("adspy.download")
 
 MANIFEST = "manifest.json"
 LINKS = "links.txt"
-ARCHIVE = ".downloaded.txt"        # yt-dlp's own archive: one "extractor id" per finished video (dedups reposts across share links)
-OUTTMPL = "%(extractor_key)s-%(id)s.%(ext)s"
+OUTTMPL = "%(extractor_key)s-%(id)s.%(ext)s"   # the file name is the video id, so any link to the same video finds the same file
 
 NO_WATERMARK = "[format_note!*=atermark]"     # case-insensitive enough: 'watermarked' / 'Watermarked'
 FORMAT_WITH_FFMPEG = f"bv*{NO_WATERMARK}+ba/b{NO_WATERMARK}/bv*+ba/b"
@@ -113,7 +112,6 @@ def ydl_options(dest: Path, cookies: str = "", cookies_from_browser: str = "", q
     opts = {
         "format": format_expression(),
         "outtmpl": str(dest / OUTTMPL),
-        "download_archive": str(dest / ARCHIVE),
         "retries": config.RETRIES,
         "fragment_retries": config.RETRIES,
         "socket_timeout": 60,
@@ -151,39 +149,62 @@ def _first_downloaded_path(info: dict) -> str:
     return info.get("filepath") or info.get("_filename") or ""
 
 
+def _first_video(info: dict) -> dict:
+    """An Instagram post with several clips comes back as a playlist: take its first clip."""
+    if info.get("_type") == "playlist":
+        entries = [e for e in (info.get("entries") or []) if e]
+        return entries[0] if entries else info
+    return info
+
+
+def existing_file(dest: Path, extractor_key: str, video_id: str) -> Path | None:
+    """The file a previous run saved for this video id, whatever link it was reached through."""
+    if not video_id:
+        return None
+    for f in dest.glob(f"{extractor_key or '*'}-{video_id}.*"):
+        if f.is_file() and f.suffix != ".part" and ".clean." not in f.name:
+            return f
+    return None
+
+
 def ytdlp_downloader(cookies: str = "", cookies_from_browser: str = "", quiet: bool = True) -> Downloader:
-    """The real thing. Imported lazily so the sheet commands never need yt-dlp."""
+    """The real thing. Imported lazily so the sheet / ClickUp commands never need yt-dlp.
+
+    Two steps on purpose: resolve the link to a video id first (no download), look for that id in the folder, and only
+    then download. yt-dlp's own download archive is not used: it answers an already-seen video with an empty result on
+    some sites (Instagram), which is indistinguishable from a dead link."""
     import yt_dlp
 
     def _download(url: str, dest: Path) -> VideoResult:
         opts = ydl_options(dest, cookies, cookies_from_browser, quiet)
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+                info = ydl.extract_info(url, download=False)
+                if info is None:
+                    return VideoResult(url=url, status="failed", error="no video found at this link")
+                video = _first_video(info)
+                vid, key = str(video.get("id") or ""), video.get("extractor_key") or ""
+                have = existing_file(dest, key, vid)
+                if have is not None:
+                    return VideoResult(url=url, status="exists", file=have.name, video_id=vid, title=(video.get("title") or "")[:120],
+                                       width=video.get("width"), height=video.get("height"))
+                done = ydl.process_ie_result(info, download=True)
         except yt_dlp.utils.DownloadError as e:
             err = str(e).split("\n")[0][:300]
             return VideoResult(url=url, status="failed", error=TRANSIENT_TEXT if is_transient(err) else err)
         except Exception as e:  # noqa: BLE001  curl_cffi / transport errors surface as their own classes
             err = f"{type(e).__name__}: {str(e)[:200]}"
             return VideoResult(url=url, status="failed", error=TRANSIENT_TEXT if is_transient(err) else err)
-        if info is None:
-            return VideoResult(url=url, status="failed", error="no video found at this link")
-        if info.get("_type") == "playlist":      # an Instagram post with several clips: take the entries
-            info = (info.get("entries") or [info])[0] or info
-        path = _first_downloaded_path(info)
-        status = "downloaded"
-        if not path:                                        # in the archive already -> nothing written this time
-            status = "exists"
-            for f in dest.glob(f"{info.get('extractor_key', '*')}-{info.get('id', '*')}.*"):
-                if f.name != ARCHIVE and f.suffix != ".part":
-                    path = str(f)
-                    break
-            else:
-                return VideoResult(url=url, status="failed", video_id=str(info.get("id") or ""),
-                                   error=f"video {info.get('id')} is listed in {ARCHIVE} but its file is gone; delete that line (or the file) to refetch")
-        return VideoResult(url=url, status=status, file=Path(path).name if path else "", video_id=str(info.get("id") or ""),
-                           title=(info.get("title") or "")[:120], width=info.get("width"), height=info.get("height"),
-                           format_note=info.get("format_note") or info.get("format") or "")
+        done = _first_video(done or {})
+        path = _first_downloaded_path(done)
+        if not path:
+            have = existing_file(dest, done.get("extractor_key") or key, str(done.get("id") or vid))
+            if have is None:
+                return VideoResult(url=url, status="failed", video_id=vid, error="yt-dlp finished without writing a file")
+            path = str(have)
+        return VideoResult(url=url, status="downloaded", file=Path(path).name, video_id=str(done.get("id") or vid),
+                           title=(done.get("title") or "")[:120], width=done.get("width"), height=done.get("height"),
+                           format_note=done.get("format_note") or done.get("format") or "")
 
     return _download
 

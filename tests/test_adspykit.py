@@ -150,8 +150,9 @@ class DownloadLoopTests(unittest.TestCase):
 
 
 class FakeYDL:
-    """Stands in for yt_dlp.YoutubeDL: behaviour keyed on the URL."""
+    """Stands in for yt_dlp.YoutubeDL: behaviour keyed on the URL. Records whether a download was attempted."""
     last_opts = None
+    downloads = []
 
     def __init__(self, opts):
         FakeYDL.last_opts = opts
@@ -167,36 +168,55 @@ class FakeYDL:
         import yt_dlp
         if "gone" in url:
             raise yt_dlp.utils.DownloadError("ERROR: [TikTok] 123: Video not available\nmore")
-        vid = url.rstrip("/").rsplit("/", 1)[-1]
+        if "nothing" in url:
+            return None
+        vid = url.rstrip("/").rsplit("/", 1)[-1].split("?")[0]
         info = {"id": vid, "extractor_key": "TikTok", "title": "clip " + vid, "width": 1080, "height": 1920, "format_note": "Direct video"}
-        if "archived" in url:                       # already in the archive: yt-dlp writes nothing, no filepath
-            info["requested_downloads"] = [{"format_id": "x"}]
-            return info
-        f = self.dest / f"TikTok-{vid}.mp4"
+        if "carousel" in url:
+            return {"_type": "playlist", "entries": [info, {"id": "second", "extractor_key": "TikTok"}]}
+        return info
+
+    def process_ie_result(self, info, download=True):
+        assert download
+        video = info["entries"][0] if info.get("_type") == "playlist" else info
+        FakeYDL.downloads.append(video["id"])
+        f = self.dest / f"TikTok-{video['id']}.mp4"
         f.write_bytes(b"\x00")
-        info["requested_downloads"] = [{"filepath": str(f)}]
+        video["requested_downloads"] = [{"filepath": str(f)}]
         return info
 
 
 class YtdlpWrapperTests(unittest.TestCase):
-    def test_wrapper_maps_info_errors_and_archive_hits(self):
+    def test_wrapper_resolves_first_then_downloads_only_when_missing(self):
         import yt_dlp
         with tempfile.TemporaryDirectory() as d, mock.patch.object(yt_dlp, "YoutubeDL", FakeYDL):
             dest = Path(d)
+            FakeYDL.downloads.clear()
             dl = download.ytdlp_downloader(cookies_from_browser="edge")
             r = dl("https://vm.tiktok.com/AAA/", dest)
             self.assertEqual((r.status, r.file, r.video_id, r.width, r.title), ("downloaded", "TikTok-AAA.mp4", "AAA", 1080, "clip AAA"))
             self.assertEqual(FakeYDL.last_opts["cookiesfrombrowser"], ("edge",))
+            self.assertNotIn("download_archive", FakeYDL.last_opts)
             self.assertIn("atermark", FakeYDL.last_opts["format"])
+            # the same video through another link (share token): found by id, nothing downloaded again
+            r = dl("https://www.tiktok.com/@x/video/AAA?stkn=zzz", dest)
+            self.assertEqual((r.status, r.file), ("exists", "TikTok-AAA.mp4"))
+            self.assertEqual(FakeYDL.downloads, ["AAA"])
+            # file deleted by hand: downloaded again
+            (dest / "TikTok-AAA.mp4").unlink()
+            r = dl("https://vm.tiktok.com/AAA/", dest)
+            self.assertEqual(r.status, "downloaded")
+            self.assertEqual(FakeYDL.downloads, ["AAA", "AAA"])
+            # errors
             r = dl("https://vm.tiktok.com/gone/", dest)
             self.assertEqual((r.status, r.error), ("failed", "ERROR: [TikTok] 123: Video not available"))
-            (dest / "TikTok-archived.mp4").write_bytes(b"\x00")
-            r = dl("https://vm.tiktok.com/archived/", dest)
-            self.assertEqual((r.status, r.file), ("exists", "TikTok-archived.mp4"))
-            (dest / "TikTok-archived.mp4").unlink()
-            r = dl("https://vm.tiktok.com/archived/", dest)
-            self.assertEqual(r.status, "failed")
-            self.assertIn(".downloaded.txt", r.error)
+            r = dl("https://vm.tiktok.com/nothing/", dest)
+            self.assertEqual((r.status, r.error), ("failed", "no video found at this link"))
+            # a multi-clip post: first clip
+            r = dl("https://www.instagram.com/p/carousel/", dest)
+            self.assertEqual((r.status, r.file), ("downloaded", "TikTok-carousel.mp4"))
+            r = dl("https://www.instagram.com/p/carousel/", dest)
+            self.assertEqual(r.status, "exists")
 
 
 class ThrottleTests(unittest.TestCase):
