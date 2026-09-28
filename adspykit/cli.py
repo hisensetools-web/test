@@ -160,6 +160,7 @@ def cmd_check(args) -> int:
     print(f"strip  : {'metadata removed after every download' if config.STRIP_METADATA else 'OFF (ADSPY_STRIP_METADATA=0)'}")
     print(f"dedup  : {('duplicates removed after every download, one copy ' + ('per sheet' if config.DEDUP_ACROSS else 'per product')) if config.DEDUP else 'OFF (ADSPY_DEDUP=0)'}")
     print(f"format : {dl.format_expression()}")
+    print(f"tls    : {'browser fingerprint ' + str(dl.impersonate_target()) if dl.impersonate_target() else 'plain (pip install curl_cffi to look like a browser to TikTok)'}; rate-limit waits {', '.join(str(w) + 's' for w in config.THROTTLE_WAITS)}")
     src = "csv" if args.csv else (args.source or config.SOURCE)
     print(f"source : {src}")
     if src == "clickup":

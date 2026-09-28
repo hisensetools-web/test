@@ -8,4 +8,4 @@ anthropic>=1.0         # optional: Claude rewrites product_summary and writes th
 higgsfield-client>=0.1 # optional: Higgsfield Cloud image generation (HF_KEY)
 # optional template readers: python-docx (for .docx templates), pypdf (for .pdf templates)
 # --- adspy.py (Adspy video puller) ---
-yt-dlp>=2026.1        # TikTok / Instagram downloads; ffmpeg on PATH for merged best video+audio (winget install Gyan.FFmpeg)
+yt-dlp[default,curl-cffi]>=2026.1   # TikTok / Instagram downloads (curl-cffi: browser TLS fingerprint); ffmpeg on PATH (winget install Gyan.FFmpeg)

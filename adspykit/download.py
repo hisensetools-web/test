@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 import shutil
 import time
 from dataclasses import asdict, dataclass
@@ -51,6 +52,51 @@ class Downloader(Protocol):
     def __call__(self, url: str, dest: Path) -> VideoResult: ...
 
 
+TRANSIENT_MARKERS = ("connection aborted", "connection reset", "forcibly closed", "10054", "10053", "timed out", "timeout",
+                     "http error 429", "too many requests", "http error 503", "http error 502", "temporarily", "remote end closed",
+                     "unable to download webpage", "unable to download json", "network is unreachable", "name resolution")
+TRANSIENT_TEXT = "the site closed the connection or timed out (rate limit); retried with backoff"
+
+
+def is_transient(error: str) -> bool:
+    """A network / rate-limit failure worth retrying after a pause, as opposed to a dead or private video."""
+    e = (error or "").lower()
+    if "not available" in e or "private" in e or "removed" in e or "no video found" in e or "login required" in e:
+        return False
+    return any(m in e for m in TRANSIENT_MARKERS)
+
+
+class _YdlLogger:
+    """Keeps yt-dlp's own chatter out of the terminal (it is in `-v` debug logging); errors come back through the result."""
+    def __init__(self):
+        self.last_error = ""
+
+    def debug(self, msg):
+        log.debug("yt-dlp: %s", msg)
+
+    def info(self, msg):
+        log.debug("yt-dlp: %s", msg)
+
+    def warning(self, msg):
+        log.debug("yt-dlp warning: %s", msg)
+
+    def error(self, msg):
+        self.last_error = str(msg)
+        log.debug("yt-dlp error: %s", msg)
+
+
+def impersonate_target():
+    """A browser TLS fingerprint for yt-dlp when curl_cffi is installed (TikTok resets plain-Python connections)."""
+    if not config.IMPERSONATE:
+        return None
+    try:
+        import curl_cffi  # noqa: F401
+        from yt_dlp.networking.impersonate import ImpersonateTarget
+        return ImpersonateTarget.from_str(config.IMPERSONATE)
+    except Exception:  # noqa: BLE001  optional dependency
+        return None
+
+
 def ffmpeg_available() -> bool:
     return metadata.find_ffmpeg() is not None
 
@@ -81,6 +127,11 @@ def ydl_options(dest: Path, cookies: str = "", cookies_from_browser: str = "", q
         "postprocessors": [{"key": "FFmpegVideoRemuxer", "preferedformat": "mp4"}] if ffmpeg_available() else [],
         "http_headers": {"User-Agent": config.USER_AGENT},
     }
+    if quiet:
+        opts["logger"] = _YdlLogger()
+    target = impersonate_target()
+    if target is not None:
+        opts["impersonate"] = target
     ff = metadata.find_ffmpeg()
     if ff and shutil.which("ffmpeg") is None:
         opts["ffmpeg_location"] = ff
@@ -110,7 +161,11 @@ def ytdlp_downloader(cookies: str = "", cookies_from_browser: str = "", quiet: b
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
         except yt_dlp.utils.DownloadError as e:
-            return VideoResult(url=url, status="failed", error=str(e).split("\n")[0][:300])
+            err = str(e).split("\n")[0][:300]
+            return VideoResult(url=url, status="failed", error=TRANSIENT_TEXT if is_transient(err) else err)
+        except Exception as e:  # noqa: BLE001  curl_cffi / transport errors surface as their own classes
+            err = f"{type(e).__name__}: {str(e)[:200]}"
+            return VideoResult(url=url, status="failed", error=TRANSIENT_TEXT if is_transient(err) else err)
         if info is None:
             return VideoResult(url=url, status="failed", error="no video found at this link")
         if info.get("_type") == "playlist":      # an Instagram post with several clips: take the entries
@@ -190,6 +245,12 @@ def download_product(product: Product, out_root: Path, downloader: Downloader, m
             say(f"  [{i}/{len(links)}] would fetch {url}")
             continue
         r = downloader(url, folder)
+        for wait in (config.THROTTLE_WAITS if r.status == "failed" and is_transient(r.error) else ()):
+            say(f"  [{i}/{len(links)}] rate limited, waiting {wait}s then retrying {url}")
+            time.sleep(wait)
+            r = downloader(url, folder)
+            if not (r.status == "failed" and is_transient(r.error)):
+                break
         r.at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         results.append(r)
         manifest[url] = r
@@ -200,7 +261,7 @@ def download_product(product: Product, out_root: Path, downloader: Downloader, m
             dims = f" {r.width}x{r.height}" if r.width and r.height else ""
             say(f"  [{i}/{len(links)}] {r.status:<11} {r.file}{dims}")
         if pause and i < len(links):
-            time.sleep(pause)
+            time.sleep(random.uniform(pause, pause * 2))
     if not dry_run:
         save_manifest(folder, product, manifest)
     return results

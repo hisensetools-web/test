@@ -199,6 +199,60 @@ class YtdlpWrapperTests(unittest.TestCase):
             self.assertIn(".downloaded.txt", r.error)
 
 
+class ThrottleTests(unittest.TestCase):
+    def test_transient_vs_permanent(self):
+        self.assertTrue(download.is_transient("ERROR: [vm.tiktok] X: Unable to download webpage: ('Connection aborted.', ConnectionResetError(10054, ...))"))
+        self.assertTrue(download.is_transient("HTTPSConnectionPool(host='vm.tiktok.com', port=443): Read timed out."))
+        self.assertTrue(download.is_transient("HTTP Error 429: Too Many Requests"))
+        self.assertFalse(download.is_transient("ERROR: [TikTok] 123: Video not available"))
+        self.assertFalse(download.is_transient("no video found at this link"))
+        self.assertFalse(download.is_transient(""))
+
+    def test_rate_limited_link_is_retried_after_waits_then_recorded(self):
+        calls = []
+
+        def flaky(url, dest):
+            calls.append(url)
+            if len(calls) < 3:
+                return download.VideoResult(url=url, status="failed", error=download.TRANSIENT_TEXT)
+            f = dest / "TikTok-ok.mp4"
+            f.write_bytes(b"\x00")
+            return download.VideoResult(url=url, status="downloaded", file=f.name)
+
+        p = Product(name="Throttled", links=["https://vm.tiktok.com/A/"])
+        with tempfile.TemporaryDirectory() as d, mock.patch("time.sleep") as sleep, mock.patch.object(download.config, "THROTTLE_WAITS", (30, 60, 120)):
+            lines = []
+            res = download.download_product(p, Path(d), flaky, pause_s=0, progress=lines.append)
+            self.assertEqual([r.status for r in res], ["downloaded"])
+            self.assertEqual(len(calls), 3)
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [30, 60])
+            self.assertTrue(any("rate limited, waiting 30s" in l for l in lines))
+            # permanent failure: no waiting at all
+            calls.clear()
+            dead = lambda url, dest: download.VideoResult(url=url, status="failed", error="Video not available")
+            sleep.reset_mock()
+            res = download.download_product(Product(name="Dead", links=["https://vm.tiktok.com/B/"]), Path(d), dead, pause_s=0)
+            self.assertEqual(res[0].status, "failed")
+            sleep.assert_not_called()
+            # always transient: every wait used, then recorded as failed
+            always = lambda url, dest: download.VideoResult(url=url, status="failed", error=download.TRANSIENT_TEXT)
+            res = download.download_product(Product(name="Never", links=["https://vm.tiktok.com/C/"]), Path(d), always, pause_s=0)
+            self.assertEqual((res[0].status, res[0].error), ("failed", download.TRANSIENT_TEXT))
+            self.assertEqual([c.args[0] for c in sleep.call_args_list], [30, 60, 120])
+
+    def test_ydl_options_quiet_logger_and_impersonation(self):
+        with tempfile.TemporaryDirectory() as d:
+            opts = download.ydl_options(Path(d))
+            self.assertIsInstance(opts["logger"], download._YdlLogger)
+            try:
+                import curl_cffi  # noqa: F401
+                self.assertEqual(str(opts["impersonate"]), "chrome")
+            except ImportError:
+                self.assertNotIn("impersonate", opts)
+            with mock.patch.object(download.config, "IMPERSONATE", ""):
+                self.assertNotIn("impersonate", download.ydl_options(Path(d)))
+
+
 class StripTests(unittest.TestCase):
     def _setup(self, root):
         p = Product(name="Skull Candle Warmer", links=["https://vm.tiktok.com/AAA/", "https://vm.tiktok.com/BBB/"])

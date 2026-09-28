@@ -60,7 +60,11 @@ OUTPUT_ROOT = Path(os.environ.get("ADSPY_OUTPUT_DIR", ROOT / "adspy_output"))
 COOKIES_FILE = os.environ.get("ADSPY_COOKIES", "").strip()
 COOKIES_FROM_BROWSER = os.environ.get("ADSPY_COOKIES_FROM_BROWSER", "").strip()
 
-PAUSE_S = float(os.environ.get("ADSPY_PAUSE_S", "2"))          # polite pause between downloads
+PAUSE_S = float(os.environ.get("ADSPY_PAUSE_S", "3"))          # polite pause between downloads (randomised up to 2x)
+# When TikTok / Instagram close the connection or time out (rate limiting), wait this long and retry the same link,
+# one wait per attempt; the link is recorded as failed only after the last one.
+THROTTLE_WAITS = tuple(int(x) for x in os.environ.get("ADSPY_THROTTLE_WAITS", "30,60,120,300").split(",") if x.strip())
+IMPERSONATE = os.environ.get("ADSPY_IMPERSONATE", "chrome").strip()   # browser TLS fingerprint for yt-dlp (needs curl_cffi); empty = off
 RETRIES = int(os.environ.get("ADSPY_RETRIES", "3"))
 FORMAT_OVERRIDE = os.environ.get("ADSPY_FORMAT", "").strip()    # a raw yt-dlp -f expression, if you ever need one
 FFMPEG = os.environ.get("ADSPY_FFMPEG", "").strip()              # full path to ffmpeg.exe when it is not on PATH

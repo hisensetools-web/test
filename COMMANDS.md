@@ -147,7 +147,8 @@ if (Test-Path vid -PathType Leaf) { Remove-Item vid -Force }          # a stray 
 New-Item -ItemType Directory -Force vid | Out-Null
 git clone --depth 1 -b claude/ecstatic-brahmagupta-9esg5e https://github.com/hisensetools-web/test vid-src
 Copy-Item vid-src\adspy.py, vid-src\requirements-adspy.txt -Destination vid\ -Force
-Copy-Item vid-src\adspykit -Destination vid\adspykit -Recurse -Force
+Remove-Item -Recurse -Force vid\adspykit -ErrorAction SilentlyContinue    # an existing folder would receive the copy *inside* it
+Copy-Item vid-src\adspykit -Destination vid\adspykit -Recurse
 Copy-Item vid-src\adspy_dist\* -Destination vid\ -Force               # setup.bat, DOWNLOAD.bat, INSTRUCTIONS.txt for non-technical users
 Remove-Item -Recurse -Force vid-src
 cd vid
