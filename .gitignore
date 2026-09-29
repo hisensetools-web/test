@@ -10,3 +10,4 @@ logs/
 pdp_output/
 data/shopify_token.json
 stores.txt
+.venv/
