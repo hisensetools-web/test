@@ -4,7 +4,8 @@ task description.
 Links are taken from the description wherever they are (any heading), filtered to the video hosts we download
 from (TikTok, Instagram) so competition / PDP / PipiAds links are never treated as videos. A task that stores
 TikToks as bare numeric video ids with a "prefix each with https://www.tiktok.com/@creator/video/" note gets
-its links rebuilt from that prefix. Tasks whose status is in SKIP_STATUSES (cancelled, lesson) are left out.
+its links rebuilt from that prefix. Tasks whose status is in SKIP_STATUSES (cancelled, lesson) are left out; STATUSES (or --status) keeps only the
+statuses named, for example only "ready to launch".
 
 API: ClickUp v2, personal token (ClickUp > Settings > Apps > API Token). Read-only: one GET per page of tasks.
 """
@@ -74,7 +75,7 @@ def extract_video_links(text: str) -> list[str]:
 
 def task_to_product(task: dict) -> Product:
     text = task.get("markdown_description") or task.get("description") or task.get("text_content") or ""
-    return Product(name=(task.get("name") or "").strip(), links=extract_video_links(text))
+    return Product(name=(task.get("name") or "").strip(), links=extract_video_links(text), status=task_status(task))
 
 
 def task_status(task: dict) -> str:
@@ -84,11 +85,24 @@ def task_status(task: dict) -> str:
     return (s or "").strip().lower()
 
 
-def products_from_tasks(tasks: list[dict], skip_statuses: tuple[str, ...] | None = None) -> list[Product]:
-    skip = tuple(s.strip().lower() for s in (config.CLICKUP_SKIP_STATUSES if skip_statuses is None else skip_statuses) if s.strip())
+def normalise_statuses(statuses) -> tuple[str, ...]:
+    """'Ready To Launch, testing' or ['Ready To Launch'] -> ('ready to launch', 'testing')."""
+    if not statuses:
+        return ()
+    if isinstance(statuses, str):
+        statuses = statuses.split(",")
+    return tuple(s.strip().lower() for s in statuses if s and s.strip())
+
+
+def products_from_tasks(tasks: list[dict], skip_statuses: tuple[str, ...] | None = None, statuses=None) -> list[Product]:
+    """One product per task. `statuses` (or VIDDL_CLICKUP_STATUSES) keeps only tasks in those statuses; empty means every
+    status except the skipped ones (cancelled, lesson)."""
+    skip = normalise_statuses(config.CLICKUP_SKIP_STATUSES if skip_statuses is None else skip_statuses)
+    keep = normalise_statuses(config.CLICKUP_STATUSES if statuses is None else statuses)
     out: dict[str, Product] = {}
     for t in tasks:
-        if task_status(t) in skip or not (t.get("name") or "").strip():
+        status = task_status(t)
+        if status in skip or (keep and status not in keep) or not (t.get("name") or "").strip():
             continue
         p = task_to_product(t)
         if p.slug in out:                                   # two tasks with the same name: merge the links
@@ -154,5 +168,5 @@ def _get(session: requests.Session, url: str, headers: dict, params: dict) -> di
     raise ClickUpError("ClickUp: gave up")
 
 
-def fetch_products(list_id: str = "", token: str = "", session: requests.Session | None = None) -> list[Product]:
-    return products_from_tasks(fetch_tasks(list_id, token, session))
+def fetch_products(list_id: str = "", token: str = "", session: requests.Session | None = None, statuses=None) -> list[Product]:
+    return products_from_tasks(fetch_tasks(list_id, token, session), statuses=statuses)

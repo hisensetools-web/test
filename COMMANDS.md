@@ -136,7 +136,7 @@ python tracker.py ads --only a.com b.com               # scrape new stores now i
 ## 6. vidDownloader: `vidDownloader.py`
 
 Downloads every TikTok / Instagram link in the descriptions of the ClickUp **Product Research** tasks (cancelled and
-lesson skipped) into `vidDownloader_output\<product>\`, clean (no TikTok watermark) and at the best quality available.
+lesson skipped; `--status "ready to launch"` or `DOWNLOAD READY TO LAUNCH.bat` limits it to one status) into `vidDownloader_output\<product>\`, clean (no TikTok watermark) and at the best quality available.
 `setup.bat` asks once for the ClickUp API token (avatar > Settings > Apps > API Token). ClickUp is the only source. It runs on its own in `C:\Users\top2\Desktop\vid` (no tracker needed there).
 Once, to put it there (or refresh it after an update):
 

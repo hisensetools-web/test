@@ -18,10 +18,12 @@ def _setup_logging(verbose: bool) -> None:
 
 def _products(args):
     from . import clickup
-    products = select(clickup.fetch_products(args.clickup_list, args.clickup_token), args.only)
-    source = f"ClickUp list {args.clickup_list or config.CLICKUP_LIST_ID}"
+    statuses = clickup.normalise_statuses(args.status) or clickup.normalise_statuses(config.CLICKUP_STATUSES)
+    products = select(clickup.fetch_products(args.clickup_list, args.clickup_token, statuses=statuses), args.only)
+    source = f"ClickUp list {args.clickup_list or config.CLICKUP_LIST_ID}" + (f", status {' / '.join(statuses)}" if statuses else "")
     if not products:
-        raise SystemExit(f"no products{' matching ' + ', '.join(args.only) if args.only else ''} in {source}")
+        raise SystemExit(f"no products{' matching ' + ', '.join(args.only) if args.only else ''} in {source}"
+                         + ("\n(status names must match ClickUp exactly, e.g. --status \"ready to launch\"; `python vidDownloader.py links` shows each product's status)" if statuses else ""))
     return products, source
 
 
@@ -30,7 +32,7 @@ def cmd_links(args) -> int:
     products, source = _products(args)
     print(f"{source}: {len(products)} products, {sum(len(p.links) for p in products)} links")
     for p in products:
-        print(f"\n{p.name}  ->  {config.OUTPUT_ROOT / p.slug}  ({len(p.links)} links)")
+        print(f"\n{p.name}  [{p.status or 'no status'}]  ->  {config.OUTPUT_ROOT / p.slug}  ({len(p.links)} links)")
         if args.urls:
             for u in p.links:
                 print("   ", u)
@@ -154,7 +156,7 @@ def cmd_check(args) -> int:
     print(f"format : {dl.format_expression()}")
     print(f"tls    : {'browser fingerprint ' + str(dl.impersonate_target()) if dl.impersonate_target() else 'plain (pip install curl_cffi to look like a browser to TikTok)'}; rate-limit waits {', '.join(str(w) + 's' for w in config.THROTTLE_WAITS)}")
     tok = args.clickup_token or config.CLICKUP_TOKEN
-    print(f"clickup: list {args.clickup_list or config.CLICKUP_LIST_ID}, token {'set (' + tok[:5] + '...)' if tok else 'MISSING -> VIDDL_CLICKUP_TOKEN in .env (run setup.bat)'}, skipping statuses {', '.join(config.CLICKUP_SKIP_STATUSES)}")
+    print(f"clickup: list {args.clickup_list or config.CLICKUP_LIST_ID}, token {'set (' + tok[:5] + '...)' if tok else 'MISSING -> VIDDL_CLICKUP_TOKEN in .env (run setup.bat)'}, skipping statuses {', '.join(config.CLICKUP_SKIP_STATUSES)}" + (f", only statuses {', '.join(config.CLICKUP_STATUSES)}" if config.CLICKUP_STATUSES else ""))
     print(f"output : {config.OUTPUT_ROOT}")
     cookies, browser, warning = dl.usable_cookies()
     print(f"login  : {warning or ('cookies file ' + cookies if cookies else browser + ' browser login' if browser else 'none (Instagram usually works without; set VIDDL_COOKIES_FROM_BROWSER=firefox after logging in there if reels fail)')}")
@@ -177,6 +179,7 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--clickup-list", default="", metavar="ID", help="ClickUp list id (VIDDL_CLICKUP_LIST_ID)")
         p.add_argument("--clickup-token", default="", metavar="pk_...", help="ClickUp personal API token (VIDDL_CLICKUP_TOKEN)")
         p.add_argument("--only", action="append", metavar="NAME", help="only products whose name contains this (repeatable)")
+        p.add_argument("--status", action="append", metavar="STATUS", help='only tasks in this ClickUp status, e.g. "ready to launch" (repeatable; VIDDL_CLICKUP_STATUSES)')
 
     p = sub.add_parser("links", help="list the products and how many links each has (--urls prints them)")
     common(p)

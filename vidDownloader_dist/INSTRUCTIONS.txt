@@ -45,6 +45,14 @@ Double-click  DOWNLOAD.bat
 Run it as often as you like. Videos that are already there are skipped in a second, only new links are fetched.
 
 
+ONLY THE PRODUCTS MARKED "READY TO LAUNCH"
+-------------------------------------------
+Double-click  DOWNLOAD READY TO LAUNCH.bat
+
+- It downloads only for the products whose status in ClickUp is "ready to launch"; everything else is left alone.
+- Same output folder, same messages as DOWNLOAD.bat.
+
+
 JUST ONE PRODUCT
 ----------------
 Double-click  DOWNLOAD ONE PRODUCT.bat  and type part of the product name (for example  skull  or  ghostface),
@@ -78,6 +86,7 @@ FILES IN THIS FOLDER
 --------------------
 setup.bat                  one-time setup
 DOWNLOAD.bat               download everything new
+DOWNLOAD READY TO LAUNCH.bat   download only the products with status "ready to launch"
 DOWNLOAD ONE PRODUCT.bat   download one product only
 UPDATE.bat                 update the downloader when TikTok / Instagram change
 INSTRUCTIONS.txt           this file

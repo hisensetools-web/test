@@ -10,6 +10,7 @@ from . import config
 class Product:
     name: str
     links: list[str] = field(default_factory=list)
+    status: str = ""                       # ClickUp task status, lower-case (ready to launch, testing, ...)
 
     @property
     def slug(self) -> str:

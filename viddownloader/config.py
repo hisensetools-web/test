@@ -48,6 +48,7 @@ def slugify(text: str, max_len: int = 60) -> str:
 CLICKUP_TOKEN = env("CLICKUP_TOKEN", "").strip()          # personal token, pk_...
 CLICKUP_LIST_ID = env("CLICKUP_LIST_ID", "901222590753").strip()
 CLICKUP_SKIP_STATUSES = tuple(s.strip() for s in env("CLICKUP_SKIP_STATUSES", "cancelled,lesson").split(","))
+CLICKUP_STATUSES = tuple(s.strip() for s in env("CLICKUP_STATUSES", "").split(",") if s.strip())   # empty: every status but the skipped
 
 # One folder per product under here: vidDownloader_output/<product-slug>/
 OUTPUT_ROOT = Path(env("OUTPUT_DIR", ROOT / "vidDownloader_output"))

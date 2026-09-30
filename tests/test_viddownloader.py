@@ -378,6 +378,17 @@ class ClickUpParseTests(unittest.TestCase):
         wicked = {p.name: p for p in clickup.products_from_tasks(self.tasks, skip_statuses=())}["Wicked For Good Tumbler"]
         self.assertEqual(wicked.links, ["https://vm.tiktok.com/ZN8CANCEL/"])          # pipiads is never a video link
 
+    def test_status_filter_keeps_only_the_named_statuses(self):
+        self.assertEqual(self.by["Winking Spidey Mask"].status, "ready to launch")
+        ready = clickup.products_from_tasks(self.tasks, statuses=["Ready To Launch"])
+        self.assertEqual([p.name for p in ready], ["Winking Spidey Mask"])
+        two = clickup.products_from_tasks(self.tasks, statuses="ready to launch, scaling")
+        self.assertEqual([p.name for p in two], ["Winking Spidey Mask", "Rosabella"])
+        # the skip list still wins, and an empty filter means every status but the skipped ones
+        self.assertEqual(clickup.products_from_tasks(self.tasks, statuses=["cancelled"]), [])
+        self.assertEqual(len(clickup.products_from_tasks(self.tasks, statuses=())), len(self.by))
+        self.assertEqual(clickup.normalise_statuses(None), ())
+
     def test_slug_is_the_folder_name_and_select_filters(self):
         self.assertEqual(self.by["Trunk Horror Prop"].slug, "trunk-horror-prop")
         self.assertEqual(self.by["Winking Spidey Mask"].slug, "winking-spidey-mask")

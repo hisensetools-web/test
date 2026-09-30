@@ -79,7 +79,8 @@ link in the task description, whatever the heading) and downloads the videos, on
 taken: yt-dlp labels it `watermarked` and the format rule rejects it, so you get the clean stream the app itself plays,
 at the highest resolution and bitrate offered (video + audio merged with ffmpeg when they come separately; nothing is
 re-encoded). Instagram reels are served clean. Tasks whose status is `cancelled` or `lesson` are skipped
-(`VIDDL_CLICKUP_SKIP_STATUSES`); competition / PDP / PipiAds links never count as videos; a task that lists bare TikTok
+(`VIDDL_CLICKUP_SKIP_STATUSES`), and `--status "ready to launch"` (or `VIDDL_CLICKUP_STATUSES`) keeps only the tasks
+in the statuses named; competition / PDP / PipiAds links never count as videos; a task that lists bare TikTok
 ids under a `tiktok.com/@creator/video/` prefix note gets its links rebuilt.
 
 ```bash
@@ -87,6 +88,7 @@ pip install -r requirements-vidDownloader.txt   # yt-dlp[curl-cffi] + requests; 
 python vidDownloader.py check                   # yt-dlp + ffmpeg present, ClickUp readable, how many products / links
 python vidDownloader.py links                   # products and link counts (--urls prints the links)
 python vidDownloader.py download                # everything, resumable: run it again and only missing / failed links are fetched
+python vidDownloader.py download --status "ready to launch"        # only the tasks in that ClickUp status (repeatable; `links` shows each product's status)
 python vidDownloader.py download --only "skull candle" --max 3     # one product, first 3 links (a quick test)
 python vidDownloader.py download --cookies-from-browser firefox    # Instagram reels that need a logged-in session (or --cookies cookies.txt)
 ```
@@ -109,7 +111,7 @@ limit) the tool waits 30 / 60 / 120 / 300 s and retries before recording a failu
 fingerprint (`curl_cffi`). `--force` refetches everything. The tool is self-contained: copy `vidDownloader.py`,
 `viddownloader\` and `requirements-vidDownloader.txt` to any folder and it runs there without the rest of the repository.
 `vidDownloader_dist\` holds double-click launchers for people who do not use a terminal (`setup.bat` installs Python,
-ffmpeg and the packages and asks for the ClickUp token once; `DOWNLOAD.bat`, `DOWNLOAD ONE PRODUCT.bat`, `UPDATE.bat`)
+ffmpeg and the packages and asks for the ClickUp token once; `DOWNLOAD.bat`, `DOWNLOAD READY TO LAUNCH.bat`, `DOWNLOAD ONE PRODUCT.bat`, `UPDATE.bat`)
 plus `INSTRUCTIONS.txt`; see COMMANDS.md > Giving it to someone else. Update yt-dlp when TikTok or Instagram change
 (`pip install -U yt-dlp`). Tests: `python -m unittest tests.test_viddownloader`.
 
